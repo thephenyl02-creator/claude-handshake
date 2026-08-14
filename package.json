@@ -1,0 +1,24 @@
+{
+  "name": "claude-handshake",
+  "version": "0.0.1",
+  "description": "Peer collaboration for Claude Code — separate Claude instances, different users and machines, working one project as a team. In active development; see PLAN.md.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/thephenyl02-creator/claude-handshake.git"
+  },
+  "homepage": "https://github.com/thephenyl02-creator/claude-handshake#readme",
+  "license": "MIT",
+  "author": "Fenil <the.phenyl02@gmail.com>",
+  "keywords": [
+    "claude-code",
+    "claude",
+    "collaboration",
+    "multi-agent",
+    "peer-to-peer",
+    "plugin"
+  ],
+  "files": [
+    "README.md",
+    "LICENSE"
+  ]
+}
