@@ -52,3 +52,17 @@ current behavior is noted so the freeze either ratifies or changes it.
     for `warn.*`/`note.blocker`? Relay uses 5.
 11. **Does rotation rotate the recovery key too?** Currently no.
 12. **Claim `files[]` on renewal** is a capped union (not replace). Confirm.
+
+## Settled ahead of the freeze (Fenil, 2026-08-15): subagent CHILD MODE
+
+The spike's subagent-hooks discovery is absorbed as a feature, not filtered
+out. Subagent/headless child sessions run in child mode:
+- NEVER members: no join, no presence record, no claims, no outbound posts.
+- DO honor the PreToolUse overlap gate against peers' claims, read from the
+  parent's local cache (no network from children).
+- DO append their touched files to the parent's claim state locally; the
+  parent's next heartbeat carries the union — claims reflect the whole agent
+  tree's footprint.
+- Presence may aggregate child activity into the parent's record
+  ("working: onboarding flow (+3 agents)") — never as separate members.
+M1 must specify the child-detection mechanism and freeze it.
