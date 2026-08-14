@@ -1,0 +1,40 @@
+name = "claude-handshake-relay"
+main = "src/worker.js"
+compatibility_date = "2025-08-01"
+
+# SQLite-backed Durable Objects. This MUST stay `new_sqlite_classes`: the
+# key-value DO backend is a paid-plan feature, and the relay has to deploy on a
+# free Workers account. Changing this to `new_classes` breaks free-plan deploys
+# and cannot be undone for an existing class without a new class name.
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["WorkspaceDO", "RateLimiterDO"]
+
+[[durable_objects.bindings]]
+name = "WORKSPACE"
+class_name = "WorkspaceDO"
+
+[[durable_objects.bindings]]
+name = "LIMITER"
+class_name = "RateLimiterDO"
+
+# Workers Logs is OFF by default. The relay's own logging is already redacted
+# (src/lib/log.js emits a code and an error type, never bodies or headers), but
+# platform invocation logs record request URLs, and a URL here contains the
+# workspace id. Turn it on deliberately if you need it; `wrangler tail` shows
+# the redacted errors live without persisting anything.
+[observability]
+enabled = false
+
+# RELAY_CREATE_TOKEN is a secret, never a var:
+#   wrangler secret put RELAY_CREATE_TOKEN
+# Without it, POST /ws returns 503 and no workspace can be created.
+
+# Optional tunables — defaults in src/lib/config.js match the frozen protocol.
+# [vars]
+# CLAIM_TTL_DEFAULT_SECONDS = "7200"
+# MESSAGE_TTL_SECONDS = "604800"
+# MESSAGE_MAX = "500"
+# SYNC_FETCH_CAP = "20"
+# SYNC_RESERVED_SLOTS = "5"
+# ROTATE_GRACE_SECONDS = "86400"

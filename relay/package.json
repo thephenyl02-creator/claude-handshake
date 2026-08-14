@@ -1,0 +1,21 @@
+{
+  "name": "claude-handshake-relay",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "claude-handshake team relay — Cloudflare Worker + one SQLite-backed Durable Object per workspace.",
+  "license": "MIT",
+  "author": "Fenil <the.phenyl02@gmail.com>",
+  "scripts": {
+    "test": "node --test \"test/node/*.test.js\" && vitest run",
+    "test:worker": "vitest run",
+    "test:source": "node --test \"test/node/*.test.js\"",
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.21.3",
+    "vitest": "^4.1.0",
+    "wrangler": "^4.123.0"
+  }
+}
