@@ -1,9 +1,11 @@
 {
   "name": "claude-handshake",
-  "owner": { "name": "Fenil K Ventures LLC" },
+  "owner": {
+    "name": "Fenil K Ventures LLC"
+  },
   "metadata": {
     "description": "Peer collaboration for Claude Code - separate Claude instances, different users and machines, working one project as a team. In development.",
-    "version": "0.0.1"
+    "version": "0.1.0"
   },
   "plugins": [
     {
@@ -13,13 +15,11 @@
       "author": {
         "name": "Fenil"
       },
-      "source": "./"
-    },
-    {
-      "name": "handshake-spike",
-      "description": "Throwaway M0.5 measurement plugin: logs hook/monitor timing to ~/.claude/handshake-spike.log. No network, no context injection. Removed after the spike.",
-      "version": "0.1.0",
-      "source": "./spike"
+      "source": {
+        "source": "archive",
+        "url": "https://github.com/thephenyl02-creator/claude-handshake/releases/download/v0.1.0/claude-handshake-plugin-0.1.0.zip",
+        "sha256": "c5a1a4e59f272ec8ad1cf8d57632c80045e14ef5f557a6a4942f9c15c1d0180a"
+      }
     }
   ]
 }

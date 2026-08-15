@@ -24,9 +24,11 @@ if (!version || !/^\d+\.\d+\.\d+$/.test(version)) {
 
 // The plugin distribution — mirrors package.json "files". NOT test/, e2e/,
 // spike/, node_modules, .git, .wrangler.
+// NOTE: marketplace.json is deliberately NOT in the archive. It carries this
+// zip's own sha256, so including it would make the hash depend on itself.
+// (claude-tier's release format excludes it for the same reason.)
 const INCLUDE = [
   '.claude-plugin/plugin.json',
-  '.claude-plugin/marketplace.json',
   'LICENSE', 'README.md',
   'bin', 'lib', 'hooks', 'monitors', 'commands', 'skills', 'installers',
   'docs/PROTOCOL.md', 'docs/SECURITY.md', 'docs/INSTALL.md', 'PLAN.md',
