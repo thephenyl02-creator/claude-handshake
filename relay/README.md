@@ -14,6 +14,33 @@ is the live chatter layer, and everything in it is disposable.
 
 You need a Cloudflare account (the free plan is enough) and Node 18+.
 
+### The one command (recommended)
+
+```
+/handshake deploy-relay
+```
+
+That is the whole thing. From a terminal it is `handshake deploy-relay`. It
+runs every step below for you — you never type `wrangler`:
+
+- fetches `wrangler` through `npx` (nothing is installed globally, and the
+  version is pinned to the one this relay was tested against);
+- opens your browser once to authorize Cloudflare;
+- deploys the Worker (from a writable copy — wrangler needs to write `.wrangler/`);
+- checks `GET /health` returns `{ok:true, protocol:1}`;
+- generates a strong `RELAY_CREATE_TOKEN` and sets it with `wrangler secret put`
+  over stdin (never on a command line, never in `[vars]`);
+- creates the workspace and prints the **invite** to hand to your team, plus the
+  **recovery key** to store out of band.
+
+`/handshake upgrade` does the same deploy but migrates an existing zero-setup
+workspace onto the new relay, carrying its live claims across (PROTOCOL §9.4).
+
+If the wrapped command ever cannot run (the bundled `relay/` source is not part
+of your install), fall back to the manual steps below.
+
+### The manual steps (fallback)
+
 ```sh
 cd relay
 npm install

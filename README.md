@@ -31,7 +31,8 @@ is — by `git pull`. The live layer is what makes coordination feel automatic;
 the durable layer is what survives after everyone signs off.
 
 - **Zero-setup mode** to try it — no accounts, no servers, just an invite blob
-- **Team relay mode** (your own free Cloudflare Worker) for real work
+- **Team relay mode** (your own free Cloudflare Worker) for real work — deployed
+  with **one command**, `/handshake deploy-relay`; you never type `wrangler`
 - **GitHub as the durable base** — tasks and decisions live in your repo;
   claude-handshake works without a GitHub remote too, on the live layer alone
 - **One paste to join** — an invite line your teammate pastes into Claude Code
@@ -143,11 +144,28 @@ Then, inside a project: `/handshake init` to create a workspace, or
 No command exists to *cause* coordination beyond that — read-only views like
 `/handshake status` are the only thing you'd ever type on purpose.
 
+**Moving to a team relay (optional, for real work).** The zero-setup transport
+is public and disposable; for a private, authenticated live layer, deploy your
+own free Cloudflare Worker with **one command** — you never type `wrangler`:
+
+```
+/handshake deploy-relay
+```
+
+It fetches wrangler through `npx` (nothing installed globally), opens your
+browser once to authorize Cloudflare (a free account is enough), deploys the
+Worker, sets its create-token secret, creates the workspace, and prints the
+invite plus a **recovery key to store out of band** (shown once, never written
+to the repo). Already have a zero-setup workspace with claims and history?
+`/handshake upgrade` deploys a relay the same way and migrates you onto it,
+carrying your live claims across. Full details and the free-tier limits:
+[relay/README.md](relay/README.md).
+
 ## The `/handshake` command
 
 ```
 /handshake [status | init | join <blob> | invite | claim <subject> | release |
-            done | mute | rest | doctor | upgrade]
+            done | mute | rest | doctor | deploy-relay | upgrade]
 ```
 
 | Verb | What it does | Confirms first? |
@@ -162,7 +180,8 @@ No command exists to *cause* coordination beyond that — read-only views like
 | `mute` | Stop peer chatter from reaching your context (local only — your own claims/notes still go out) | no |
 | `rest` | Sign off for this session; stop broadcasting | no |
 | `doctor` | Pass/warn/fail health check (Node, workspace, credentials, transport, private-repo guard, git history, more) | no |
-| `upgrade` | Migrate zero-setup → team relay | yes |
+| `deploy-relay` | Deploy your own Cloudflare relay in **one command** (no `wrangler` typing) and print the invite | yes |
+| `upgrade` | Migrate an existing zero-setup workspace → team relay (deploys one for you if you have none) | yes |
 
 `rotate` is also routed (`/handshake rotate`) but is an offboarding action that
 needs the recovery key — never run it on your own initiative. Full verb
@@ -183,8 +202,10 @@ decision tree and worked examples: [skills/handshake/SKILL.md](skills/handshake/
   works, falling back to heartbeating on turn boundaries
   ([PROTOCOL.md §8](docs/PROTOCOL.md)).
 - **Team relay** (optional, for real work beyond trying it out): a free
-  Cloudflare account, needed only by whoever deploys the relay — see
-  [relay/README.md](relay/README.md) (about three minutes).
+  Cloudflare account and one browser login, needed only by whoever deploys the
+  relay. `/handshake deploy-relay` does the whole deploy in one command (no
+  `wrangler` typing) — see [relay/README.md](relay/README.md) (about three
+  minutes). Members joining an already-deployed relay need nothing extra.
 
 ## Context cost
 

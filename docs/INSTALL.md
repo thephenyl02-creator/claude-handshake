@@ -27,7 +27,7 @@ should check before trusting a run.
 | **macOS / Linux** | Supported natively via `installers/install.sh`. |
 | **Windows** | Supported natively via `installers/install.ps1` (PowerShell 5.1+ or pwsh). |
 | **WSL** | Works, with a caveat: Claude Code plugins are currently known **not to load hooks or monitors inside WSL**. `install.sh` detects WSL (`$WSL_DISTRO_NAME`, `$WSL_INTEROP`, or `microsoft` in `/proc/version`) and installs the fallback copy unconditionally there, regardless of what the plugin route itself reports. |
-| **Team relay** (optional) | A free Cloudflare account, needed only by whoever deploys the relay — see [`relay/README.md`](../relay/README.md). Members joining an already-deployed relay need nothing extra. |
+| **Team relay** (optional) | A free Cloudflare account and one browser login, needed only by whoever deploys the relay. `/handshake deploy-relay` (or `handshake deploy-relay` from a terminal) deploys it in **one command** — it fetches `wrangler` through `npx`, so nothing is installed globally and you never type `wrangler` yourself — see [`relay/README.md`](../relay/README.md). Members joining an already-deployed relay need nothing extra. |
 
 ## The installers
 

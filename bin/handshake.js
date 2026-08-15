@@ -31,6 +31,7 @@ const wsFiles = require('../lib/workspace-files');
 const relay = require('../lib/transport-relay');
 const ntfy = require('../lib/transport-ntfy');
 const T = require('../lib/transport');
+const deployLib = require('../lib/deploy');
 const { FilterViolation } = require('../lib/outbound');
 
 const CLIENT = 'claude-handshake/0.0.1';
@@ -1599,11 +1600,145 @@ async function cmdRest(args) {
   out('  heartbeat disarmed via ' + sentinel);
 }
 
+// ========================================================== deploy-relay ====
+
+// PROTOCOL §9.4 step 1 ("script the wrangler deploy; create the workspace;
+// write the new config"), SECURITY.md §3. ONE wrapped command so a founder
+// deploys their own Cloudflare relay without ever typing `wrangler`: the
+// mechanics live in lib/deploy.js (all via `npx --yes wrangler@<pinned major>`,
+// shell:false, Windows-safe); this function is the wiring, the workspace
+// persistence (identical to `init`'s config format) and the credential print.
+async function cmdDeployRelay(args) {
+  // (a) a child NEVER deploys - it would provision a relay and mint credentials
+  // beside its parent's (PROTOCOL 7.2 rule 1).
+  if (refuseIfChild('deploy-relay')) return;
+
+  const name = typeof args.flags.name === 'string' ? args.flags.name : path.basename(process.cwd());
+
+  // (b) locate the bundled relay dir; if it is missing, the manual fallback is
+  // the only honest answer - there is nothing to deploy from.
+  const relayDir = deployLib.locateRelayDir(__dirname);
+  if (!relayDir) {
+    err('handshake: the bundled relay source was not found in this install.');
+    err('           Deploy by hand from the claude-handshake repo: `cd relay && npx wrangler deploy`,');
+    err('           set RELAY_CREATE_TOKEN with `wrangler secret put`, then run');
+    err('           `handshake upgrade --relay https://<your-worker-origin>`.');
+    process.exitCode = 1; return;
+  }
+  const workDir = typeof args.flags['work-dir'] === 'string'
+    ? path.resolve(args.flags['work-dir']) : deployLib.defaultWorkDir();
+
+  // A plain dry preview for tests and the cautious: no deploy, no network.
+  if (args.flags['print-only']) {
+    out('deploy-relay (dry preview - nothing is deployed, no network is touched)');
+    out('  relay source: ' + relayDir);
+    out('  work dir:     ' + workDir);
+    out('  wrangler:     npx --yes ' + deployLib.wranglerSpecFrom(relayDir).spec + ' (nothing installed globally)');
+    out('  workspace:    ' + name);
+    out('  steps:        check wrangler -> whoami/login -> deploy -> /health -> put RELAY_CREATE_TOKEN (stdin) -> POST /ws -> save config + invite');
+    out('  credentials:  the create token is piped to `wrangler secret put` over stdin, never argv;');
+    out('                the recovery key is shown ONCE and never written to the repo (SECURITY.md §3).');
+    return;
+  }
+
+  out('handshake deploy-relay deploys the bundled Cloudflare Worker to YOUR Cloudflare account');
+  out('  (a free account is enough) and needs one browser login the first time.');
+  // (skip the confirm with --yes)
+  if (!args.flags.yes) {
+    if (!(await confirm('Deploy your team relay now?'))) { out('not deployed'); return; }
+  }
+
+  out('deploying team relay...');
+  let prov;
+  try {
+    // fetchImpl is left to lib/deploy -> transport-relay's default (the one
+    // network chokepoint); the CLI never names fetch itself. `args.hooks` is a
+    // test-only injection seam (a mock wrangler runner + mock fetch); parseArgs
+    // never populates it, so production always takes the real defaults.
+    const hooks = args.hooks || {};
+    prov = await deployLib.provisionRelay({
+      relayDir, workDir, name, out, err, runner: hooks.runner, fetchImpl: hooks.fetchImpl,
+    });
+  } catch (e) {
+    if (e instanceof deployLib.DeployError) { err('handshake: ' + e.guidance); process.exitCode = 1; return; }
+    err('handshake: deploy failed (' + (e && e.message ? e.message : String(e)) + ')');
+    process.exitCode = 1; return;
+  }
+
+  const origin = prov.origin;
+  const created = prov.created;          // {ws, enrollment_token, recovery_key, ...}
+  // The workspace SECRET is client-side key material the relay never sees
+  // (PROTOCOL §1); it is minted locally, exactly as `init` does.
+  const secret = envelope.newSecret();
+
+  // (h) persist the workspace in the guarded local state, in the SAME config
+  // shape `init` writes - not a second format.
+  const state = stateLib.openState(created.ws);
+  state.ensure();
+  state.update((s) => {
+    s.ws = created.ws; s.name = name; s.transport = 'relay'; s.endpoint = origin;
+    s.protocol = envelope.PROTOCOL_VERSION; s.client = CLIENT;
+    s.secret = secret.toString('base64url');
+    s.enrollment_token = created.enrollment_token;
+    s.recovery_key = created.recovery_key;
+    s.created_at = Date.now();
+    s.project_dir = process.cwd();
+    return s;
+  });
+  stateLib.linkProject(process.cwd(), created.ws);
+
+  out('');
+  out('team relay deployed');
+  out('  name:      ' + name);
+  out('  id:        ' + created.ws);
+  out('  transport: relay');
+  out('  endpoint:  ' + origin);
+  out('  state:     ' + state.dir);
+  if (process.platform === 'win32') out('  note:      ' + stateLib.WINDOWS_ACL_NOTE);
+
+  // The durable repo layer, exactly like `init`.
+  const detected = args.flags['no-repo'] ? null : repoRoot();
+  if (detected) {
+    const layer = writeRepoLayer(created.ws, state.read(), { detected, state, filterOpts: { projectDir: process.cwd() } });
+    printRepoLayer(layer);
+    const email = repoLib.localGitEmail(detected.root);
+    if (email) state.update((s) => { s.git_email = email; return s; });
+  }
+
+  // Mint the inline invite (relay: carries the secret AND the enrollment token).
+  const cfg = state.read();
+  let blob = null;
+  try {
+    blob = inviteLib.encode({ t: 'relay', e: origin, ws: created.ws, n: name, loc: 'inline', s: cfg.secret, tok: cfg.enrollment_token });
+  } catch (e) { err('handshake: could not mint the invite (' + e.message + ')'); }
+
+  out('');
+  if (blob) {
+    out('Invite (a CREDENTIAL - hand it to your team over a private channel):');
+    out(blob);
+    err('This invite carries the workspace secret and the relay enrollment token. Send it the');
+    err('way you would send a password; anyone holding it can read and sign workspace traffic');
+    err('(SECURITY.md §3).');
+  }
+  out('');
+  out('  These are shown ONCE and are never retrievable again:');
+  out('    enrollment token: ' + created.enrollment_token);
+  out('    recovery key:     ' + created.recovery_key);
+  out('  Store the recovery key OUT OF BAND - a password manager, NOT the repo, not chat, not a');
+  out('  commit. It is immutable in v1 (SECURITY.md §3): lose it and the workspace must be');
+  out('  recreated, and anyone who holds it can rotate, purge or destroy the workspace.');
+  out('');
+  out('  relay URL: ' + origin);
+  out('');
+  out('Teammates join by pasting the invite into their own Claude Code (README -> Install).');
+}
+
 // =============================================================== upgrade ====
 
-// PROTOCOL section 9.4, zero-setup -> relay. SCOPED: the wrangler deploy is a
-// later milestone, so this assumes the relay is already deployed and reachable
-// and performs the protocol steps only.
+// PROTOCOL §9.4: zero-setup -> team relay. Step 1 is "script the wrangler
+// deploy; create the workspace; write the new config" - with no --relay this
+// now deploys a relay in place (via lib/deploy.js) instead of printing a manual
+// gap; with --relay it migrates onto a relay the user already deployed.
 async function cmdUpgrade(args) {
   if (refuseIfChild('upgrade')) return;
   const found = requireWs(args); if (!found) return;
@@ -1613,25 +1748,53 @@ async function cmdUpgrade(args) {
     err('handshake: upgrade migrates zero-setup (ntfy) -> team relay. This workspace is already on ' + ctx.cfg.transport + '.');
     process.exitCode = 2; return;
   }
-  const origin = typeof args.flags.relay === 'string' ? args.flags.relay.replace(/\/+$/, '') : null;
+  let origin = typeof args.flags.relay === 'string' ? args.flags.relay.replace(/\/+$/, '') : null;
+  let createToken = null;
+
   if (!origin) {
-    out('handshake upgrade needs a deployed relay.');
-    out('');
-    out('  1. Deploy the Worker from relay/ (wrangler deploy) and set RELAY_CREATE_TOKEN');
-    out('     with `wrangler secret put` - never in [vars].');
-    out('  2. Re-run:  handshake upgrade --relay https://<your-worker-origin>');
-    out('');
-    out('Scripting the deploy is a later milestone; this command does the protocol');
-    out('steps only (PROTOCOL 9.4).');
-    return;
+    // No --relay: offer to deploy one in place (PROTOCOL §9.4 step 1). The
+    // manual pointer stays the fallback when the deploy is declined or the
+    // bundled relay source is unavailable.
+    const relayDir = deployLib.locateRelayDir(__dirname);
+    out('handshake upgrade needs a relay. `handshake deploy-relay` can deploy your own in one');
+    out('command, or upgrade can deploy one here and migrate onto it.');
+    const doNow = Boolean(relayDir) && (args.flags.yes || await confirm('Deploy a relay now and migrate onto it?'));
+    if (!doNow) {
+      out('');
+      out('  Manual path:');
+      out('  1. Deploy the Worker from relay/ (wrangler deploy) and set RELAY_CREATE_TOKEN');
+      out('     with `wrangler secret put` - never in [vars].');
+      out('  2. Re-run:  handshake upgrade --relay https://<your-worker-origin>');
+      if (!relayDir) out('  (the bundled relay/ source was not found here, so the in-place deploy is unavailable)');
+      return;
+    }
+    const workDir = typeof args.flags['work-dir'] === 'string'
+      ? path.resolve(args.flags['work-dir']) : deployLib.defaultWorkDir();
+    try {
+      // createWorkspace:false - upgrade mints its OWN workspace below, carrying
+      // the migrated ntfy secret across.
+      const prov = await deployLib.provisionRelay({
+        relayDir, workDir, name: ctx.cfg.name,
+        out, err, createWorkspace: false,
+      });
+      origin = prov.origin;
+      createToken = prov.createToken;
+    } catch (e) {
+      if (e instanceof deployLib.DeployError) { err('handshake: ' + e.guidance); process.exitCode = 1; return; }
+      err('handshake: deploy failed (' + (e && e.message ? e.message : String(e)) + ')');
+      process.exitCode = 1; return;
+    }
   }
 
-  const createToken = (await ask('relay create token (input hidden): ', { silent: true })).trim();
-  if (!createToken) { err('no create token given'); process.exitCode = 2; return; }
+  if (createToken === null) {
+    // --relay path: the user points at a relay they deployed themselves.
+    createToken = (await ask('relay create token (input hidden): ', { silent: true })).trim();
+    if (!createToken) { err('no create token given'); process.exitCode = 2; return; }
+  }
 
   let created, joined;
   try {
-    created = await relay.createWorkspace({ origin, createToken, name: ctx.cfg.name });
+    created = await deployLib.createWorkspaceWithRetry({ origin, createToken, name: ctx.cfg.name });
     joined = await relay.joinWorkspace({
       origin, ws: created.ws, enrollmentToken: created.enrollment_token,
       member: ctx.cfg.member_name || ctx.cfg.member,
@@ -1734,7 +1897,8 @@ const COMMANDS = {
   post: cmdPost, note: cmdNote, warn: cmdWarn, presence: cmdPresence,
   sync: cmdSync, cursor: cmdCursor, status: cmdStatus, tasks: cmdTasks, guard: cmdGuard,
   rotate: cmdRotate, leave: cmdLeave, doctor: cmdDoctor,
-  mute: cmdMute, unmute: cmdUnmute, rest: cmdRest, upgrade: cmdUpgrade,
+  mute: cmdMute, unmute: cmdUnmute, rest: cmdRest,
+  'deploy-relay': cmdDeployRelay, upgrade: cmdUpgrade,
 };
 
 const USAGE = [
@@ -1761,7 +1925,8 @@ const USAGE = [
   '  mute      [on|off]        stop injecting peer chatter (LOCAL only)',
   '  unmute                    alias for `mute off`',
   '  rest      [--summary "..."]  stop broadcasting this session; keep listening',
-  '  upgrade   [--relay <origin>]  migrate zero-setup -> team relay (PROTOCOL 9.4)',
+  '  deploy-relay [--name <n>] [--work-dir <path>] [--yes] [--print-only]  deploy your own Cloudflare relay (one command)',
+  '  upgrade   [--relay <origin>] [--yes]  migrate zero-setup -> team relay (PROTOCOL 9.4)',
   '  doctor    [--json]',
   '',
   'Credentials are read from stdin, never from argv.',
