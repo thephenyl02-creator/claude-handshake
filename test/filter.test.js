@@ -96,7 +96,10 @@ test('rt: tripwire covers non-.env in-project secret files, encoded and case-fol
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hs-rt-'));
   fs.mkdirSync(path.join(dir, 'config'), { recursive: true });
   const SEC = 'moderate-secret-value-abc123xyz';
-  fs.writeFileSync(path.join(dir, 'secret.json'), JSON.stringify({ apiKey: SEC }, null, 1));
+  // MINIFIED and NESTED on purpose: a real secret.json is one line, which no
+  // line-oriented regex can read. The pretty-printed form this test used
+  // before passed while the minified form leaked (M13 follow-up).
+  fs.writeFileSync(path.join(dir, 'secret.json'), JSON.stringify({ db: { apiKey: SEC } }));
   fs.writeFileSync(path.join(dir, 'config', 'database.yml'), 'password: ' + SEC + '\n');
   const o = { projectDir: dir };
   blocked('debug: ' + SEC, o);                                        // subdir/json file

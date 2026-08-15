@@ -1274,6 +1274,33 @@ async function cmdDoctor(args) {
   else if (major >= 18) add('node', 'warn', process.version + ' - works, but node --test is thin before 20');
   else add('node', 'fail', process.version + ' - global fetch and node --test require Node 18+/20+');
 
+  // The check that matters most and is easiest to miss: a plugin can install
+  // "successfully" and still fail to LOAD (a bad manifest key, a duplicate
+  // hooks file). Every capability of this product rides on hooks, so a
+  // not-loaded plugin is a silently inert one. v0.1.0 shipped exactly that
+  // bug; this check is what makes the class impossible to ship blind again.
+  try {
+    const r = require('child_process').spawnSync(
+      process.platform === 'win32' ? 'cmd.exe' : 'claude',
+      process.platform === 'win32' ? ['/d', '/s', '/c', 'claude', 'plugin', 'list'] : ['plugin', 'list'],
+      { encoding: 'utf8', timeout: 20000, shell: false });
+    const out = String((r.stdout || '') + (r.stderr || ''));
+    if (r.error || !out.includes('claude-handshake')) {
+      add('plugin loaded', 'warn', 'could not read `claude plugin list` (not installed as a plugin, or the CLI is unavailable)');
+    } else {
+      const block = out.slice(out.indexOf('claude-handshake'));
+      const errLine = /Error:\s*(.+)/.exec(block);
+      if (/Status:\s*[x×]|failed to load/i.test(block)) {
+        add('plugin loaded', 'fail', 'the plugin is installed but FAILED TO LOAD - no hook fires, so nothing coordinates.' +
+          (errLine ? ' ' + errLine[1].trim() : ''));
+      } else {
+        add('plugin loaded', 'pass', 'claude plugin list reports it enabled');
+      }
+    }
+  } catch (e) {
+    add('plugin loaded', 'warn', 'plugin-load check skipped: ' + String(e && e.message).slice(0, 80));
+  }
+
   const found = resolveWs(args);
   if (!found) {
     add('workspace', 'warn', 'not inside a handshake workspace (cwd: ' + process.cwd() + ')');

@@ -375,6 +375,11 @@ test('PostToolUse mtime sentinel gates the second firing of a burst', () => {
   assert.deepStrictEqual(w.state.getOwnClaims()[0].files, ['src/a.ts']);
 
   // Sentinel is fresh: this firing must exit before doing any work.
+  // Stamp it to NOW rather than trusting two process spawns to land inside the
+  // 1000 ms window — under CPU load they do not, and the test would flake on
+  // the machine's speed instead of testing the gate.
+  const tick = path.join(w.state.dir, 'posttool.tick');
+  fs.utimesSync(tick, new Date(), new Date());
   assert.strictEqual(fire('src/b.ts').status, 0);
   assert.deepStrictEqual(w.state.getOwnClaims()[0].files, ['src/a.ts'], 'gated firing did no work');
 
@@ -752,8 +757,16 @@ test('hooks.json matches the section 8 cadence contract exactly', () => {
 test('the plugin manifest and the monitor declaration are wired', () => {
   const manifest = JSON.parse(fs.readFileSync(path.join(ROOT, '.claude-plugin', 'plugin.json'), 'utf8'));
   assert.strictEqual(manifest.name, 'claude-handshake');
-  assert.strictEqual(manifest.version, '0.1.0');
-  assert.strictEqual(manifest.hooks, './hooks/hooks.json');
+  assert.match(manifest.version, /^\d+\.\d+\.\d+$/);
+  // The manifest MUST NOT declare hooks. Claude Code auto-loads the standard
+  // hooks/hooks.json; declaring it too registers the same file twice and the
+  // WHOLE plugin fails to load ("Duplicate hooks file detected") — it installs
+  // "successfully" and then every capability is silently inert. v0.1.0 shipped
+  // exactly that. `plugin validate` does NOT catch it; only `plugin list`
+  // after an install does. This assertion is the regression guard.
+  assert.strictEqual(manifest.hooks, undefined,
+    'plugin.json must NOT declare hooks - the standard path is auto-loaded (duplicate => plugin fails to load)');
+  assert.ok(fs.existsSync(path.join(ROOT, 'hooks', 'hooks.json')), 'hooks live at the auto-loaded standard path');
   assert.strictEqual(manifest.experimental.monitors, './monitors/monitors.json');
   assert.ok(manifest.description && manifest.description.length > 20);
   assert.ok(fs.existsSync(path.join(ROOT, 'skills')), 'skills/ is auto-discovered at the default path');

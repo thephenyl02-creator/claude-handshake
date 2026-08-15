@@ -14,8 +14,12 @@
 # never merely by a file existing on disk.
 #
 #   install.sh              full install (Node check, plugin, fallback if needed)
-#   install.sh --verify     re-run ONLY the three-valued self-check
+#   install.sh --verify     re-run ONLY the self-check
 #   install.sh --help       usage
+#   anything else           usage + exit 2, and NOTHING is installed
+#
+# Self-check exit codes: 0 active-verified, 1 installed-but-not-active,
+# 2 not-installed, 3 listed-but-failed-to-load (inert; a reload cannot fix it).
 
 set -u
 
@@ -38,7 +42,19 @@ TARBALL_URL="https://github.com/$REPO/archive/refs/heads/main.tar.gz"
 # Marks a fallback copy as written by this installer, so a later successful
 # plugin install may safely replace it (and never a hand-authored directory).
 MARKER=".installed-by-claude-handshake-installer"
-FALLBACK_ROOT="$HOME/.claude/handshake-plugin"
+# Claude Code reads and writes its whole configuration tree from
+# $CLAUDE_CONFIG_DIR when that is set (commands/, skills/, plugins/data/,
+# settings.json), and only falls back to ~/.claude when it is not. Every path
+# below - the fallback copy, the shared command/skill locations, the backup
+# directories and BOTH self-check state roots - must follow it, or a user who
+# sets it can never reach active-verified (the roots would be scanned in a
+# directory the host never writes to).
+if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
+  CLAUDE_DIR="${CLAUDE_CONFIG_DIR%/}"
+else
+  CLAUDE_DIR="$HOME/.claude"
+fi
+FALLBACK_ROOT="$CLAUDE_DIR/handshake-plugin"
 # lib/state.js resolves ${CLAUDE_PLUGIN_DATA} when set, else ~/.claude/handshake
 # - but CLAUDE_PLUGIN_DATA is set by the Claude Code HOST inside a hook's own
 # process; this installer's own shell never sees it, even for a successful
@@ -47,8 +63,8 @@ FALLBACK_ROOT="$HOME/.claude/handshake-plugin"
 # varies by how the plugin was sourced), so the self-check scans BOTH that
 # family AND the fallback-route's fixed ~/.claude/handshake - whichever one a
 # hook actually wrote to is the one that lights up.
-STATE_ROOT_FALLBACK="$HOME/.claude/handshake"
-STATE_ROOT_PLUGIN_GLOB="$HOME/.claude/plugins/data/$PLUGIN"'*'
+STATE_ROOT_FALLBACK="$CLAUDE_DIR/handshake"
+STATE_ROOT_PLUGIN_GLOB="$CLAUDE_DIR/plugins/data/$PLUGIN"'*'
 if [ -n "${CLAUDE_PLUGIN_DATA:-}" ]; then STATE_ROOT_OVERRIDE="$CLAUDE_PLUGIN_DATA"; else STATE_ROOT_OVERRIDE=""; fi
 ACTIVE_WINDOW_SECS=1800   # 30 min: "fresh" means a hook fired recently, not ever
 # A false "active" is worse than a false "not active", so evidence is split by
@@ -65,6 +81,9 @@ ACTIVE_WINDOW_SECS=1800   # 30 min: "fresh" means a hook fired recently, not eve
 # ever set by the Claude Code host inside a plugin process, so anything fresh
 # there is hook-proof by construction.
 HOOK_PROOF_FILES='posttool.tick activity.mark hooks.ticks.json monitor.alive'
+# Absolute path of the node binary, filled in by step zero below and baked into
+# the printed settings.json snippet (see the comment there).
+NODE_BIN=""
 
 info() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 ok()   { printf '\033[1;32m  +\033[0m %s\n' "$*"; }
@@ -85,14 +104,16 @@ if [ "$#" -gt 0 ]; then
       -h|--help)
         printf 'usage: install.sh [--verify] [--help]\n'
         printf '  (no args)  full install: Node check, plugin route, WSL/no-git fallback\n'
-        printf '  --verify   re-run only the three-valued self-check (not-installed /\n'
-        printf '             installed-but-not-active / active-verified)\n'
+        printf '  --verify   re-run only the self-check (0 active-verified /\n'
+        printf '             1 installed-but-not-active / 2 not-installed /\n'
+        printf '             3 listed-but-failed-to-load)\n'
         exit 0
         ;;
       *)
         # Never silently perform a full install because a flag was mistyped
         # (`--verfiy` must not reinstall).
         printf 'install.sh: unknown option: %s\n' "$a" >&2
+        printf 'Nothing was installed. Run it with no arguments for a full install.\n' >&2
         printf 'usage: install.sh [--verify] [--help]\n' >&2
         exit 2
         ;;
@@ -133,10 +154,17 @@ find_claude() {
 
 # ------------------------------------------------ self-check (shared logic) ---
 
-# Three values, never a guess in between:
-#   not-installed            - no plugin entry AND no fallback copy
-#   installed-but-not-active - present, but no hook has proven it live recently
-#   active-verified           - a hook (SessionStart et al.) wrote fresh state
+# Four outcomes, never a guess in between:
+#   2 not-installed            - no plugin entry AND no fallback copy
+#   3 load-failed              - listed, but the host could not LOAD it and
+#                                nothing else is carrying the install. A reload
+#                                cannot fix a manifest/load error, so this must
+#                                never be reported as the benign
+#                                "installed-but-not-active" case (that is exactly
+#                                how a dead-on-arrival manifest once reached a
+#                                "successful" install).
+#   1 installed-but-not-active - present, but no hook has proven it live recently
+#   0 active-verified          - a hook (SessionStart et al.) wrote fresh state
 #
 # "Fresh" is judged by mtime recency (ACTIVE_WINDOW_SECS), never by mere
 # existence - a state file from a stale install a month ago must not read as
@@ -192,40 +220,77 @@ scan_state_roots() {
   return 0
 }
 
-# Echoes "<listed> <enabled>". Mirrors install.ps1's structural scan: find the
-# id line, then the first Status: line after it. A bare `grep -i enabled` over
-# nearby lines would read "Enabled: false" as enabled.
-plugin_list_state() {
-  "$1" plugin list </dev/null 2>/dev/null | awk -v id="$PLUGIN@$MARKETPLACE" '
-    index($0, id) > 0 { listed = 1; look = 5; next }
-    look > 0 {
-      look--
+# Mirrors install.ps1's structural scan: find the id line, then read the entry
+# that follows it up to the blank line that closes it. A bare `grep -i enabled`
+# over nearby lines would read "Enabled: false" as enabled.
+#
+# The CLI renders one entry as:
+#     <pointer> <plugin>@<marketplace>
+#       Version: <v>
+#       Scope:   <scope>
+#       Status:  <glyph> enabled | <glyph> disabled | <glyph> failed to load
+#       Error:   <message>            (zero or more, only when it failed)
+#       Note:    <message>            (zero or more)
+#     <blank line>
+# Matching is ASCII-only on purpose: the bullet/tick glyph varies by locale and
+# codepage, the Status: / Error: field names do not.
+#
+# Sets PLUGIN_LISTED / PLUGIN_ENABLED / PLUGIN_FAILED / PLUGIN_ERRORS rather
+# than echoing, so the verbatim Error: lines survive intact (they contain
+# spaces, quotes and paths). "failed to load" is tracked separately from "not
+# enabled" because it is a hard, non-self-healing condition - see self_check.
+PLUGIN_LISTED=0
+PLUGIN_ENABLED=0
+PLUGIN_FAILED=0
+PLUGIN_ERRORS=""
+read_plugin_state() {  # $1 = claude binary
+  local out parsed
+  PLUGIN_LISTED=0
+  PLUGIN_ENABLED=0
+  PLUGIN_FAILED=0
+  PLUGIN_ERRORS=""
+  [ -n "${1:-}" ] || return 0
+  out="$("$1" plugin list </dev/null 2>/dev/null || true)"
+  # First line: "<listed> <enabled> <failed>". Every later line: one verbatim
+  # Error: line from the entry.
+  parsed="$(printf '%s\n' "$out" | awk -v id="$PLUGIN@$MARKETPLACE" '
+    index($0, id) > 0 { inentry = 1; listed = 1; next }
+    inentry {
+      if ($0 ~ /^[[:space:]]*$/) { inentry = 0; next }
       if ($0 ~ /Status:/) {
         line = tolower($0)
-        if (line ~ /disabled/) { look = 0 }
-        else if (line ~ /enabled/) { enabled = 1; look = 0 }
-        else { look = 0 }
+        if (line ~ /failed/) failed = 1
+        else if (line ~ /disabled/) { }
+        else if (line ~ /enabled/) enabled = 1
+        next
+      }
+      if ($0 ~ /^[[:space:]]*Error:/) {
+        sub(/^[[:space:]]+/, "", $0)
+        errs[++n] = $0
       }
     }
-    END { printf "%d %d\n", listed, enabled }
-  '
+    END {
+      printf "%d %d %d\n", listed, enabled, failed
+      for (i = 1; i <= n; i++) print errs[i]
+    }
+  ')"
+  PLUGIN_LISTED="$(printf '%s\n' "$parsed" | head -n 1 | cut -d' ' -f1)"
+  PLUGIN_ENABLED="$(printf '%s\n' "$parsed" | head -n 1 | cut -d' ' -f2)"
+  PLUGIN_FAILED="$(printf '%s\n' "$parsed" | head -n 1 | cut -d' ' -f3)"
+  PLUGIN_ERRORS="$(printf '%s\n' "$parsed" | tail -n +2)"
+  case "$PLUGIN_LISTED" in ''|*[!0-9]*) PLUGIN_LISTED=0 ;; esac
+  case "$PLUGIN_ENABLED" in ''|*[!0-9]*) PLUGIN_ENABLED=0 ;; esac
+  case "$PLUGIN_FAILED" in ''|*[!0-9]*) PLUGIN_FAILED=0 ;; esac
+  return 0
 }
 
 self_check() {
-  local plugin_listed=0 plugin_enabled=0 fallback_present=0 claude_probe pls
+  local fallback_present=0 claude_probe d
   claude_probe="$(find_claude || true)"
-  if [ -n "$claude_probe" ]; then
-    pls="$(plugin_list_state "$claude_probe" || true)"
-    case "$pls" in
-      *' '*)
-        plugin_listed="${pls%% *}"
-        plugin_enabled="${pls##* }"
-        ;;
-    esac
-  fi
+  read_plugin_state "$claude_probe"
   for d in "$FALLBACK_ROOT"/*/; do [ -f "$d$MARKER" ] && fallback_present=1; done 2>/dev/null
 
-  local now proof_age amb_age
+  local now proof_age amb_age proof_fresh=0 load_failed=0 line
   scan_state_roots
   now=$(date +%s)
   proof_age=$((now - PROOF_MTIME))
@@ -241,13 +306,56 @@ self_check() {
     info "Self-check (state roots: $STATE_ROOT_FALLBACK , $STATE_ROOT_PLUGIN_GLOB)"
   fi
 
-  if [ "$plugin_listed" -eq 0 ] && [ "$fallback_present" -eq 0 ]; then
+  if [ "$PLUGIN_LISTED" -eq 0 ] && [ "$fallback_present" -eq 0 ]; then
     err "not-installed - neither the plugin nor a fallback copy was found."
     err "Run this installer without --verify to install."
     return 2
   fi
 
   if [ "$PROOF_MTIME" -gt 0 ] && [ "$proof_age" -lt "$ACTIVE_WINDOW_SECS" ]; then
+    proof_fresh=1
+  fi
+  # Listed, but the host reported it as failed to load. Distinct from "listed
+  # but not enabled": a disabled plugin is one /reload-plugins or
+  # `claude plugin enable` away, while a load failure means the manifest itself
+  # is broken - nothing from the plugin is loaded, and re-reading the same
+  # broken manifest cannot change that.
+  if [ "$PLUGIN_LISTED" -eq 1 ] && [ "$PLUGIN_FAILED" -eq 1 ] && [ "$PLUGIN_ENABLED" -eq 0 ]; then
+    load_failed=1
+  fi
+
+  if [ "$load_failed" -eq 1 ]; then
+    if [ "$proof_fresh" -eq 1 ] || [ "$fallback_present" -eq 1 ]; then
+      warn "$PLUGIN@$MARKETPLACE is listed but 'claude plugin list' reports it as FAILED TO LOAD:"
+    else
+      err "load-failed - $PLUGIN@$MARKETPLACE is listed by 'claude plugin list', but"
+      err "Claude Code could not load it. Nothing from the plugin is running: no"
+      err "hook, no command, no skill, no monitor. The install is INERT."
+    fi
+    if [ -n "$PLUGIN_ERRORS" ]; then
+      printf '%s\n' "$PLUGIN_ERRORS" | while IFS= read -r line; do
+        [ -n "$line" ] && err "  claude plugin list: $line"
+      done
+    else
+      err "  ('claude plugin list' printed no Error: line here - run it yourself for the raw text)"
+    fi
+    err "/reload-plugins CANNOT fix a load failure: a reload re-reads the same"
+    err "manifest and fails again identically. What to do instead:"
+    err "  1. claude plugin list            (read the full, unabridged error)"
+    err "  2. re-run this installer         (it always calls 'plugin update', so a"
+    err "     fixed release is picked up)"
+    err "  3. still failing? report that Error: line at https://github.com/$REPO/issues"
+    err "  4. or remove the broken entry: claude plugin uninstall $PLUGIN@$MARKETPLACE"
+    if [ "$proof_fresh" -eq 0 ] && [ "$fallback_present" -eq 0 ]; then
+      printf '\n'
+      return 3
+    fi
+    warn "Continuing the self-check against the fallback copy / hook evidence below,"
+    warn "which is what is actually carrying this install."
+    printf '\n'
+  fi
+
+  if [ "$proof_fresh" -eq 1 ]; then
     ok "active-verified - a handshake hook wrote hook-only state ${proof_age}s ago (within the ${ACTIVE_WINDOW_SECS}s freshness window)."
     ok "claude-handshake is running. Try: /handshake status"
     return 0
@@ -262,11 +370,18 @@ self_check() {
     warn "that fires PostToolUse, which only a hook can do, and re-checking then"
     warn "reports active-verified."
   fi
-  if [ "$plugin_listed" -eq 1 ] && [ "$plugin_enabled" -eq 0 ]; then
+  if [ "$PLUGIN_LISTED" -eq 1 ] && [ "$PLUGIN_ENABLED" -eq 0 ] && [ "$PLUGIN_FAILED" -eq 0 ]; then
+    # Deliberately NOT reached for a failed-to-load entry: that case is
+    # diagnosed above, and telling someone to run /reload-plugins for a broken
+    # manifest sends them round a loop that can never terminate.
     warn "The plugin is installed but not reporting as enabled in 'claude plugin list'."
     warn "Inside a Claude Code session, run:  /reload-plugins"
     warn "Then start a NEW session (or /reload-plugins again) before re-checking."
   else
+    # Reached for a failed-to-load entry only when a fallback copy is also
+    # present (the load-failure return above already handled the case where the
+    # plugin was the only route) - and then this is exactly the right advice,
+    # because the fallback is what runs.
     warn "This is expected immediately after install: handshake's hooks are"
     warn "no-ops until you are inside a workspace. To verify activation:"
     warn "  1. cd into a project directory (a git repo is recommended)"
@@ -323,7 +438,16 @@ fi
 
 if command -v node >/dev/null 2>&1; then
   NODE_VERSION="$(node --version 2>/dev/null || echo unknown)"
-  ok "Node found: $NODE_VERSION"
+  # Absolute path, captured here and used by the settings.json snippet below.
+  # Claude Code runs a hook with the environment of whatever process started
+  # Claude Code - which, for an nvm/asdf/fnm-managed node, is routinely a PATH
+  # WITHOUT node on it (measured on Ubuntu 24.04/WSL2: `bash -c` and `bash -lc`
+  # both fail to find an nvm node, only `bash -ic` finds it). A snippet that
+  # said bare `node` would then make every hook die with "node: command not
+  # found" - and hooks fail soft, so the install would look fine while doing
+  # nothing at all.
+  NODE_BIN="$(command -v node 2>/dev/null || true)"
+  ok "Node found: $NODE_VERSION ($NODE_BIN)"
 else
   err "Node.js was not found (required by claude-handshake's CLI and every hook)."
   err "Install it with your platform's package manager, or the official installer:"
@@ -449,36 +573,129 @@ plugin_route() {
 
 info "Installing the claude-handshake plugin..."
 PLUGIN_ROUTE_OK=0
-if plugin_route; then
+ROUTE_REPORTED_OK=0
+plugin_route && ROUTE_REPORTED_OK=1
+# Read the resulting state once, on BOTH paths: it decides whether a failed
+# route can be ignored (a working install already exists - do not shadow it
+# with a frozen fallback copy) and whether the plugin the route just installed
+# is actually loadable. Uses the same structural Status:-line scan as the
+# self-check (a bare `grep enabled` over the next few lines would accept
+# "Enabled: false"), because this decides whether the fallback runs at all.
+read_plugin_state "$CLAUDE_BIN"
+if [ "$ROUTE_REPORTED_OK" -eq 1 ]; then
   PLUGIN_ROUTE_OK=1
   ok "Plugin installed: $PLUGIN@$MARKETPLACE"
+elif [ "$PLUGIN_ENABLED" -eq 1 ]; then
+  PLUGIN_ROUTE_OK=1
+  warn "Plugin route failed, but $PLUGIN@$MARKETPLACE is already installed and enabled - keeping it."
 else
-  # The route may have failed transiently over a working plugin install - do
-  # not shadow that with a frozen fallback copy. Uses the same structural
-  # Status:-line scan as the self-check (a bare `grep enabled` over the next
-  # few lines would accept "Enabled: false"), because this decides whether the
-  # fallback runs at all.
-  ALREADY="$(plugin_list_state "$CLAUDE_BIN" || true)"
-  case "$ALREADY" in
-    '1 1')
-      PLUGIN_ROUTE_OK=1
-      warn "Plugin route failed, but $PLUGIN@$MARKETPLACE is already installed and enabled - keeping it."
-      ;;
-    *)
-      warn "Plugin route failed."
-      ;;
-  esac
+  warn "Plugin route failed."
+fi
+# `plugin install` can exit 0 for a plugin the host then refuses to load (a
+# broken manifest installs perfectly well). That must never be allowed to
+# trigger the supersede-cleanup below: deleting a working fallback copy in
+# favour of an inert plugin would take a working install away from the user.
+# The self-check reports it in full.
+PLUGIN_LOAD_FAILED=0
+if [ "$PLUGIN_LISTED" -eq 1 ] && [ "$PLUGIN_FAILED" -eq 1 ] && [ "$PLUGIN_ENABLED" -eq 0 ]; then
+  PLUGIN_LOAD_FAILED=1
 fi
 
 NEED_FALLBACK=0
 [ "$PLUGIN_ROUTE_OK" -eq 0 ] && NEED_FALLBACK=1
 [ "$IS_WSL" -eq 1 ] && NEED_FALLBACK=1
 
-if [ "$NEED_FALLBACK" -eq 0 ]; then
+if [ "$NEED_FALLBACK" -eq 0 ] && [ "$PLUGIN_LOAD_FAILED" -eq 1 ]; then
+  warn "$PLUGIN@$MARKETPLACE is listed but reports 'failed to load' - keeping any"
+  warn "existing fallback copy (removing it would leave nothing running). The"
+  warn "self-check below reports the load error in full."
+elif [ "$NEED_FALLBACK" -eq 0 ]; then
   # A previous run may have used the fallback; the plugin copy supersedes it.
-  # Only remove a copy carrying our marker - never a hand-authored directory.
-  # Contents first, marker last: if a locked file blocks full removal, the
-  # marker survives and a later run can still recognize and finish this.
+  # The fallback route writes THREE things, so all three have to be superseded
+  # together:
+  #   1. $FALLBACK_ROOT/<version>/           (carries $MARKER)
+  #   2. $CLAUDE_DIR/skills/handshake/       (carries $MARKER)
+  #   3. $CLAUDE_DIR/commands/handshake.md   (a single file - no marker is
+  #      possible, so identity is proven by content)
+  # Removing only (1) left (2) and (3) behind pointing at the very directory
+  # this run had just deleted, and made /handshake and the skill load twice -
+  # once from the orphans, once from the plugin.
+  #
+  # Ownership rules are unchanged: only something this installer wrote is
+  # deleted outright, anything ambiguous is backed up first, and anything with
+  # no trace of the fallback route is left alone.
+  MARKED_FALLBACKS=""
+  for FB in "$FALLBACK_ROOT"/*/; do
+    FB="${FB%/}"
+    [ -f "$FB/$MARKER" ] || continue
+    MARKED_FALLBACKS="$MARKED_FALLBACKS$FB
+"
+  done
+  USER_SKILL="$CLAUDE_DIR/skills/handshake"
+  USER_CMD="$CLAUDE_DIR/commands/handshake.md"
+  USER_SKILL_IS_OURS=0
+  [ -f "$USER_SKILL/$MARKER" ] && USER_SKILL_IS_OURS=1
+  # The gate for touching the SHARED user-level locations at all: is there any
+  # evidence THIS installer's fallback route ever ran here? Without it, a
+  # machine that only ever used the plugin route would have a hand-written
+  # ~/.claude/commands/handshake.md moved aside for no reason.
+  FALLBACK_TRACES=0
+  [ -n "$MARKED_FALLBACKS" ] && FALLBACK_TRACES=1
+  [ "$USER_SKILL_IS_OURS" -eq 1 ] && FALLBACK_TRACES=1
+  SUPERSEDE_BAK="$CLAUDE_DIR/handshake-backup.$(date +%s)"
+
+  # (3) command file - compared against the fallback copies BEFORE they are
+  # removed below, since they are the only proof of what this installer wrote
+  # there.
+  if [ "$FALLBACK_TRACES" -eq 1 ] && [ -f "$USER_CMD" ]; then
+    CMD_IS_OURS=0
+    while IFS= read -r FBDIR; do
+      [ -n "$FBDIR" ] || continue
+      [ -f "$FBDIR/commands/handshake.md" ] || continue
+      if cmp -s "$FBDIR/commands/handshake.md" "$USER_CMD"; then
+        CMD_IS_OURS=1
+        break
+      fi
+    done <<MARKED_FALLBACK_LIST
+$MARKED_FALLBACKS
+MARKED_FALLBACK_LIST
+    if [ "$CMD_IS_OURS" -eq 1 ]; then
+      if rm -f "$USER_CMD" && [ ! -e "$USER_CMD" ]; then
+        ok "Removed the superseded user-level command $USER_CMD (the plugin provides /handshake now)"
+      else
+        warn "Could not remove the superseded $USER_CMD - /handshake may load twice."
+      fi
+    else
+      # It differs from every copy we wrote (hand-edited, or from an older
+      # release whose fallback directory is gone). Never delete that outright -
+      # back it up, then take it out of the load path so it cannot shadow the
+      # plugin's own command.
+      if mkdir -p "$SUPERSEDE_BAK" && mv "$USER_CMD" "$SUPERSEDE_BAK/commands-handshake.md"; then
+        warn "$USER_CMD differed from every copy this installer wrote - moved it to $SUPERSEDE_BAK/commands-handshake.md so it cannot shadow the plugin's /handshake."
+      else
+        warn "Could not back up $USER_CMD - leaving it in place. /handshake may load twice until you remove it."
+      fi
+    fi
+  fi
+
+  # (2) skill directory - marker or nothing.
+  if [ -e "$USER_SKILL" ]; then
+    if [ "$USER_SKILL_IS_OURS" -eq 1 ]; then
+      if rm -rf "$USER_SKILL" && [ ! -e "$USER_SKILL" ]; then
+        ok "Removed the superseded user-level skill $USER_SKILL (the plugin provides it now)"
+      else
+        warn "Could not remove the superseded $USER_SKILL (a file may be in use)."
+        warn "Close Claude Code and re-run this installer, or the skill may load twice."
+      fi
+    elif [ "$FALLBACK_TRACES" -eq 1 ]; then
+      warn "$USER_SKILL was not written by this installer - leaving it untouched."
+      warn "It may shadow the plugin's own handshake skill; remove it yourself if that is not what you want."
+    fi
+  fi
+
+  # (1) fallback copies. Contents first, marker last: if a locked file blocks
+  # full removal, the marker survives and a later run can still recognize and
+  # finish this.
   for FB in "$FALLBACK_ROOT"/*/; do
     FB="${FB%/}"
     [ -f "$FB/$MARKER" ] || continue
@@ -527,7 +744,7 @@ else
     # Not ours - never destroy a hand-authored directory; move it aside.
     # The backup must live OUTSIDE $FALLBACK_ROOT, or a later scan of
     # $FALLBACK_ROOT/*/ would still find and try to manage it.
-    BAK="$HOME/.claude/handshake-plugin-backup.$(date +%s)"
+    BAK="$CLAUDE_DIR/handshake-plugin-backup.$(date +%s)"
     if mv "$DEST" "$BAK"; then
       warn "Existing $DEST was not created by this installer - moved it to $BAK"
     else
@@ -547,6 +764,47 @@ else
     warn "Could not write the installer marker at $DEST/$MARKER - a future run will treat this copy as hand-authored and move it aside instead of replacing it."
   fi
   ok "Copied claude-handshake $VERSION to $DEST"
+
+  # ---- prune to the runtime payload ------------------------------------------
+  # The downloaded archive is the WHOLE repository - test/, e2e/, spike/, docs/,
+  # scripts/, installers/, PLAN.md - none of which is ever loaded at runtime,
+  # and all of which would sit in the user's own config directory forever. Keep
+  # only what a hook, the CLI, the skill/command files and `deploy-relay`
+  # actually read. The keep-list is maintained beside the repo layout, which is
+  # safe because the installer and the payload always ship from the same branch
+  # of the same repo - they cannot drift apart.
+  prune_to_runtime() {  # $1 = installed copy root
+    local root="$1" entry base
+    for entry in "$root"/* "$root"/.[!.]*; do
+      [ -e "$entry" ] || continue
+      base="${entry##*/}"
+      case "$base" in
+        bin|lib|hooks|monitors|skills|commands|relay|.claude-plugin) ;;
+        package.json|LICENSE|README.md) ;;
+        "$MARKER") ;;
+        *) rm -rf "$entry" 2>/dev/null || true ;;
+      esac
+    done
+    # relay/: lib/deploy.js copies exactly src/, wrangler.toml and package.json
+    # to the work dir, and locateRelayDir only probes for wrangler.toml plus
+    # src/worker.js. Everything else there is development-only.
+    if [ -d "$root/relay" ]; then
+      for entry in "$root"/relay/* "$root"/relay/.[!.]*; do
+        [ -e "$entry" ] || continue
+        base="${entry##*/}"
+        case "$base" in
+          src|wrangler.toml|package.json) ;;
+          *) rm -rf "$entry" 2>/dev/null || true ;;
+        esac
+      done
+    fi
+    return 0
+  }
+  prune_to_runtime "$DEST"
+  if [ ! -f "$DEST/bin/handshake.js" ] || [ ! -d "$DEST/hooks" ] || [ ! -d "$DEST/lib" ]; then
+    err "Pruning removed something it should not have - $DEST is incomplete."
+    exit 1
+  fi
 
   # Rewrite the plugin-relative references so the standalone copy is directly
   # runnable: ${CLAUDE_PLUGIN_ROOT} / $CLAUDE_PLUGIN_ROOT only exist when the
@@ -597,32 +855,34 @@ else
   # the replacement exists, never destroy something we did not write, and keep
   # any backup OUTSIDE the managed directory (a backup left inside
   # ~/.claude/skills would load as a second, stale `handshake` skill).
-  USER_BAK="$HOME/.claude/handshake-backup.$(date +%s)"
-  mkdir -p "$HOME/.claude/commands" "$HOME/.claude/skills"
+  USER_BAK="$CLAUDE_DIR/handshake-backup.$(date +%s)"
+  mkdir -p "$CLAUDE_DIR/commands" "$CLAUDE_DIR/skills"
 
   if [ -f "$DEST/commands/handshake.md" ]; then
-    CMD_DEST="$HOME/.claude/commands/handshake.md"
+    USER_CMD_PATH="$CLAUDE_DIR/commands/handshake.md"
+    CMD_DEST="$USER_CMD_PATH"
     if [ -e "$CMD_DEST" ] && ! cmp -s "$DEST/commands/handshake.md" "$CMD_DEST"; then
       if mkdir -p "$USER_BAK" && cp -p "$CMD_DEST" "$USER_BAK/commands-handshake.md" 2>/dev/null; then
-        warn "Your existing ~/.claude/commands/handshake.md differed - backed it up to $USER_BAK/commands-handshake.md"
+        warn "Your existing $USER_CMD_PATH differed - backed it up to $USER_BAK/commands-handshake.md"
       else
-        err "Could not back up the existing ~/.claude/commands/handshake.md - leaving it untouched."
+        err "Could not back up the existing $USER_CMD_PATH - leaving it untouched."
         CMD_DEST=""
       fi
     fi
     # Write beside it, then rename over: the replacement exists before the
     # old file stops existing, and a failed copy leaves the original intact.
     if [ -n "$CMD_DEST" ] && cp "$DEST/commands/handshake.md" "$CMD_DEST.new" && mv "$CMD_DEST.new" "$CMD_DEST"; then
-      ok "Command copied: ~/.claude/commands/handshake.md (/handshake will work once claude reloads)"
+      ok "Command copied: $USER_CMD_PATH (/handshake will work once claude reloads)"
     elif [ -n "$CMD_DEST" ]; then
       rm -f "$CMD_DEST.new"
-      warn "Could not install ~/.claude/commands/handshake.md - /handshake will not be available."
+      warn "Could not install $USER_CMD_PATH - /handshake will not be available."
     fi
   fi
 
   if [ -d "$DEST/skills/handshake" ]; then
-    SKILL_DEST="$HOME/.claude/skills/handshake"
-    SKILL_STAGE="$HOME/.claude/skills/.handshake-installing.$$"
+    USER_SKILL_PATH="$CLAUDE_DIR/skills/handshake"
+    SKILL_DEST="$USER_SKILL_PATH"
+    SKILL_STAGE="$CLAUDE_DIR/skills/.handshake-installing.$$"
     rm -rf "$SKILL_STAGE"
     if cp -R "$DEST/skills/handshake" "$SKILL_STAGE" && [ -f "$SKILL_STAGE/SKILL.md" ]; then
       : > "$SKILL_STAGE/$MARKER" 2>/dev/null || true
@@ -630,44 +890,72 @@ else
         # Not ours (or written by a pre-marker version of this installer):
         # move it aside rather than delete it.
         if mkdir -p "$USER_BAK" && mv "$SKILL_DEST" "$USER_BAK/skills-handshake"; then
-          warn "Existing ~/.claude/skills/handshake was not written by this installer - moved it to $USER_BAK/skills-handshake"
+          warn "Existing $USER_SKILL_PATH was not written by this installer - moved it to $USER_BAK/skills-handshake"
         else
-          err "Could not move ~/.claude/skills/handshake aside - leaving it untouched."
+          err "Could not move $USER_SKILL_PATH aside - leaving it untouched."
           SKILL_DEST=""
         fi
       elif [ -e "$SKILL_DEST" ] && ! rm -rf "$SKILL_DEST"; then
-        warn "Could not replace ~/.claude/skills/handshake (a file may be in use)."
+        warn "Could not replace $USER_SKILL_PATH (a file may be in use)."
         SKILL_DEST=""
       fi
       if [ -n "$SKILL_DEST" ] && mv "$SKILL_STAGE" "$SKILL_DEST"; then
-        ok "Skill copied: ~/.claude/skills/handshake"
+        ok "Skill copied: $USER_SKILL_PATH"
       else
         rm -rf "$SKILL_STAGE"
-        warn "Could not install ~/.claude/skills/handshake - the on-demand skill will not load."
+        warn "Could not install $USER_SKILL_PATH - the on-demand skill will not load."
       fi
     else
       rm -rf "$SKILL_STAGE"
-      warn "Could not stage the skill copy - ~/.claude/skills/handshake left unchanged."
+      warn "Could not stage the skill copy - $USER_SKILL_PATH left unchanged."
     fi
   fi
 
   printf '\n'
   info "Hook registration (required - not automated on purpose)"
-  printf 'This installer will NOT edit ~/.claude/settings.json for you. Merge the\n'
+  printf 'This installer will NOT edit %s/settings.json for you. Merge the\n' "$CLAUDE_DIR"
   printf '"hooks" object below into it by hand (or ask your own Claude Code session\n'
   printf 'to do it, and review the diff before saving):\n\n'
   if [ -f "$DEST/hooks/hooks.json" ]; then
-    # The sed pass above already resolved ${CLAUDE_PLUGIN_ROOT} to $DEST inside
-    # this copy's own hooks.json, so this just re-wraps it for settings.json.
+    # The rewrite pass above already resolved ${CLAUDE_PLUGIN_ROOT} to $DEST
+    # inside this copy's own hooks.json, so this re-wraps it for settings.json -
+    # and pins the interpreter while doing so. hooks.json ships the bare word
+    # `node`, which is correct for the plugin route (the host resolves it) but
+    # wrong here: these commands are about to be pasted into settings.json and
+    # will be executed with whatever environment started Claude Code. An
+    # nvm/asdf/fnm node is not on that PATH, every hook then dies with
+    # "node: command not found", and because hooks fail soft the install looks
+    # perfectly healthy while doing nothing. Same node-based renderer as before,
+    # so quoting/escaping stays correct for a path with spaces.
     node -e '
       const fs = require("fs");
-      const hooks = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
-      console.log(JSON.stringify({ hooks: hooks.hooks }, null, 2));
-    ' "$DEST/hooks/hooks.json"
+      const hooks = JSON.parse(fs.readFileSync(process.argv[1], "utf8")).hooks || {};
+      const nodeBin = process.argv[2] || "";
+      if (nodeBin) {
+        for (const event of Object.keys(hooks)) {
+          for (const group of hooks[event] || []) {
+            for (const h of (group && group.hooks) || []) {
+              if (h && typeof h.command === "string" && /^node\s/.test(h.command)) {
+                h.command = JSON.stringify(nodeBin) + h.command.slice("node".length);
+              }
+            }
+          }
+        }
+      }
+      console.log(JSON.stringify({ hooks }, null, 2));
+    ' "$DEST/hooks/hooks.json" "$NODE_BIN"
   else
     warn "(could not render the hooks snippet - inspect $DEST/hooks/hooks.json by hand)"
   fi
   printf '\n'
+  if [ -n "$NODE_BIN" ]; then
+    printf 'The hook commands above deliberately pin the absolute node binary this\n'
+    printf 'installer found (%s) instead of the bare word "node":\n' "$NODE_BIN"
+    printf 'Claude Code runs hooks with the environment of whatever process started it,\n'
+    printf 'and an nvm/asdf/fnm node is usually NOT on that PATH - the hooks would then\n'
+    printf 'fail silently with "node: command not found". Update that path by hand if\n'
+    printf 'you later switch node versions.\n\n'
+  fi
   printf 'Monitors (the presence/claim-renewal clock) have no settings.json\n'
   printf 'equivalent and are NOT available in this fallback mode. This is a\n'
   printf 'documented, handled condition, not a defect: claude-handshake falls back\n'

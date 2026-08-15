@@ -15,7 +15,6 @@
     "coordination",
     "peer-to-peer"
   ],
-  "hooks": "./hooks/hooks.json",
   "experimental": {
     "monitors": "./monitors/monitors.json"
   }

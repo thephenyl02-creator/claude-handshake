@@ -325,7 +325,10 @@ test('doctor check: token-in-history finds a credential that was committed and t
   const hist = repo.tokenInHistory(box.dir);
   assert.equal(hist.ok, true);
   assert.ok(hist.hits.length >= 1, 'the removed credential is still in history - that is the point');
-  assert.ok(hist.hits.some((h) => h.needle === 'hsk_'));
+  // Needles are full credential SHAPES, not bare prefixes: scanning for "hsk_"
+  // alone fired on this project's own docs and pattern definitions (24 false
+  // positives), and a doctor that cries wolf is a doctor users ignore.
+  assert.ok(hist.hits.some((h) => h.needle.startsWith('hsk_')), 'the enrollment-token shape matched');
 
   const clean = repo.tokenInHistory(gitRepo().dir);
   assert.equal(clean.ok, true);
