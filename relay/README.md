@@ -27,7 +27,7 @@ npx wrangler deploy
 
 ```sh
 curl https://claude-handshake-relay.<your-subdomain>.workers.dev/health
-# {"ok":true,"service":"claude-handshake-relay","version":"0.1.0","protocol":1}
+# {"ok":true,"service":"claude-handshake-relay","version":"0.1.1","protocol":1}
 ```
 
 Then create the workspace and hand the invite to your team:
@@ -116,8 +116,8 @@ they cannot land in a proxy's request-body log.
 | GET | `/` | none | HTML page from `src/landing.js` — swap that one file to restyle it |
 | GET | `/health` | none | `{ok, service, version, protocol}` — stable shape for `doctor` |
 | POST | `/ws` | `RELAY_CREATE_TOKEN` | mints workspace id + enrollment token + recovery key |
-| POST | `/ws/:id/join` | enrollment token | mints `{member_id, secret}`; duplicate names rejected |
-| POST | `/ws/:id/heartbeat` | member | presence + renews that member's claims |
+| POST | `/ws/:id/join` | enrollment token | mints `{member_id, secret}`; duplicate names rejected; optional `display_name` |
+| POST | `/ws/:id/heartbeat` | member | presence + renews that member's claims; optional `display_name` |
 | POST | `/ws/:id/claim` | member | one winner per normalized subject; 409 carries the live claim |
 | POST | `/ws/:id/release` | member (owner) | 403 for anyone else |
 | POST | `/ws/:id/post` | member | append an envelope |
@@ -127,9 +127,32 @@ they cannot land in a proxy's request-body log.
 | POST | `/ws/:id/purge` | recovery key | clears messages (`{"all":true}` also clears claims/presence) |
 | DELETE | `/ws/:id` | recovery key | destroys the workspace; the id cannot be re-bound |
 | POST | `/ws/:id/members/:member/remove` | recovery key | invalidates that sub-token, releases its claims |
+| POST | `/ws/:id/members/:member/rebind` | recovery key | reissues a sub-token for a member that still exists |
 
 Joining a workspace id that was never created returns **404 and writes
 nothing** — the relay never binds a workspace on first contact.
+
+### Members
+
+`name` is the authoritative handle: printable ASCII, unique per workspace, and
+permanently retired on removal. `display_name` is an OPTIONAL label beside it —
+UTF-8, sanitized (C0/C1 controls, bidi overrides and isolates, and the
+zero-width class are stripped), then capped at 40 characters *after*
+sanitizing, so padding a name with invisibles buys nothing. It may be sent at
+`join` or on any `heartbeat`, is returned in `members[]` and `presence[]`, and
+is never used for identity, uniqueness or authorization. A `display_name` that
+sanitizes away to nothing stores as absent and never fails the call.
+
+`rebind` is the recovery path for a member that lost its local credential:
+names are retired for good, so re-joining under the same name is refused
+(`409 member_name_taken`), and only the recovery key can reissue a sub-token.
+It keeps the member id — and with it that member's claims, cursor and place in
+every peer's roster — and invalidates the previous secret immediately. It
+accepts the member id or the member name in the path. It never un-retires a
+removed member: that is `409 member_revoked`, and an unknown member is
+`404 member_not_found`. After a rebind the client must restart its `sender_seq`
+from the current Unix ms, because `(member, sender_seq)` is still the dedupe
+key.
 
 ### Claims
 
@@ -143,21 +166,35 @@ same subject renews it and merges `files[]`.
 
 ### Messages
 
-Append-only with a Durable-Object-assigned monotonic `seq`. Envelopes are
-stored **verbatim** — every field the client sent, including `sig` and fields
-this version does not know about. The relay does not verify `sig` (the HMAC is
-end-to-end between clients) and must never strip it.
+Append-only with a Durable-Object-assigned monotonic `seq`. That `seq` is the
+relay's own; the sender's per-sender dedupe counter is the separate envelope
+field **`sender_seq`** — two different numbers, which is why they no longer
+share a name. Envelopes are stored **verbatim** — every field the client sent,
+including `sig` and fields this version does not know about. The relay does not
+verify `sig` (the HMAC is end-to-end between clients) and must never strip it.
 
-`from` is server-authoritative but is *not* rewritten: a client may include its
-own `from` (it is inside its HMAC), and a mismatch with the authenticated
-member is refused with `403 from_mismatch` rather than silently overwritten —
-overwriting would invalidate a signature the relay cannot recompute. Each
-message is returned wrapped as `{seq, from, from_name, received_at, envelope}`,
-where the outer `from` is the authenticated member id.
+`from` is REQUIRED and complete (`{member, machine, session}`, all strings): it
+sits inside the signed serialization, so an envelope missing any part of it
+cannot be verified by the peer that has to check the HMAC (`400 envelope_from`).
+It is server-authoritative but is *not* rewritten: a mismatch with the
+authenticated member is refused with `403 from_mismatch` rather than silently
+overwritten — overwriting would invalidate a signature the relay cannot
+recompute. `ws` is checked against the workspace in the path
+(`400 envelope_ws`), which is cheap defence in depth against a cross-workspace
+replay. Each message is returned wrapped as `{seq, from, from_name,
+received_at, envelope}`, where the outer `from` is the authenticated member id.
+
+`presence.update`, `task.claim`, `task.release` and `state.request` are
+**refused** here with `400 envelope_type_not_carried`. On this transport they
+are the server's own state, reached through `/heartbeat`, `/claim`, `/release`
+and `/sync`; accepting them as envelopes would build unauthenticated shadow
+state beside the server's and spend the fetch budget re-sending what `sync`
+already returns. Every other type matching the type regex is carried, including
+ones this version does not know — forward compatibility lives at the transport.
 
 Retention is TTL **and** count: 7 days, last 500. Reads filter by TTL, so an
 expired message is never returned even before the sweep deletes it. Replaying a
-`(member, envelope.seq)` pair is idempotent — useful for the offline queue.
+`(member, sender_seq)` pair is idempotent — useful for the offline queue.
 
 Sync returns at most 20 messages, chosen per-sender round-robin with 5 slots
 reserved for `warn.*` and `note.blocker`, so one chatty peer cannot bury a
@@ -205,6 +242,14 @@ belongs at injection time on the client.
 
 Rotation does not invalidate existing member sub-tokens, and it never un-leaks
 git history.
+
+### Lost-credential runbook
+
+A member that loses local state loses its sub-token, and cannot re-join under
+its own name. Use `POST /ws/:id/members/:member/rebind` with the recovery key
+and hand the new `token` back over the same channel the invite went out on. The
+old secret dies the moment the new one is minted, so a rebind is also the right
+answer to a sub-token that leaked from one machine.
 
 ---
 

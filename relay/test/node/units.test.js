@@ -9,7 +9,7 @@ import { timingSafeEqual } from '../../src/lib/crypto.js';
 import { ENROLL_PREFIX, credentialWellFormed, mintCredential, parseMemberToken } from '../../src/lib/tokens.js';
 import { normalizeSubject } from '../../src/lib/subject.js';
 import { selectFair } from '../../src/lib/fairness.js';
-import { validateEnvelope } from '../../src/lib/envelope.js';
+import { isCarriedByRelay, validateEnvelope } from '../../src/lib/envelope.js';
 
 describe('timingSafeEqual', () => {
   it('matches only identical strings', () => {
@@ -110,45 +110,95 @@ describe('fair selection', () => {
 });
 
 describe('envelope validation', () => {
+  const WS = '0123456789abcdef0123456789abcdef';
   const base = () => ({
     v: 1,
+    ws: WS,
+    from: { member: '3f2a1b0c4d5e6f70', machine: 'm-7d3f9a2c', session: 's-1a2b3c4d' },
     type: 'note.info',
     body: { a: 1 },
     ts: Date.now(),
     nonce: 'abcdefgh',
-    seq: 0,
+    sender_seq: 0,
     sig: 'x'
   });
 
   it('accepts a well-formed envelope', () => {
-    assert.equal(validateEnvelope(base(), Date.now()).ok, true);
+    assert.equal(validateEnvelope(base(), Date.now(), WS).ok, true);
   });
 
   it('preserves nothing and rejects everything malformed', () => {
     const now = Date.now();
+    const drop = (key) => {
+      const e = base();
+      delete e[key];
+      return e;
+    };
     const cases = [
       [null, 'envelope_missing'],
       [{ ...base(), v: 2 }, 'envelope_version'],
       [{ ...base(), type: 'nodot' }, 'envelope_type'],
-      [(() => { const e = base(); delete e.body; return e; })(), 'envelope_body_missing'],
+      [drop('body'), 'envelope_body_missing'],
       [{ ...base(), body: undefined }, 'envelope_body_missing'],
       [{ ...base(), nonce: 'short' }, 'envelope_nonce'],
-      [{ ...base(), seq: 1.5 }, 'envelope_seq'],
+      [{ ...base(), sender_seq: 1.5 }, 'envelope_sender_seq'],
+      [{ ...base(), sender_seq: -1 }, 'envelope_sender_seq'],
+      [drop('sender_seq'), 'envelope_sender_seq'],
+      // The pre-rename field name is not an alias for it.
+      [{ ...drop('sender_seq'), seq: 3 }, 'envelope_sender_seq'],
       [{ ...base(), sig: '' }, 'envelope_sig'],
+      [{ ...base(), ws: 'f'.repeat(32) }, 'envelope_ws'],
+      [{ ...base(), ws: 42 }, 'envelope_ws'],
+      [drop('ws'), 'envelope_ws'],
+      [drop('from'), 'envelope_from'],
+      [{ ...base(), from: null }, 'envelope_from'],
+      [{ ...base(), from: 'alice' }, 'envelope_from'],
+      [{ ...base(), from: ['alice'] }, 'envelope_from'],
       [{ ...base(), from: { machine: 'x' } }, 'envelope_from'],
+      [{ ...base(), from: { member: 'a', machine: 'm-1' } }, 'envelope_from'],
+      [{ ...base(), from: { member: 'a', machine: 'm-1', session: 7 } }, 'envelope_from'],
+      [{ ...base(), from: { member: '', machine: 'm-1', session: 's-1' } }, 'envelope_from'],
       [{ ...base(), ts: now - 400000 }, 'envelope_ts_skew']
     ];
     for (const [envelope, code] of cases) {
-      const result = validateEnvelope(envelope, now);
+      const result = validateEnvelope(envelope, now, WS);
       assert.equal(result.ok, false, code);
       assert.equal(result.code, code);
     }
   });
 
+  it('fails closed when no workspace id is supplied to match against', () => {
+    assert.equal(validateEnvelope(base(), Date.now(), undefined).code, 'envelope_ws');
+    assert.equal(validateEnvelope(base(), Date.now(), null).code, 'envelope_ws');
+  });
+
   it('reads a second-precision ts as seconds', () => {
     const now = Date.now();
-    const result = validateEnvelope({ ...base(), ts: Math.floor(now / 1000) }, now);
+    const result = validateEnvelope({ ...base(), ts: Math.floor(now / 1000) }, now, WS);
     assert.equal(result.ok, true);
     assert.ok(Math.abs(result.ts - now) < 1000);
+  });
+});
+
+describe('relay carriage', () => {
+  it('excludes exactly the four types the relay holds as server state', () => {
+    for (const type of ['presence.update', 'task.claim', 'task.release', 'state.request']) {
+      assert.equal(isCarriedByRelay(type), false, type);
+    }
+    for (const type of [
+      'task.done',
+      'task.change',
+      'note.discovery',
+      'note.error',
+      'note.fix',
+      'note.blocker',
+      'note.info',
+      'warn.overlap',
+      'ws.join',
+      'ws.leave',
+      'ws.migrate'
+    ]) {
+      assert.equal(isCarriedByRelay(type), true, type);
+    }
   });
 });

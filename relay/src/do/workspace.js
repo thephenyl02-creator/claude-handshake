@@ -9,7 +9,7 @@ import {
   newMemberId,
   parseMemberToken
 } from '../lib/tokens.js';
-import { validateEnvelope } from '../lib/envelope.js';
+import { isCarriedByRelay, validateEnvelope } from '../lib/envelope.js';
 import { MAX_SUBJECT_CHARS, normalizeSubject } from '../lib/subject.js';
 import { selectFair } from '../lib/fairness.js';
 import { cfg } from '../lib/config.js';
@@ -27,6 +27,19 @@ const PRESENCE_STATES = Object.freeze(['working', 'waiting', 'blocked', 'tooling
 const TABLES = Object.freeze(['messages', 'claims', 'presence', 'members', 'authfail', 'meta']);
 const ZERO_DIGEST = '0'.repeat(64);
 
+// Bumped whenever an existing workspace's tables need changing. Durable Object
+// storage survives a redeploy, so a schema change has to reach workspaces that
+// were created by an earlier version — see #upgradeSchema.
+const SCHEMA_VERSION = '2';
+
+// C0 and C1 controls, the bidi embedding/override/isolate set, and the
+// zero-width class. A display name reaches every peer's model context, so the
+// characters that can forge an injection boundary, reorder a rendered line or
+// hide one name inside another are removed outright rather than escaped
+// (PROTOCOL section 1, SECURITY section 5.3).
+const DISPLAY_NAME_STRIP = /[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff]/g;
+const MAX_DISPLAY_NAME_CHARS = 40;
+
 function ok(body, status) {
   return { status: status || 200, body };
 }
@@ -38,6 +51,20 @@ function str(value, max) {
   const trimmed = value.trim();
   if (!trimmed || trimmed.length > max) return null;
   return trimmed;
+}
+
+// OPTIONAL human label; never authoritative — `name` stays the handle every
+// decision is made on. Sanitized, then capped, in that order: the cap is on
+// what survives, so padding a name with invisibles cannot buy length. Returns
+// null for anything that sanitizes away to nothing, which stores as "no
+// display name" rather than as an empty one.
+function displayName(value) {
+  if (typeof value !== 'string') return null;
+  const cleaned = value.replace(DISPLAY_NAME_STRIP, '').trim();
+  if (!cleaned) return null;
+  // Sliced by code point, so the cap can never cut an astral character in half
+  // and leave a lone surrogate in the roster.
+  return [...cleaned].slice(0, MAX_DISPLAY_NAME_CHARS).join('');
 }
 
 export class WorkspaceDO extends DurableObject {
@@ -62,7 +89,7 @@ export class WorkspaceDO extends DurableObject {
     this.sql.exec('CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL)');
     this.sql.exec(
       'CREATE TABLE IF NOT EXISTS members (' +
-        'member_id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, secret_hash TEXT NOT NULL, ' +
+        'member_id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, display_name TEXT, secret_hash TEXT NOT NULL, ' +
         'joined_at INTEGER NOT NULL, revoked_at INTEGER, cursor INTEGER NOT NULL DEFAULT 0)'
     );
     this.sql.exec(
@@ -85,6 +112,23 @@ export class WorkspaceDO extends DurableObject {
     this.sql.exec(
       'CREATE TABLE IF NOT EXISTS authfail (ip TEXT PRIMARY KEY, count INTEGER NOT NULL, window_start INTEGER NOT NULL)'
     );
+    this.#setMeta('schema_version', SCHEMA_VERSION);
+  }
+
+  // Durable Object storage survives a redeploy, so a workspace created by an
+  // earlier version still has that version's tables. This brings one forward in
+  // place, on its first request after the deploy; afterwards the meta key makes
+  // it a single indexed read. The column is added, never rewritten — no member
+  // row is touched and nothing is dropped.
+  #upgradeSchema() {
+    if (this.#meta('schema_version') === SCHEMA_VERSION) return;
+    const table = this.sql
+      .exec("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'members'")
+      .toArray()[0];
+    if (table && !/\bdisplay_name\b/.test(table.sql)) {
+      this.sql.exec('ALTER TABLE members ADD COLUMN display_name TEXT');
+    }
+    this.#setMeta('schema_version', SCHEMA_VERSION);
   }
 
   // ---- meta -------------------------------------------------------------
@@ -238,6 +282,7 @@ export class WorkspaceDO extends DurableObject {
     const now = Date.now();
     if (op === 'init') return this.#init(input, now);
     if (!this.#schemaExists() || !this.#initialized()) return err(404, 'workspace_not_found');
+    this.#upgradeSchema();
 
     const ip = typeof input.ip === 'string' && input.ip ? input.ip : 'unknown';
 
@@ -252,6 +297,8 @@ export class WorkspaceDO extends DurableObject {
         return this.#destroy(input, now, ip);
       case 'member_remove':
         return this.#memberRemove(input, now, ip);
+      case 'member_rebind':
+        return this.#memberRebind(input, now, ip);
       case 'heartbeat':
       case 'claim':
       case 'release':
@@ -324,6 +371,9 @@ export class WorkspaceDO extends DurableObject {
     if (auth.fail) return this.#denyAuth(ip, now, 401, auth.fail);
     const name = str(input.body?.member, 64);
     if (!name || !NAME_RE.test(name)) return err(400, 'member_name_invalid');
+    // OPTIONAL, and never a reason to refuse a join: a display name that
+    // sanitizes away simply stores as absent (PROTOCOL section 1).
+    const display = displayName(input.body?.display_name);
 
     // Minted and hashed BEFORE the duplicate check so that the check and the
     // insert run in one synchronous stretch. With an await in between, two
@@ -344,9 +394,10 @@ export class WorkspaceDO extends DurableObject {
     if (count >= cfg(this.env, 'MAX_MEMBERS')) return err(409, 'workspace_full');
 
     this.sql.exec(
-      'INSERT INTO members (member_id, name, secret_hash, joined_at, cursor) VALUES (?, ?, ?, ?, ?)',
+      'INSERT INTO members (member_id, name, display_name, secret_hash, joined_at, cursor) VALUES (?, ?, ?, ?, ?, ?)',
       memberId,
       name,
+      display,
       secretHash,
       now,
       0
@@ -386,6 +437,16 @@ export class WorkspaceDO extends DurableObject {
       str(body.session, 64),
       now
     );
+    // A display name may ride the heartbeat so it can be set or corrected
+    // without re-joining. Omitting it leaves the stored one alone — otherwise
+    // every keepalive from a client that does not carry one would erase it.
+    if (body.display_name !== undefined) {
+      this.sql.exec(
+        'UPDATE members SET display_name = ? WHERE member_id = ?',
+        displayName(body.display_name),
+        member.member_id
+      );
+    }
     // The monitor's heartbeat is also the claim-renewal tick (PLAN section 1).
     if (body.renew_claims !== false) {
       this.sql.exec('UPDATE claims SET renewed_at = ? WHERE owner = ?', now, member.member_id);
@@ -495,19 +556,36 @@ export class WorkspaceDO extends DurableObject {
 
   async #post(member, input, now) {
     const envelope = input.body?.envelope;
-    const check = validateEnvelope(envelope, now);
+    // The workspace id is checked against this object's own id: an envelope
+    // signed for another workspace is refused here rather than stored.
+    const check = validateEnvelope(envelope, now, this.#meta('ws_id'));
     if (!check.ok) return err(400, check.code, { skew_ms: check.skew_ms, window_ms: check.window_ms });
 
-    // `from` is server-authoritative. A client MAY include its own `from`
-    // (it is inside the HMAC), but a mismatch is refused rather than silently
+    // PROTOCOL section 3.1: presence, claims and releases are server state on
+    // this transport and travel through their own endpoints; `state.request`
+    // has nothing to ask for, because `sync` already returns the full state.
+    // Accepting them as envelopes would build unauthenticated shadow state
+    // beside the server's and spend the fetch budget re-sending it.
+    if (!isCarriedByRelay(envelope.type)) {
+      return err(400, 'envelope_type_not_carried', { type: envelope.type });
+    }
+
+    // `from` is server-authoritative. The client's own `from` is REQUIRED (it
+    // is inside the HMAC), and a mismatch is refused rather than silently
     // rewritten — rewriting would invalidate a signature the relay cannot
     // recompute, and trusting it would let a member spoof a peer.
-    if (envelope.from && envelope.from.member !== member.member_id) {
+    if (envelope.from.member !== member.member_id) {
       return err(403, 'from_mismatch', { expected: member.member_id });
     }
 
+    // Dedupe is on (sender, sender_seq) — the sender's own counter, stored in
+    // the client_seq column to keep it distinct from the relay-assigned seq.
     const duplicate = this.sql
-      .exec('SELECT seq, received_at FROM messages WHERE sender = ? AND client_seq = ?', member.member_id, envelope.seq)
+      .exec(
+        'SELECT seq, received_at FROM messages WHERE sender = ? AND client_seq = ?',
+        member.member_id,
+        envelope.sender_seq
+      )
       .toArray()[0];
     if (duplicate) {
       return ok({ seq: duplicate.seq, received_at: duplicate.received_at, duplicate: true });
@@ -520,7 +598,7 @@ export class WorkspaceDO extends DurableObject {
       seq,
       member.member_id,
       envelope.type,
-      envelope.seq,
+      envelope.sender_seq,
       now,
       // Stored structurally verbatim: every field the client sent, including
       // `sig` and any field this version does not know about, is preserved.
@@ -595,12 +673,16 @@ export class WorkspaceDO extends DurableObject {
       }));
     }
 
+    // `name` is the authoritative handle in both lists; `display_name` is the
+    // OPTIONAL label beside it, already sanitized on the way in.
     const members = this.sql
-      .exec('SELECT member_id, name, joined_at FROM members WHERE revoked_at IS NULL ORDER BY joined_at ASC')
+      .exec(
+        'SELECT member_id, name, display_name, joined_at FROM members WHERE revoked_at IS NULL ORDER BY joined_at ASC'
+      )
       .toArray();
     const presence = this.sql
       .exec(
-        'SELECT p.*, m.name FROM presence p JOIN members m ON m.member_id = p.member_id ' +
+        'SELECT p.*, m.name, m.display_name FROM presence p JOIN members m ON m.member_id = p.member_id ' +
           'WHERE m.revoked_at IS NULL ORDER BY p.updated_at DESC'
       )
       .toArray();
@@ -689,6 +771,21 @@ export class WorkspaceDO extends DurableObject {
     return ok({ ok: true, destroyed: true });
   }
 
+  // The `:member` path segment is the member id. A name is accepted as a
+  // fallback because a member that has lost its local state knows the name it
+  // joined under and not necessarily the id it was minted — id first, so the
+  // resolution stays deterministic even for a name shaped like an id.
+  #findMember(target) {
+    if (typeof target !== 'string' || !target) return null;
+    const byId = this.sql
+      .exec('SELECT member_id, name, revoked_at FROM members WHERE member_id = ?', target)
+      .toArray()[0];
+    if (byId) return byId;
+    return (
+      this.sql.exec('SELECT member_id, name, revoked_at FROM members WHERE name = ?', target).toArray()[0] || null
+    );
+  }
+
   async #memberRemove(input, now, ip) {
     const auth = await this.#authRecovery(input.auth);
     if (auth.fail) return this.#denyAuth(ip, now, 401, auth.fail);
@@ -703,5 +800,38 @@ export class WorkspaceDO extends DurableObject {
     const claims = this.sql.exec('SELECT COUNT(*) AS n FROM claims WHERE owner = ?', row.member_id).toArray()[0].n;
     this.sql.exec('DELETE FROM claims WHERE owner = ?', row.member_id);
     return ok({ ok: true, member_id: row.member_id, member: row.name, claims_released: claims, removed_at: now });
+  }
+
+  // Lost-local-state recovery. Names are permanently retired on removal, so a
+  // member that loses its sub-token cannot re-join under its own name; this
+  // reissues one for the member that already exists, keeping the member id —
+  // and with it that member's claims, cursor and place in every peer's roster.
+  //
+  // On the recovery key, never the enrollment token: on the enrollment token
+  // any member could seize any other member's identity. It does NOT un-retire
+  // a removed name — a revoked member is refused, and rebinding a retired name
+  // would let a new secret inherit that name's history.
+  async #memberRebind(input, now, ip) {
+    const auth = await this.#authRecovery(input.auth);
+    if (auth.fail) return this.#denyAuth(ip, now, 401, auth.fail);
+    const row = this.#findMember(input.params?.member);
+    if (!row) return err(404, 'member_not_found');
+    if (row.revoked_at) return err(409, 'member_revoked', { member_id: row.member_id });
+
+    const token = mintMemberToken(row.member_id);
+    const secret = parseMemberToken(token).secret;
+    const secretHash = await sha256Hex(secret);
+
+    // Re-read after the await: the digest step yields, so a removal that lands
+    // in between must not be undone by a rebind that started before it.
+    const fresh = this.sql
+      .exec('SELECT member_id, name, revoked_at FROM members WHERE member_id = ?', row.member_id)
+      .toArray()[0];
+    if (!fresh) return err(404, 'member_not_found');
+    if (fresh.revoked_at) return err(409, 'member_revoked', { member_id: fresh.member_id });
+    // The previous secret is invalidated by being overwritten: only the digest
+    // was ever stored, and the old sub-token stops authenticating immediately.
+    this.sql.exec('UPDATE members SET secret_hash = ? WHERE member_id = ?', secretHash, fresh.member_id);
+    return ok({ ok: true, member_id: fresh.member_id, member: fresh.name, secret, token, rebound_at: now });
   }
 }

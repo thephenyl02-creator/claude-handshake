@@ -1,7 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { call, envelope, setup } from './helpers.js';
+import { call, send, setup } from './helpers.js';
 
-const post = (ws, token, env) => call('POST', '/ws/' + ws.ws + '/post', { token, body: { envelope: env } });
 const sync = (ws, token, cursor) =>
   call('GET', '/ws/' + ws.ws + '/sync' + (cursor === undefined ? '' : '?cursor=' + cursor), { token });
 const joinWith = (ws, token, member) => call('POST', '/ws/' + ws.ws + '/join', { token, body: { member } });
@@ -67,8 +66,8 @@ describe('rotation', () => {
 describe('purge', () => {
   it('clears live chatter without rewinding sequence numbers', async () => {
     const { ws, members } = await setup(['alice', 'bob']);
-    await post(ws, members.alice.token, envelope('note.info', { seq: 1 }));
-    await post(ws, members.alice.token, envelope('note.info', { seq: 2 }));
+    await send(ws, members.alice, 'note.info', { sender_seq: 1 });
+    await send(ws, members.alice, 'note.info', { sender_seq: 2 });
     await call('POST', '/ws/' + ws.ws + '/claim', { token: members.alice.token, body: { subject: 'kept work' } });
 
     const purged = await call('POST', '/ws/' + ws.ws + '/purge', { token: ws.recovery_key, body: {} });
@@ -81,7 +80,7 @@ describe('purge', () => {
     // Claims and presence survive a plain purge: it clears chatter, not work.
     expect(view.body.claims).toHaveLength(1);
 
-    const next = await post(ws, members.alice.token, envelope('note.info', { seq: 3 }));
+    const next = await send(ws, members.alice, 'note.info', { sender_seq: 3 });
     expect(next.body.seq).toBe(3);
   });
 
@@ -111,7 +110,7 @@ describe('purge', () => {
 describe('destroy', () => {
   it('leaves nothing behind and does not let the id be re-bound', async () => {
     const { ws, members } = await setup(['alice']);
-    await post(ws, members.alice.token, envelope('note.info'));
+    await send(ws, members.alice, 'note.info');
 
     const gone = await call('DELETE', '/ws/' + ws.ws, { token: ws.recovery_key });
     expect(gone.status).toBe(200);

@@ -8,7 +8,7 @@
   },
   "homepage": "https://github.com/thephenyl02-creator/claude-handshake#readme",
   "scripts": {
-    "test": "node --test test/filter.test.js"
+    "test": "node --test test/filter.test.js test/envelope.test.js test/subject.test.js test/state.test.js test/invite.test.js test/transport.test.js test/session.test.js test/no-direct-send.test.js test/cli.test.js"
   },
   "license": "MIT",
   "author": "Fenil <the.phenyl02@gmail.com>",

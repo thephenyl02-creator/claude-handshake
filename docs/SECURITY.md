@@ -169,10 +169,15 @@ documented only for the case of an intentional, already-rotated value.
 
 `filteredSend()` is the single outbound chokepoint: no code may hand data to a
 transport except through it, and a test greps the tree for direct adapter calls
-`[P§3]` `[C lib/outbound.js]`. **Every** outbound field is filter input —
-presence notes, branch names, `files[]`, claim subjects, not just note bodies —
-and writes into `.handshake/*` are filtered too `[P§3]`. Filtering happens at
-enqueue **and** again at send for the offline queue (PROTOCOL §10.3).
+`[P§3]` `[C lib/outbound.js]`. **Every authored outbound field** is filter
+input — presence notes, branch names, `files[]`, claim subjects, summaries,
+member/display names, not just note bodies — and writes into `.handshake/*`
+are filtered too `[P§3]`. Protocol machinery the client itself generates
+(`ws`, `nonce`, `sig`, `ct`, machine/session pseudonyms) is exempt by design:
+it carries no authored content, and a random 128-bit id would self-block every
+message on the entropy heuristic `[C lib/envelope.js authoredFields]`.
+Filtering happens at enqueue **and** again at send for the offline queue
+(PROTOCOL §10.3).
 
 What it actually does `[C lib/filter.js]`: a pattern battery for known
 credential shapes (cloud keys, VCS/chat/package tokens, private-key blocks,

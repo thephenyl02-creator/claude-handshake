@@ -332,9 +332,10 @@ written to the local task shard so the record exists in both the live and
 durable layers `[P§1]`.
 
 **`ws.migrate`** — `{from_transport, to_transport, endpoint, ws_new, name,
-dual_read_until, member_map?}` (§9.4). `member_map` maps this sender's old
-member id to its new one; a client MUST NOT accept a `member_map` entry for any
-member other than the signed sender `[F]`.
+dual_read_until, member_map?}` (§9.4). `member_map` is the object
+`{from, to}` — the signed sender's old and new member ids (an id-keyed map
+would violate §2.1's key regex and be uncanonicalizable); a client MUST NOT
+accept a `member_map` for any member other than the signed sender `[F]`.
 
 **`state.request`** — `{want}` where `want` is a non-empty array over
 `claims | presence` `[F]`.
@@ -422,7 +423,7 @@ Frozen exactly as implemented in `relay/src/lib/subject.js` `[D6]`. In prose,
    character that survived step 4).
 6. Trim leading/trailing spaces and split on runs of whitespace; drop empties.
    Call the result the **raw tokens**, order preserved.
-7. Remove tokens present in the frozen stopword list (28 entries, exactly):
+7. Remove tokens present in the frozen stopword list (27 entries, exactly):
    `a an and are as at be but by for from in into is it its my of on or our
    that the their this to with`.
 8. If step 7 left at least one token, the **kept tokens** are the result;
@@ -613,11 +614,14 @@ appends to the parent's claim state (§7.2).
 
 **Safe fallback (MUST):** when the variable is absent, the session is treated as
 a child anyway — a session that cannot prove it is a parent behaves as a child —
-UNLESS interactive markers are present `[D child mode]`. The only interactive
+UNLESS interactive markers are present `[D child mode]`. The interactive
 markers recognized in v1 are: a running monitor (monitors start only in
-interactive CLI sessions `[S5]`) or a SessionStart `source` of
-`startup | resume | clear` in an interactive host `[F]`. The fallback fails
-toward silence, never toward a phantom teammate.
+interactive CLI sessions `[S5]`), a SessionStart `source` of
+`startup | resume | clear` in an interactive host `[F]`, or an explicitly
+human-typed CLI invocation — a typed command is itself an interactive act; the
+fallback verdict is still reported in `status`/`doctor` `[F]`. The fallback
+fails toward silence, never toward a phantom teammate. Only a *proven* child
+(`CLAUDE_CODE_CHILD_SESSION=1`) refuses an explicitly typed posting command.
 
 M6 re-verifies the variable once under terminal-CLI subagents `[D child mode]`;
 a change in detection is a client change, not a protocol change — nothing in
@@ -766,7 +770,7 @@ the enrollment token any member could kick any other `[R2]`.
 | 12 | `POST /ws/:id/purge` | recovery | `{all?}` | `200 {ok, messages_purged, claims_purged, next_seq}` | `401` |
 | 13 | `DELETE /ws/:id` | recovery | — | `200 {ok, destroyed:true}` | `401` |
 | 14 | `POST /ws/:id/members/:member/remove` | recovery | — | `200 {ok, member_id, member, claims_released, removed_at}` | `404 member_not_found` |
-| 15 | `POST /ws/:id/members/:member/rebind` | recovery | `{}` | `200 {ok, member_id, member, secret, token, rebound_at}` | `404 member_not_found`, `409 member_revoked` — **not yet implemented, Appendix B A3** `[D7]` |
+| 15 | `POST /ws/:id/members/:member/rebind` | recovery | `{}` | `200 {ok, member_id, member, secret, token, rebound_at}` | `404 member_not_found`, `409 member_revoked` `[D7]`. `:member` (rows 14–15) resolves as member **id** first, then member **name** — deterministic even for a name shaped like an id `[C v0.1.1]` |
 
 Message wrapper returned by sync: `{seq, from, from_name, received_at,
 envelope}`, where the outer `from` is the **authenticated** member id and
@@ -1091,9 +1095,10 @@ need no change.
 | **A1** | Envelope field `seq` must be renamed `sender_seq`. Validator reads `envelope.seq`; the DO stores it as `client_seq` and dedupes on `(sender, client_seq)`. Error code `envelope_seq` becomes `envelope_sender_seq`. | `relay/src/lib/envelope.js`, `relay/src/do/workspace.js` `#post` | `[D2]` — the name collision with the relay-assigned `seq` is exactly what the rename resolves |
 | **A2** | `from` must become REQUIRED, with `member`, `machine`, `session` all present and strings. Today `from` is optional (`if ('from' in envelope)`) and only `from.member` is type-checked. | `relay/src/lib/envelope.js` | `[D3]` — `from` is inside the signed canonical serialization, so an envelope without it cannot be verified |
 | **A3** | Add `POST /ws/:id/members/:member/rebind`, recovery-key authorized: reissue a sub-token for an **existing, non-revoked** member name, invalidating the previous secret. Does not un-retire a removed name. | `relay/src/worker.js` route table, `relay/src/do/workspace.js` | `[D7]` — names are permanently retired on removal, so a member that loses local state currently has no re-join path |
-| **A4** | Add OPTIONAL `display_name` (UTF-8, sanitized: strip C0/C1, bidi and zero-width classes, length ≤ 40) to `join` and `heartbeat`, stored beside `name`, returned in `members[]`/`presence[]`. `name` stays authoritative. | `relay/src/do/workspace.js` schema + `#join` + `#heartbeat` + `#sync` | `[D8]` |
+| **A4** | Add OPTIONAL `display_name` (UTF-8, sanitized: strip C0/C1, bidi and zero-width classes, length ≤ 40 code points AFTER sanitization — an oversize value is truncated, never refused) to `join` and `heartbeat`, stored beside `name`, returned in `members[]`/`presence[]` only. `name` stays authoritative. **Implemented in relay v0.1.1** with an in-place schema upgrader for pre-A4 workspaces. | `relay/src/do/workspace.js` schema + `#join` + `#heartbeat` + `#sync` | `[D8]` |
 | **A5** | Reject an envelope whose `ws` ≠ the workspace in the path (`400 envelope_ws`). `ws` is currently unvalidated. | `relay/src/lib/envelope.js` (needs the ws passed in) | `ws` is inside the signature; validating it at the relay is cheap defence in depth against cross-workspace replay |
-| **A6** | Enforce the carriage rule of §3.1: `POST /ws/:id/post` must refuse envelopes of type `presence.update`, `task.claim`, `task.release` and `state.request` (`400 envelope_type_not_carried`). The relay currently accepts any type matching the type regex. | `relay/src/do/workspace.js` `#post` | `[F]` §3.1 — these four are server-state endpoints on the relay; accepting them as envelopes creates unauthenticated shadow state beside the server's and burns the message budget on data `sync` already returns |
+| **A6** | Enforce the carriage rule of §3.1: `POST /ws/:id/post` must refuse envelopes of type `presence.update`, `task.claim`, `task.release` and `state.request` (`400 envelope_type_not_carried`). The relay currently accepts any type matching the type regex. **Implemented in relay v0.1.1.** | `relay/src/do/workspace.js` `#post` | `[F]` §3.1 — these four are server-state endpoints on the relay; accepting them as envelopes creates unauthenticated shadow state beside the server's and burns the message budget on data `sync` already returns |
+| **A7** | `POST /ws/:id/claim` accepts an OPTIONAL `acquired_at` (clamped to ≤ now; honored only for the acquiring member's own claim). Without it, §9.4 step 3's "preserving each claim's original `acquired_at`" is unimplementable through the relay and migration silently resets tiebreak ordering. Until A7 ships, `/handshake upgrade` keeps the original `acquired_at` in local state and prints an explicit honesty note. | `relay/src/do/workspace.js` `#claim`, `relay/src/lib/*` validation | `[F]` §9.4 step 3 — proposed during M4/M5 client build, ratified at wave-1 integration |
 
 ### B. Tolerated divergences (no patch)
 
@@ -1101,7 +1106,7 @@ need no change.
 |---|---|---|
 | B1 | `normalizeTs()` accepts seconds (`ts < 1e11`) as well as milliseconds. | `[D1]` explicitly keeps the dual-accept "as robustness"; the spec says clients MUST send ms |
 | B2 | The relay does not verify `sig`. | By design: the HMAC is end-to-end and the relay never holds the workspace secret (§1, §2.3) |
-| B3 | The relay accepts any `type` matching the type regex, not just the §3 catalog. | Forward compatibility lives at the transport; the closed catalog binds v1 **senders** (§3) |
+| B3 | The relay accepts any `type` matching the type regex, not just the §3 catalog — **except** the four §3.1 server-state types (`presence.update`, `task.claim`, `task.release`, `state.request`), which `post` refuses per A6. | Forward compatibility lives at the transport; the closed catalog binds v1 **senders** (§3) |
 | B4 | The relay does not track `nonce` replay. | `(sender, sender_seq)` uniqueness plus the ±5 min window bounds replay at the transport; nonce replay detection is a receiver duty (§2.6) |
 | B5 | `heartbeat` renews TTL but does not merge `files[]`; the union happens on re-`claim`. | Matches `[D12]` — renewal-union is specified on the claim path, and keeps the heartbeat body small enough for the ntfy budget |
 | B6 | `presence` rows accept a client-supplied `machine`/`session`. | They are pseudonyms, not credentials (§1); the authenticated identity is the member id, which the client cannot set |

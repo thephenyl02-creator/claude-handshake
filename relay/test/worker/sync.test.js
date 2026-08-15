@@ -1,16 +1,15 @@
 import { runInDurableObject } from 'cloudflare:test';
 import { describe, expect, it } from 'vitest';
-import { call, envelope, setup, workspaceStub } from './helpers.js';
+import { call, send, setup, workspaceStub } from './helpers.js';
 
-const post = (ws, token, env) => call('POST', '/ws/' + ws.ws + '/post', { token, body: { envelope: env } });
 const sync = (ws, token, cursor) =>
   call('GET', '/ws/' + ws.ws + '/sync' + (cursor === undefined ? '' : '?cursor=' + cursor), { token });
 
 // One sender's messages go out together (the Durable Object serializes them
 // anyway), but separate floods stay sequential so sender order is stable.
-async function flood(ws, token, count, type, from) {
+async function flood(ws, member, count, type, from) {
   const results = await Promise.all(
-    Array.from({ length: count }, (_, i) => post(ws, token, envelope(type, { seq: (from || 0) + i })))
+    Array.from({ length: count }, (_, i) => send(ws, member, type, { sender_seq: (from || 0) + i }))
   );
   for (const res of results) {
     if (res.status !== 201) throw new Error('post failed: ' + res.text);
@@ -20,7 +19,7 @@ async function flood(ws, token, count, type, from) {
 describe('sync cursor', () => {
   it('returns only messages after the cursor and reports the overflow', async () => {
     const { ws, members } = await setup(['alice', 'bob']);
-    await flood(ws, members.alice.token, 3, 'note.info');
+    await flood(ws, members.alice, 3, 'note.info');
 
     const all = await sync(ws, members.bob.token, 0);
     expect(all.body.messages).toHaveLength(3);
@@ -34,7 +33,7 @@ describe('sync cursor', () => {
 
   it('caps a fetch at 20 and counts the rest as more', async () => {
     const { ws, members } = await setup(['alice', 'bob']);
-    await flood(ws, members.alice.token, 25, 'note.info');
+    await flood(ws, members.alice, 25, 'note.info');
     const view = await sync(ws, members.bob.token, 0);
     expect(view.body.messages).toHaveLength(20);
     expect(view.body.more).toBe(5);
@@ -42,7 +41,7 @@ describe('sync cursor', () => {
 
   it('does not move the stored cursor by itself — the client advances it', async () => {
     const { ws, members } = await setup(['alice', 'bob']);
-    await flood(ws, members.alice.token, 2, 'note.info');
+    await flood(ws, members.alice, 2, 'note.info');
 
     const first = await sync(ws, members.bob.token);
     expect(first.body.stored_cursor).toBe(0);
@@ -66,7 +65,7 @@ describe('sync cursor', () => {
 
   it('keeps cursor writes to their owner and never moves one backwards', async () => {
     const { ws, members } = await setup(['alice', 'bob']);
-    await flood(ws, members.alice.token, 2, 'note.info');
+    await flood(ws, members.alice, 2, 'note.info');
     const view = await sync(ws, members.bob.token);
     await call('POST', '/ws/' + ws.ws + '/cursor', { token: members.bob.token, body: { seq: view.body.next_cursor } });
 
@@ -87,7 +86,7 @@ describe('sync cursor', () => {
     const { ws, members } = await setup(['alice', 'bob']);
     await call('POST', '/ws/' + ws.ws + '/heartbeat', { token: members.alice.token, body: { state: 'working' } });
     await call('POST', '/ws/' + ws.ws + '/claim', { token: members.alice.token, body: { subject: 'feature x' } });
-    await post(ws, members.alice.token, envelope('task.claim'));
+    await send(ws, members.alice, 'task.done');
 
     const view = await sync(ws, members.bob.token, 0);
     expect(view.body.members).toHaveLength(2);
@@ -102,9 +101,9 @@ describe('sync cursor', () => {
 describe('per-sender fairness', () => {
   it('shares the fetch cap across senders instead of letting one bury the rest', async () => {
     const { ws, members } = await setup(['alice', 'bob', 'carol', 'dave']);
-    await flood(ws, members.alice.token, 30, 'note.info');
-    await flood(ws, members.bob.token, 30, 'note.info');
-    await flood(ws, members.carol.token, 2, 'note.info');
+    await flood(ws, members.alice, 30, 'note.info');
+    await flood(ws, members.bob, 30, 'note.info');
+    await flood(ws, members.carol, 2, 'note.info');
 
     const view = await sync(ws, members.dave.token, 0);
     expect(view.body.messages).toHaveLength(20);
@@ -119,10 +118,10 @@ describe('per-sender fairness', () => {
 
   it('reserves slots for warn.* and note.blocker under a flood', async () => {
     const { ws, members } = await setup(['alice', 'bob', 'carol']);
-    await flood(ws, members.alice.token, 40, 'note.info');
+    await flood(ws, members.alice, 40, 'note.info');
     // Posted last, so a plain oldest-first fetch would never reach them.
-    await post(ws, members.bob.token, envelope('warn.overlap', { seq: 900 }));
-    await post(ws, members.bob.token, envelope('note.blocker', { seq: 901 }));
+    await send(ws, members.bob, 'warn.overlap', { sender_seq: 900 });
+    await send(ws, members.bob, 'note.blocker', { sender_seq: 901 });
 
     const view = await sync(ws, members.carol.token, 0);
     expect(view.body.messages).toHaveLength(20);
@@ -171,7 +170,7 @@ describe('per-sender fairness', () => {
 
   it('does not let the reserved floor starve normal traffic', async () => {
     const { ws, members } = await setup(['alice', 'bob']);
-    await flood(ws, members.alice.token, 30, 'warn.overlap');
+    await flood(ws, members.alice, 30, 'warn.overlap');
     const view = await sync(ws, members.bob.token, 0);
     expect(view.body.messages).toHaveLength(20);
   });

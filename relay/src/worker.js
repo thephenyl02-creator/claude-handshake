@@ -118,9 +118,13 @@ async function route(request, env) {
   }
 
   const action = segments[2];
-  if (segments.length === 5 && action === 'members' && segments[4] === 'remove') {
+  if (segments.length === 5 && action === 'members') {
+    // Both are recovery-key operations on one member: remove retires the name
+    // for good, rebind reissues a sub-token for a member that still exists.
+    const op = { remove: 'member_remove', rebind: 'member_rebind' }[segments[4]];
+    if (!op) return fail(404, 'not_found');
     if (request.method !== 'POST') return fail(405, 'method_not_allowed');
-    return call('member_remove', { member: segments[3] });
+    return call(op, { member: segments[3] });
   }
   if (segments.length !== 3) return fail(404, 'not_found');
 
