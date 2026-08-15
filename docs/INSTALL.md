@@ -12,7 +12,7 @@ should check before trusting a run.
 - [The installers](#the-installers)
 - [The primary route: marketplace + plugin](#the-primary-route-marketplace--plugin)
 - [The fallback route: direct copy + hook registration](#the-fallback-route-direct-copy--hook-registration)
-- [The three-valued self-check](#the-three-valued-self-check)
+- [The self-check](#the-three-valued-self-check)
 - [Upgrading](#upgrading)
 - [Uninstalling](#uninstalling)
 - [Security: credentials and push protection](#security-credentials-and-push-protection)
@@ -42,7 +42,16 @@ Both are self-contained, idempotent, and safe to re-run. Both accept:
 |---|---|
 | (none) | Full install: Node check → Claude CLI check → primary route → fallback route if needed → self-check |
 | `--verify` (bash) / `-VerifyActive` (PowerShell) | Re-run **only** the self-check — no install work, no network calls beyond what the self-check itself needs (a local `claude plugin list`) |
-| `--help` / `-Help` | Usage |
+| `--help` / `-Help` (also `-h`, `-?`) | Usage |
+| anything else | Usage on stderr and **exit 2** — nothing is installed. A mistyped flag (`--verfiy`, `-VerifyActiv`) must never silently perform a full unattended install |
+
+> The PowerShell script's `param()` block deliberately has **no**
+> `[CmdletBinding()]`, so unbound arguments land in `$args` instead of being
+> rejected by the binder. The unknown-argument guard therefore lives *outside*
+> the `& { … }` body — inside it, `$args` would be the script block's own
+> (always empty) argument list. Under `irm | iex` no arguments can be passed at
+> all and `$args` is empty even when the surrounding scope has its own, so the
+> guard is inert there and never calls `exit`.
 
 **Flags need the script on disk.** The one-liners in the README pipe the
 script straight into an interpreter, and neither `curl … | bash` nor
@@ -64,11 +73,21 @@ irm https://raw.githubusercontent.com/thephenyl02-creator/claude-handshake/main/
 ```
 
 **Exit codes.** The install path exits `0` when the install itself succeeded
-and `1` only when nothing could be installed — `installed-but-not-active` is
-the *expected* outcome of a fresh install and is not reported as a failure, so
+and `1` when nothing could be installed **or** when the plugin was installed
+but the host refuses to load it — `installed-but-not-active` is the *expected*
+outcome of a fresh install and is not reported as a failure, so
 `curl … | bash && …` behaves. The `--verify` / `-VerifyActive` path is the one
-that returns the full three-valued status: `0` active-verified, `1`
-installed-but-not-active, `2` not-installed.
+that returns the full status: `0` active-verified, `1`
+installed-but-not-active, `2` not-installed, `3` listed-but-failed-to-load.
+An unknown flag exits `2` from either path without installing anything.
+
+**Config directory.** Every path both installers read or write —
+`commands/`, `skills/`, `plugins/data/`, the fallback copy, the backup
+directories, and both self-check state roots — is derived from
+`$CLAUDE_CONFIG_DIR` when that variable is set, and from `~/.claude` only when
+it is not. Setting `CLAUDE_CONFIG_DIR` moves the whole Claude Code
+configuration tree, so an installer that hardcoded `~/.claude` would install
+into a directory the host never reads and could never reach `active-verified`.
 
 Both scripts port the hardening built for [claude-tier's installers](https://github.com/thephenyl02-creator/claude-tier)
 across four adversarial review rounds, adapted for a full hook+monitor+CLI
@@ -104,7 +123,7 @@ this):
   does **not** auto-install (no assumption about which package manager you
   use), it points at the official installer and refuses to continue.
 - **WSL detection** and an unconditional fallback copy there.
-- **The three-valued self-check**, described below.
+- **The self-check** (four outcomes), described below.
 
 ## The primary route: marketplace + plugin
 
@@ -146,7 +165,16 @@ is downloaded directly from GitHub.
    `~/.claude/handshake-plugin/<version>/` (the version comes from the
    downloaded copy's own `package.json`, read via `node`, not hardcoded in
    the installer — so it stays correct across releases without an installer
-   edit).
+   edit). The copy is then **pruned to the runtime payload**: the archive is
+   the whole repository, and `test/`, `e2e/`, `spike/`, `scripts/`, `docs/`,
+   `installers/`, `PLAN.md` and the relay's dev files are never loaded at
+   runtime, so they are removed rather than parked in the user's config
+   directory forever (measured: 105 files → 51). What is kept is exactly what
+   a hook, the CLI, the skill/command files and `deploy-relay` read: `bin/`,
+   `lib/`, `hooks/`, `monitors/`, `skills/`, `commands/`, `.claude-plugin/`,
+   `relay/{src,wrangler.toml,package.json}`, `package.json`, `LICENSE`,
+   `README.md`. The prune is followed by a completeness check, and the pruned
+   copy is verified runnable (`handshake doctor` runs from it).
 2. A **marker file** (`.installed-by-claude-handshake-installer`) is written
    at the root of that versioned copy. On every future run, only a directory
    carrying this marker is ever replaced or cleaned up automatically — a
@@ -178,6 +206,20 @@ is downloaded directly from GitHub.
    absolute location). Review it (or have your own Claude Code session apply
    it and show you the diff) before saving; this installer will never edit
    `settings.json` silently.
+
+   The printed commands **pin the absolute path of the `node` binary** the
+   installer found, rather than the bare word `node` that `hooks/hooks.json`
+   ships (correct for the plugin route, where the host resolves it). Claude
+   Code runs a hook with the environment of whatever process started Claude
+   Code, and an nvm/asdf/fnm-managed node is routinely absent from that PATH —
+   measured on Ubuntu 24.04/WSL2, `bash -c` and `bash -lc` both fail to find
+   an nvm node, only `bash -ic` finds it. Since hooks fail soft, a bare `node`
+   there produces five silent `node: command not found` failures per session
+   and an install that looks perfectly healthy while doing nothing. The
+   substitution goes through the same node-based JSON renderer that emits the
+   snippet, so quoting and escaping stay correct for a path with spaces. If you
+   later switch node versions, update that path by hand — the installer prints
+   a note saying so.
 6. **Monitors are not available in fallback mode** — there is no
    settings.json equivalent for `experimental.monitors`. This is a documented,
    handled condition, not a defect: claude-handshake already falls back to
@@ -186,21 +228,59 @@ is downloaded directly from GitHub.
    reduced liveness precision (state updates ride your own turns instead of a
    60s/10min clock).
 
-When the primary route *does* succeed on a later run, the installer removes a
-superseding fallback copy automatically — but only one carrying the marker
-file, contents first and the marker deleted last, so a locked file (Claude
-Code still running) leaves the marker intact and a later run can finish the
-cleanup rather than silently re-creating a duplicate.
+When the primary route *does* succeed on a later run, the installer removes the
+superseded fallback install automatically. That means **all three** things the
+fallback route wrote, not just the versioned directory:
 
-## The three-valued self-check
+| Left over from the fallback route | How ownership is proven | What the upgrade does |
+|---|---|---|
+| `~/.claude/handshake-plugin/<version>/` | carries the marker file | contents removed first, marker deleted last, so a locked file (Claude Code still running) leaves the marker intact and a later run can finish the cleanup |
+| `~/.claude/skills/handshake/` | carries the marker file | removed; **without** the marker it is left completely untouched (with a warning that it may shadow the plugin's own skill) |
+| `~/.claude/commands/handshake.md` | a single file, so no marker is possible — proven by comparing it byte-for-byte against the `commands/handshake.md` of a marked fallback copy, *before* those copies are deleted | identical → removed; differing (hand-edited, or from an older release whose fallback directory is already gone) → moved to `~/.claude/handshake-backup.<timestamp>/commands-handshake.md` first, so nothing is destroyed but it can no longer shadow the plugin's `/handshake` |
 
-Three values, never a guess in between:
+None of that runs at all unless there is evidence *this installer's* fallback
+route ran on the machine (a marked fallback copy, or a marked
+`skills/handshake/`). On a machine that only ever used the plugin route, a
+hand-written `~/.claude/commands/handshake.md` is never touched.
 
-| Value | Meaning |
-|---|---|
-| **not-installed** | Neither the plugin (`claude plugin list`) nor a marked fallback copy was found. |
-| **installed-but-not-active** | The plugin or fallback copy is present, but no hook has proven itself live recently. |
-| **active-verified** | A hook (SessionStart, and everything downstream of it) wrote fresh local state — proof it actually ran, not just that files exist on disk. |
+Skipping the cleanup is also correct in one case and the installer does it: if
+`claude plugin list` reports the plugin as **failed to load**, the fallback copy
+is kept, because deleting it would leave nothing running at all.
+
+Leaving the orphans behind was a real defect (fixed): the upgrade deleted the
+directory while `~/.claude/skills/handshake/SKILL.md` still contained absolute
+paths into it, and `/handshake` plus the skill then loaded twice — once from
+the orphans, once from the plugin.
+
+<a id="the-three-valued-self-check"></a>
+
+## The self-check
+
+Four outcomes, never a guess in between (the legacy anchor
+`#the-three-valued-self-check` still resolves here):
+
+| Value | Exit | Meaning |
+|---|---|---|
+| **not-installed** | 2 | Neither the plugin (`claude plugin list`) nor a marked fallback copy was found. |
+| **load-failed** | 3 | The plugin is listed, but `Status:` reports `failed to load` — and nothing else (no fallback copy, no fresh hook evidence) is carrying the install. |
+| **installed-but-not-active** | 1 | The plugin or fallback copy is present, but no hook has proven itself live recently. |
+| **active-verified** | 0 | A hook (SessionStart, and everything downstream of it) wrote fresh local state — proof it actually ran, not just that files exist on disk. |
+
+**`load-failed` is deliberately not folded into `installed-but-not-active`.**
+A disabled plugin is one `/reload-plugins` away; a plugin the host *cannot
+load* is inert, and a reload just re-reads the same broken manifest and fails
+in exactly the same way. Reporting it as the benign case with the generic
+"run `/reload-plugins`" advice — and exiting `0` — is precisely how the v0.1.0
+dead-on-arrival manifest reached a "successful" install and left users in a
+loop with no diagnosis. The self-check now prints the verbatim `Error:` line
+from `claude plugin list`, says plainly that a reload cannot fix a load failure,
+and exits nonzero (`3` from `--verify`, `1` from the install path).
+
+One exception, on purpose: when a marked fallback copy is present or a hook has
+recently proven itself live, the same load failure is reported as a **warning**
+and the self-check continues — that is the normal WSL shape (plugin entry
+broken, fallback copy doing the work), and failing the install there would be a
+false alarm.
 
 "Fresh" means an mtime less than 30 minutes old — mere existence is never
 enough; a state file from a stale install months ago must not read as active
@@ -256,10 +336,15 @@ failure. To move to active-verified:
    won't trigger it).
 5. Re-run the self-check: `install.sh --verify` / `install.ps1 -VerifyActive`.
 
-If the plugin is listed but not reporting `enabled`, the self-check tells you
-to run `/reload-plugins` inside Claude Code and start a new session instead —
-a freshly-installed plugin needs one reload to register before any hook can
-fire at all.
+If the plugin is listed but not reporting `enabled` *and not reporting a load
+failure*, the self-check tells you to run `/reload-plugins` inside Claude Code
+and start a new session instead — a freshly-installed plugin needs one reload
+to register before any hook can fire at all. That advice is never given for a
+`failed to load` entry, where it cannot possibly help.
+
+Both state roots follow `$CLAUDE_CONFIG_DIR` when it is set (see
+[Exit codes / Config directory](#the-installers) above) — the scan looks
+where the host actually writes, not at a hardcoded `~/.claude`.
 
 ## Upgrading
 
@@ -305,9 +390,10 @@ identity). To also drop the marketplace registration itself:
 `claude plugin marketplace remove claude-handshake`.
 
 **Fallback route** has no CLI command for this — remove by hand, and **in this
-order**. The settings entries go first: while `settings.json` still points at
-a directory you have already deleted, every hook event fails with a "cannot
-find module" error until you finish.
+order**. (Every `~/.claude/…` path below means `$CLAUDE_CONFIG_DIR/…` if you
+have that set.) The settings entries go first: while `settings.json` still
+points at a directory you have already deleted, every hook event fails with a
+"cannot find module" error until you finish.
 
 0. **Close Claude Code.** A running session holds the copy open on Windows and
    will re-read `settings.json` mid-cleanup elsewhere.
@@ -376,6 +462,9 @@ Full key-material inventory, holder sets, and offboarding runbooks:
 | `node --version` fails after the Windows installer says it installed Node | Open a **new** terminal — PATH changes from `winget`/`choco` don't always propagate to a script's own already-running process even after the refresh attempt. |
 | Plugin route fails every time | Check `claude plugin marketplace list` for a stale `claude-handshake` entry pointing somewhere wrong; `claude plugin marketplace remove claude-handshake` and re-run the installer. |
 | `/handshake` command not recognized | You likely need `/reload-plugins` or a new session — see the self-check section above. |
+| The self-check says `load-failed` | The plugin's manifest is broken for this Claude Code version — read the printed `Error:` line, re-run the installer (it always calls `plugin update`), and report it if a fixed release does not clear it. `/reload-plugins` cannot help. |
+| Everything installed, hooks still never fire (fallback route) | Check the `"command"` strings you merged into `settings.json`: they must point at an **absolute** node binary. Hooks fail soft, so a `node: command not found` is invisible. Re-run the installer and copy the snippet again — it pins the interpreter for you. |
+| `/handshake` or the skill appears twice after upgrading to the plugin route | An older installer left the user-level command/skill behind. Re-run the installer once: it now removes its own superseded copies (and backs up anything it did not write). |
 | Hooks not firing on WSL | Expected until you've merged the printed `settings.json` snippet by hand — the fallback route never edits it for you. |
 | `handshake doctor` reports `fail` on `node` | You're on Node < 18; upgrade — `node --test` and the CLI's use of global `fetch`/`hkdfSync` need 18+, and doctor recommends 20+. |
 | Unsure if you're on the plugin route or the fallback route | `claude plugin list` shows the plugin if the primary route is active; `Test-Path ~/.claude/handshake-plugin` (or `ls ~/.claude/handshake-plugin`) shows a fallback copy. Both can coexist briefly during a transition — the installer cleans up a superseded fallback copy automatically once the plugin route is confirmed working. |
