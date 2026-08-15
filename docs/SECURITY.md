@@ -189,8 +189,16 @@ by the bypass corpus `[P§3]`. Any internal error returns "blocked", never
 "allowed": the gate is fail-closed on its own failure `[C lib/filter.js]`.
 
 One genuinely fail-closed control: values ≥ 8 chars harvested from local secret
-files (`.env*`, `*.pem`, `*.key`) are held at sync; any outbound containing one,
-or a 12-char window of one, is refused `[P§3]` `[C lib/filter.js]`.
+files are held at sync; any outbound containing one, or a 12-char window of
+one, is refused `[P§3]` `[C lib/filter.js]`. The scanned set is **bounded but
+not narrow** (hardened at M13 after a red team leaked `secret.json` and
+`config/*.yml` at 100%): `.env*`, `*.pem|key|p12|pfx`, `id_*`, `credentials*`,
+`secret(s).json|yaml|toml|ini`, `.npmrc`, `.netrc`, `.pgpass`,
+`service-account*.json`, `*_secret(s).*` — walked **recursively** to depth 3
+(skipping `node_modules`, `.git`, build output), capped at 40 files, parsing
+both `KEY=value` and `key: value` shapes. The tripwire matches over the same
+normalized variants as the battery (whitespace-stripped, base64/hex-decoded,
+one gunzip level), **case-folded and reversed** `[C lib/filter.js]`.
 
 **The claim we make, and the only one:**
 
@@ -204,14 +212,28 @@ the machine. Known and accepted gaps, which MUST NOT be papered over:
 - **Chunking defeats per-message scanning by construction.** A secret split
   across several notes passes every per-message check. The 2 KB body cap and
   the tripwire narrow this hole; they do not close it `[C lib/filter.js]`.
-- Exactly-40-hex and exactly-64-hex tokens are skipped by the entropy pass
-  because git SHAs and content digests saturate developer chatter; only the
-  pattern battery and the tripwire cover those lengths `[C lib/filter.js]`.
+- Exactly-40-hex and exactly-64-hex runs are skipped by the entropy pass
+  because git SHAs and content digests saturate developer chatter — **unless a
+  credential word (`key`, `token`, `secret`, `password`, `auth`, `bearer`,
+  `api`) appears within 24 chars before them**, which is the accidental-paste
+  shape and never a SHA's `[C lib/filter.js, M13]`. A bare 40/64-hex key with
+  no such context is still invisible to the entropy pass; only the battery and
+  the tripwire cover it.
 - UUIDs are skipped for the same reason.
 - The tripwire only knows secrets it can read: files outside the project dir,
-  a credential store it does not parse, or a value shorter than 8 chars are
-  invisible to it.
-- A deliberately manipulated model can encode around any content filter.
+  files beyond depth 3 or past the 40-file cap, a credential store it does not
+  parse (a keychain, a cloud secret manager, an encrypted vault), or a value
+  shorter than 8 chars are invisible to it.
+- A deliberately manipulated model can encode around any content filter. The
+  normalization above covers the *obvious* transforms, not every transform.
+- **M13 red-team result (2026-08-15), recorded honestly:** before hardening,
+  odd-scheme DB connection strings (`mssql`, `mariadb`, `clickhouse`,
+  `cassandra`, `snowflake`), bare 40/64-hex keys, branded tokens (Twilio,
+  Shopify, Vault, DigitalOcean), UPPERCASED handshake credentials, and
+  in-project non-`.env` secret files all leaked at ~100%. Each is now blocked
+  and pinned by a regression test named for the attack `[C test/filter.test.js]`.
+  The lesson generalizes: this is a denylist, and a denylist is only as good as
+  its last adversarial review.
 
 ---
 

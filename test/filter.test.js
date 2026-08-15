@@ -67,6 +67,44 @@ test('inline invite = whole workspace', () => blocked(`come join ${HSI} see you 
 test('high-entropy token', () =>
   blocked('blob 9fK2mQ7xLpZ4vB8nR3tY6wE1uI5oPqSd here'));
 
+// ------------------------------------------------- M13 red-team regressions
+// Every case below was a DEMONSTRATED leak through the real sendGate before
+// the M13 fixes (2026-08-15). Each names the attack it closes.
+test('rt: odd-scheme connection strings (mssql/mariadb/snowflake) - leaked 100%', () => {
+  blocked('mssql://sa:P4ssw0rdLongEnough@sqlbox/master');
+  blocked('mariadb://root:hunter2hunter2@10.0.0.5/app');
+  blocked('snowflake://usr:SuperSecret99@acct/db');
+  blocked('clickhouse://default:ClickSecret99@ch.internal:9000/db');
+  blocked('cassandra://svc:CassSecret4242@node1:9042/ks');
+});
+test('rt: 40/64-hex key next to a credential word - leaked 100%', () => {
+  blocked('rotated key: ' + 'a1b2c3d4e5'.repeat(4));
+  blocked('api token ' + '9f8e7d6c5b'.repeat(6) + 'abcd');
+});
+test('rt: 32-hex key assignment - leaked ~75%', () => blocked('DD_API_KEY=' + '0123456789abcdef'.repeat(2)));
+test('rt: branded tokens (twilio/shopify/vault/digitalocean)', () => {
+  blocked('SK' + '0123456789abcdef'.repeat(2));
+  blocked('shpat_' + '0123456789abcdef'.repeat(2));
+  blocked('hvs.CAESIJ_abcdefghijklmnop');
+  blocked('dop_v1_' + '0123456789abcdef'.repeat(4));
+});
+test('rt: UPPERCASED handshake credentials stayed recoverable and leaked', () => {
+  blocked('HSR_' + 'A1B2C3D4E5F6A7B8'.repeat(4) + '_1A2B3C4D');
+  blocked('HSK_' + 'A1B2C3D4E5F6A7B8'.repeat(4) + '_1A2B3C4D');
+});
+test('rt: tripwire covers non-.env in-project secret files, encoded and case-folded', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hs-rt-'));
+  fs.mkdirSync(path.join(dir, 'config'), { recursive: true });
+  const SEC = 'moderate-secret-value-abc123xyz';
+  fs.writeFileSync(path.join(dir, 'secret.json'), JSON.stringify({ apiKey: SEC }, null, 1));
+  fs.writeFileSync(path.join(dir, 'config', 'database.yml'), 'password: ' + SEC + '\n');
+  const o = { projectDir: dir };
+  blocked('debug: ' + SEC, o);                                        // subdir/json file
+  blocked('blob ' + Buffer.from(SEC).toString('base64'), o);          // base64 of it
+  blocked('val ' + SEC.toUpperCase(), o);                             // case-folded
+  clean('working on the api layer', o);
+});
+
 // ------------------------------------------------------------------ bypasses
 test('base64-encoded secret', () =>
   blocked('config blob: ' + Buffer.from(`key=${AWS} region=us-east-1`).toString('base64')));
