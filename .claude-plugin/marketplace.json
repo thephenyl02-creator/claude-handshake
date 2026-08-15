@@ -5,20 +5,20 @@
   },
   "metadata": {
     "description": "Peer collaboration for Claude Code - separate Claude instances, different users and machines, working one project as a team. In development.",
-    "version": "0.1.1"
+    "version": "0.1.2"
   },
   "plugins": [
     {
       "name": "claude-handshake",
       "description": "Peer collaboration for Claude Code: separate Claude instances, on different machines and different users, coordinating one project as a team. Injects a standing block of peer presence and live claims on every turn, gates writes against peers' claimed files, and keeps liveness on a monitor clock.",
-      "version": "0.1.1",
+      "version": "0.1.2",
       "author": {
         "name": "Fenil"
       },
       "source": {
         "source": "archive",
-        "url": "https://github.com/thephenyl02-creator/claude-handshake/releases/download/v0.1.1/claude-handshake-plugin-0.1.1.zip",
-        "sha256": "0310d15c29d288fec5931ebed9013fc4e53f68187c6aeed97040861dd44eb650"
+        "url": "https://github.com/thephenyl02-creator/claude-handshake/releases/download/v0.1.2/claude-handshake-plugin-0.1.2.zip",
+        "sha256": "0c3e2118a9e2c806e55ced37795b697148cded797c370b9efdf61c06dcb2961e"
       }
     }
   ]

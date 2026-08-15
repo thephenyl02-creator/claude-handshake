@@ -233,8 +233,13 @@ if ($HandshakeExtraArgs.Count -gt 0) {
             $stop = [Math]::Min($i + 20, $lines.Count)
             for ($j = $i + 1; $j -lt $stop; $j++) {
                 $line = "$($lines[$j])"
-                if ($line -match $id) { break }                 # next entry
                 if (-not $line.Trim()) { break }                # entry closed
+                # Field lines are fields, NEVER entry boundaries. The CLI's own
+                # error reads "Error: Failed to load plugin <id>: ..." - it
+                # CONTAINS the id, so an id-first test swallowed the one line
+                # the user actually needs.
+                $isField = $line -match '^\s*(Status|Error|Version|Scope|Note):'
+                if (-not $isField -and $line -match $id) { break }   # next entry
                 if ($line -match 'Status:') {
                     if ($line -match '(?i)failed') { $entryFailed = $true }
                     elseif ($line -match '(?i)disabled') { }

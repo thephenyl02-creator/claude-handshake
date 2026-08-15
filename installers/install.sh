@@ -254,8 +254,13 @@ read_plugin_state() {  # $1 = claude binary
   # First line: "<listed> <enabled> <failed>". Every later line: one verbatim
   # Error: line from the entry.
   parsed="$(printf '%s\n' "$out" | awk -v id="$PLUGIN@$MARKETPLACE" '
-    index($0, id) > 0 { inentry = 1; listed = 1; next }
+    # A field line is a FIELD, never an entry boundary. The CLI renders
+    # "Error:   Failed to load plugin <id>: ..." - which contains the id, so an
+    # id-first rule swallowed the most informative line in the whole output.
+    /^[[:space:]]*(Status|Error|Version|Scope|Note):/ && inentry { isfield = 1 }
+    !isfield && index($0, id) > 0 { inentry = 1; listed = 1; next }
     inentry {
+      isfield = 0
       if ($0 ~ /^[[:space:]]*$/) { inentry = 0; next }
       if ($0 ~ /Status:/) {
         line = tolower($0)

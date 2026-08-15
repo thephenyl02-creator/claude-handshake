@@ -1283,9 +1283,16 @@ async function cmdDoctor(args) {
     const r = require('child_process').spawnSync(
       process.platform === 'win32' ? 'cmd.exe' : 'claude',
       process.platform === 'win32' ? ['/d', '/s', '/c', 'claude', 'plugin', 'list'] : ['plugin', 'list'],
-      { encoding: 'utf8', timeout: 20000, shell: false });
+      // 60s, not 20s: `claude plugin list` was measured at 2.2-18.4s on
+      // Windows and timed out 3/10 at 20s - which then reported a healthy,
+      // enabled plugin as "not installed". A slow CLI must never read as a
+      // missing one.
+      { encoding: 'utf8', timeout: 60000, shell: false });
     const out = String((r.stdout || '') + (r.stderr || ''));
-    if (r.error || !out.includes('claude-handshake')) {
+    const timedOut = Boolean(r.error && (r.signal === 'SIGTERM' || /ETIMEDOUT/i.test(String(r.error.code || r.error.message))));
+    if (timedOut) {
+      add('plugin loaded', 'warn', '`claude plugin list` did not answer within 60s - UNKNOWN, not a verdict. Run it yourself to check.');
+    } else if (r.error || !out.includes('claude-handshake')) {
       add('plugin loaded', 'warn', 'could not read `claude plugin list` (not installed as a plugin, or the CLI is unavailable)');
     } else {
       const block = out.slice(out.indexOf('claude-handshake'));
@@ -1312,6 +1319,10 @@ async function cmdDoctor(args) {
   const state = stateLib.openState(ws);
   const w = state.writable();
   add('state dir writable', w.ok ? 'pass' : 'fail', state.dir + (w.ok ? '' : ' - ' + w.error));
+  // A read-only diagnostic must not leave litter behind: outside a workspace
+  // the probe dir is ours alone, so remove it again (only when empty, so a
+  // real workspace's state is never touched).
+  if (!found) { try { require('fs').rmdirSync(state.dir); } catch (_) { /* not empty or absent: leave it */ } }
   if (process.platform === 'win32') add('state dir permissions', 'warn', stateLib.WINDOWS_ACL_NOTE);
   else add('state dir permissions', 'pass', 'files written 0600, directory 0700');
 
