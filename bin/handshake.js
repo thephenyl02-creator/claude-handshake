@@ -506,6 +506,9 @@ async function cmdInvite(args) {
 async function cmdJoin(args) {
   const blob = args._[0];
   if (!blob) { err('usage: handshake join <hsi1_...>'); process.exitCode = 2; return; }
+  // section 7.2 rule 1: a child MUST NOT join (join posts ws.join and, on the
+  // relay, mints a sub-token - it would become a phantom member).
+  if (refuseIfChild('join')) return;
   let fields;
   try { fields = inviteLib.decode(blob); } catch (e) {
     err('handshake: invalid invite (' + e.code + '): ' + e.message);
@@ -913,7 +916,11 @@ async function cmdSync(args) {
     // at INJECTION time, not at fetch time (section 6.3). Without this, a
     // second plain `sync` would show nothing and look like silence.
     ctx.dedupe.flush();
-    ctx.state.setDigest({ items: items.map((m) => ({ type: m.envelope.type, from: m.envelope.from.member, at: m.envelope.ts })), at: Date.now(), more: result.more });
+    // Store the FULL fetched set, not just the displayed slice - the watermark
+    // advances to the fetch high-water below, so anything cached-but-not-stored
+    // would be permanently lost (section 6.2 overflow deferral / 10.2 honesty).
+    // Mirrors the hook path (hooks/sync.js writeDigest stores the full set).
+    ctx.state.setDigest({ items: result.messages.map((m) => ({ type: m.envelope.type, from: m.envelope.from.member, at: m.envelope.ts })), at: Date.now(), more: result.more });
     const next = result.next_cursor === undefined ? null : result.next_cursor;
     const adv = ctx.state.advanceWatermark(transport, next);
     if (transport === 'relay' && adv.advanced) {

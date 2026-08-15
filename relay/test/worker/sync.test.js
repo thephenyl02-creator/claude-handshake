@@ -82,6 +82,24 @@ describe('sync cursor', () => {
     expect(aliceView.body.stored_cursor).toBe(1);
   });
 
+  it('bounds the cursor at the highest ISSUED seq, not one past it (PROTOCOL 6.3)', async () => {
+    const { ws, members } = await setup(['alice', 'bob']);
+    await flood(ws, members.alice, 2, 'note.info');            // seqs 1 and 2 issued
+    const view = await sync(ws, members.bob.token);
+    const highest = view.body.next_cursor;                     // = 2, the highest issued
+    // At the highest issued seq: accepted.
+    const atHighest = await call('POST', '/ws/' + ws.ws + '/cursor', { token: members.bob.token, body: { seq: highest } });
+    expect(atHighest.status).toBe(200);
+    // One past it (= next_seq): refused, or a member would skip the next post.
+    const past = await call('POST', '/ws/' + ws.ws + '/cursor', { token: members.bob.token, body: { seq: highest + 1 } });
+    expect(past.status).toBe(400);
+    expect(past.body.error).toBe('cursor_ahead_of_stream');
+    // Proof it did not stick: the next message posted is still delivered.
+    await send(ws, members.alice, 'note.info', { sender_seq: 99 });
+    const after = await sync(ws, members.bob.token);
+    expect(after.body.messages).toHaveLength(1);
+  });
+
   it('carries the presence snapshot and active claims alongside messages', async () => {
     const { ws, members } = await setup(['alice', 'bob']);
     await call('POST', '/ws/' + ws.ws + '/heartbeat', { token: members.alice.token, body: { state: 'working' } });

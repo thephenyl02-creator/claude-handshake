@@ -733,9 +733,11 @@ export class WorkspaceDO extends DurableObject {
   #cursor(member, input, now) {
     const seq = input.body?.seq;
     if (!Number.isInteger(seq) || seq < 0) return err(400, 'cursor_invalid');
-    // Bounded by the highest seq the relay has ever issued: a client cannot
-    // park its own cursor in the future and go permanently blind.
-    if (seq > Number(this.#meta('next_seq'))) return err(400, 'cursor_ahead_of_stream');
+    // Bounded by the highest seq the relay has ever ISSUED = next_seq - 1
+    // (next_seq is what the next post will consume). A cursor at exactly
+    // next_seq would forward-clamp the member past the very next message
+    // posted, losing it (PROTOCOL §6.3).
+    if (seq >= Number(this.#meta('next_seq'))) return err(400, 'cursor_ahead_of_stream');
     // Cursor writes are authorized to their owner: a member can only ever
     // write its own, and only forwards.
     const next = Math.max(seq, member.cursor);
@@ -815,8 +817,10 @@ export class WorkspaceDO extends DurableObject {
   async #memberRemove(input, now, ip) {
     const auth = await this.#authRecovery(input.auth);
     if (auth.fail) return this.#denyAuth(ip, now, 401, auth.fail);
-    const target = input.params?.member;
-    const row = this.sql.exec('SELECT member_id, name, revoked_at FROM members WHERE member_id = ?', target).toArray()[0];
+    // Resolve id-first-then-name, exactly as #memberRebind does and as the
+    // PROTOCOL §9.2 row-15 note asserts for rows 14-15. Offboarding admins
+    // (SECURITY §7.1) naturally pass the departing member's NAME.
+    const row = this.#findMember(input.params?.member);
     if (!row) return err(404, 'member_not_found');
     if (row.revoked_at) return ok({ ok: true, member_id: row.member_id, already_removed: true });
     this.sql.exec('UPDATE members SET revoked_at = ? WHERE member_id = ?', now, row.member_id);

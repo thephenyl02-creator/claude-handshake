@@ -35,6 +35,10 @@ const STRIPE = 'sk_live_' + 'a1B2c3D4e5F6g7H8';
 const JWT = 'eyJ' + 'hbGciOiJIUzI1NiJ9' + '.eyJ' + 'zdWIiOiIxMjM0NTYifQ' + '.' + 'abcDEF123-_ghiJKL456';
 const TG = '123456789:AA' + 'F'.repeat(33);
 const HSK = 'hsk_' + 'a1b2c3d4e5f6g7h8i9j0';
+const hx = (n) => [...Array(n)].map((_, i) => 'abcdef0123456789'[i % 16]).join('');
+const HSR = 'hsr_' + hx(64) + '_' + hx(8);          // recovery key
+const HSM = 'hsm_' + hx(16) + '_' + hx(64);          // member sub-token
+const HSI = 'hsi1_' + 'AbCd_-'.repeat(10);           // inline invite = whole workspace
 
 // ------------------------------------------------------------ true positives
 test('aws access key', () => blocked(`deploy uses ${AWS} for s3`));
@@ -55,6 +59,11 @@ test('secret assignment', () => blocked("api_key = 'abcd1234efgh5678'"));
 test('env block', () =>
   blocked('DB_HOST=prod.example.com\nDB_USER=rootuser\nDB_PASS=supersecret1'));
 test('own workspace token', () => blocked(`token is ${HSK}`));
+// Regression: these three used to fall through the entropy heuristic ~1-in-3
+// times (audit 2026-08-15). They are the MOST dangerous handshake credentials.
+test('recovery key (explicit pattern, not entropy)', () => blocked(`joined as ${HSR} looks good`));
+test('member sub-token', () => blocked(`my token ${HSM} fyi`));
+test('inline invite = whole workspace', () => blocked(`come join ${HSI} see you there`));
 test('high-entropy token', () =>
   blocked('blob 9fK2mQ7xLpZ4vB8nR3tY6wE1uI5oPqSd here'));
 

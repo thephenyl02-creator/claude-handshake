@@ -185,3 +185,27 @@ describe('member rebind', () => {
     expect((await heartbeat(ws, rebound.body.token)).status).toBe(200);
   });
 });
+
+describe('member remove resolves id OR name (PROTOCOL section 9.2 row 14)', () => {
+  const remove = (ws, target, token) =>
+    call('POST', '/ws/' + ws.ws + '/members/' + target + '/remove', { token, body: {} });
+
+  it('removes by the member NAME, not only the id — the handle an offboarding admin knows', async () => {
+    const { ws, members } = await setup(['alice', 'bob']);
+    const res = await remove(ws, 'bob', ws.recovery_key);       // by name, per SECURITY 7.1
+    expect(res.status).toBe(200);
+    expect(res.body.ok).toBe(true);
+    expect(res.body.member_id).toBe(members.bob.member_id);
+    expect(res.body.member).toBe('bob');
+    // and the sub-token is dead, exactly as remove-by-id
+    const beat = await call('POST', '/ws/' + ws.ws + '/heartbeat', { token: members.bob.token, body: { state: 'working' } });
+    expect(beat.status).toBe(403);
+    expect(beat.body.error).toBe('member_revoked');
+  });
+
+  it('still removes by member id, and 404s an unknown handle', async () => {
+    const { ws, members } = await setup(['alice']);
+    expect((await remove(ws, members.alice.member_id, ws.recovery_key)).status).toBe(200);
+    expect((await remove(ws, 'ghost', ws.recovery_key)).status).toBe(404);
+  });
+});
