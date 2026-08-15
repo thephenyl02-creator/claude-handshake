@@ -684,9 +684,10 @@ async function cmdClaim(args) {
       const res = await ctx.adapter.claim({ subject: raw, ttl, files, acquired_at: acquiredAt });
       if (res.ok === false && res.conflict) {
         const mine = { acquired_at: acquiredAt, member: ctx.identity.member };
-        const theirs = { acquired_at: res.conflict.acquired_at, member: res.conflict.member_id || res.conflict.member };
+        // The relay's 409 body is a claim ROW: owner / owner_name (#claimRows).
+        const theirs = { acquired_at: res.conflict.acquired_at, member: res.conflict.owner || res.conflict.member_id || res.conflict.member };
         const lost = subject.losesTiebreak(mine, theirs);
-        out('claim refused: "' + key + '" is held by ' + (res.conflict.name || theirs.member));
+        out('claim refused: "' + key + '" is held by ' + (res.conflict.owner_name || res.conflict.name || theirs.member));
         out(lost ? '  you lose the tiebreak (PROTOCOL 5.4) - stop work on this subject'
           : '  you would win the tiebreak on acquired_at; reconcile with the holder');
         process.exitCode = 1;
@@ -701,6 +702,26 @@ async function cmdClaim(args) {
       out('claimed "' + key + '"' + (res.renewed ? ' (renewed)' : '') + ' ttl=' + ttl + 's');
     } catch (e) { reportFailure(ctx, e, 'claim'); out('claim not sent (transport unavailable)'); }
     return;
+  }
+
+  // Section 5.5: advisory conflicts are surfaced, never silently deferred, and
+  // the section 5.4 tiebreak governs every conflict on ntfy (no serializing
+  // server exists to 409). Mirrors the relay branch's refusal above.
+  if (!isRenewal) {
+    const peerClaims = (ctx.state.getPeers().claims || []);
+    const live = peerClaims.find((c) => c.subject_key === key &&
+      c.member !== ctx.identity.member &&
+      (Number(c.renewed_at) || 0) + (Number(c.ttl) || 0) * 1000 > Date.now());
+    if (live) {
+      const mine = { acquired_at: acquiredAt, member: ctx.identity.member };
+      const theirs = { acquired_at: live.acquired_at, member: live.member };
+      const lost = subject.losesTiebreak(mine, theirs);
+      out('claim refused: "' + key + '" is held by ' + live.member + ' [advisory]');
+      out(lost ? '  you lose the tiebreak (PROTOCOL 5.4) - stop work on this subject'
+        : '  you would win the tiebreak on acquired_at; reconcile with the holder');
+      process.exitCode = 1;
+      return;
+    }
   }
 
   const env = buildEnvelope(ctx, 'task.claim', {

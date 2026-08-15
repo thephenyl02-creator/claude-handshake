@@ -7,6 +7,15 @@
   },
   "plugins": [
     {
+      "name": "claude-handshake",
+      "description": "Peer collaboration for Claude Code: separate Claude instances, on different machines and different users, coordinating one project as a team. Injects a standing block of peer presence and live claims on every turn, gates writes against peers' claimed files, and keeps liveness on a monitor clock.",
+      "version": "0.1.0",
+      "author": {
+        "name": "Fenil"
+      },
+      "source": "./"
+    },
+    {
       "name": "handshake-spike",
       "description": "Throwaway M0.5 measurement plugin: logs hook/monitor timing to ~/.claude/handshake-spike.log. No network, no context injection. Removed after the spike.",
       "version": "0.1.0",

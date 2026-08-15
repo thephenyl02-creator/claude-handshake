@@ -70,7 +70,9 @@ function writeDigest(state, transport, parsed) {
       nonce: env.nonce || null,
       handle: m.handle !== undefined ? m.handle : m.seq,
     };
-  }).filter((it) => it.type);
+  }).filter((it) => it.type && it.type !== 'state.request');
+  // state.request is pure machinery ({want:[...]}) - caching it would burn a
+  // section 6.2 inject slot on "(no text)".
 
   const digest = {
     items,

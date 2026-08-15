@@ -479,6 +479,33 @@ function buildView(state, found, opts) {
   }
   claims.sort((a, b) => a.acquired_at - b.acquired_at);
 
+  // PROTOCOL 5.4: a genuinely-concurrent double-claim on an unauthenticated
+  // transport is only discoverable at sync time - neither side knew when it
+  // claimed. The deterministic verdict rides as a local notice (never
+  // watermark-consumable), and the model runs the 5.4 loser sequence from it.
+  const conflictNotices = [];
+  const subjectLib = lib('subject.js');
+  if (subjectLib && me) {
+    const ownByKey = new Map();
+    for (const c of state.getOwnClaims(now)) if (c.subject_key) ownByKey.set(c.subject_key, c);
+    for (const c of peers.claims || []) {
+      const key = c.subject_key;
+      if (!key || !ownByKey.has(key)) continue;
+      const owner = ownerOf(c);
+      if (!owner || owner === me) continue;
+      const expires = Number(c.expires_at) ||
+        (Number(c.renewed_at || c.acquired_at || 0) + Number(c.ttl || 7200) * 1000);
+      if (expires <= now) continue;
+      const mineC = ownByKey.get(key);
+      const lost = subjectLib.losesTiebreak(
+        { acquired_at: Number(mineC.acquired_at) || 0, member: me },
+        { acquired_at: Number(c.acquired_at) || 0, member: owner });
+      conflictNotices.push('claim conflict on "' + field('subject', key) + '": you ' +
+        (lost ? 'lose the tiebreak (5.4) - release it, post task.change, one line to your user'
+          : 'win the tiebreak (5.4) - the peer releases'));
+    }
+  }
+
   // digest ------------------------------------------------------------------
   const dg = state.getDigest();
   const items = (dg.items || []).map((it) => ({
@@ -514,7 +541,7 @@ function buildView(state, found, opts) {
   // private-repo verdict are both states the human must see, and neither is
   // peer traffic - so they ride as local notices, never as digest items that
   // the watermark could consume.
-  const notices = [];
+  const notices = [...conflictNotices];
   if (repoStatus.rotation_demanded) {
     notices.push('rotate the workspace secret: key material was tracked in a repo not proven private');
   } else if (verdict && verdict.private === false) {

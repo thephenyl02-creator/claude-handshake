@@ -2,6 +2,9 @@
   "name": "handshake-spike",
   "version": "0.1.0",
   "description": "Throwaway M0.5 measurement plugin for claude-handshake: logs hook/monitor timing to ~/.claude/handshake-spike.log. No network calls, no context injection, removed after the spike.",
+  "author": {
+    "name": "Fenil"
+  },
   "hooks": "./hooks/hooks.json",
   "experimental": {
     "monitors": "./monitors/monitors.json"

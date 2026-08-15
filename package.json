@@ -8,7 +8,8 @@
   },
   "homepage": "https://github.com/thephenyl02-creator/claude-handshake#readme",
   "scripts": {
-    "test": "node --test test/filter.test.js test/envelope.test.js test/subject.test.js test/state.test.js test/invite.test.js test/transport.test.js test/session.test.js test/escape.test.js test/repo.test.js test/workspace-files.test.js test/no-direct-send.test.js test/cli.test.js test/hooks.test.js"
+    "test": "node --test test/filter.test.js test/envelope.test.js test/subject.test.js test/state.test.js test/invite.test.js test/transport.test.js test/session.test.js test/escape.test.js test/repo.test.js test/workspace-files.test.js test/no-direct-send.test.js test/cli.test.js test/hooks.test.js",
+    "test:e2e": "node e2e/run.js"
   },
   "license": "MIT",
   "author": "Fenil <the.phenyl02@gmail.com>",
@@ -22,6 +23,16 @@
   ],
   "files": [
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    ".claude-plugin",
+    "bin",
+    "lib",
+    "hooks",
+    "monitors",
+    "commands",
+    "skills",
+    "installers",
+    "docs/PROTOCOL.md",
+    "docs/SECURITY.md"
   ]
 }

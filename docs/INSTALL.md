@@ -1,0 +1,387 @@
+# Install / upgrade / uninstall reference
+
+This is the detailed reference. For the three-tier quick version (paste /
+one-liner / manual), see the [README](../README.md#install). Everything below
+is normative for what the installers in [`installers/`](../installers/)
+actually do, including the fallback paths and the exact things a maintainer
+should check before trusting a run.
+
+## Contents
+
+- [Requirements](#requirements)
+- [The installers](#the-installers)
+- [The primary route: marketplace + plugin](#the-primary-route-marketplace--plugin)
+- [The fallback route: direct copy + hook registration](#the-fallback-route-direct-copy--hook-registration)
+- [The three-valued self-check](#the-three-valued-self-check)
+- [Upgrading](#upgrading)
+- [Uninstalling](#uninstalling)
+- [Security: credentials and push protection](#security-credentials-and-push-protection)
+- [Troubleshooting](#troubleshooting)
+
+## Requirements
+
+| | |
+|---|---|
+| **Node.js** | 18+ required, **20+ recommended**. `handshake doctor` grades this itself: 20+ is `pass` (global `fetch`, `hkdfSync`, `node:test` all available), 18–19 is `warn` (works, but `node --test` is thin before 20), below 18 is `fail`. The CLI (`bin/handshake.js`) and every hook shell out to `node` — there is no code path that works without it. |
+| **Claude Code CLI** | Any version that supports plugins. The installers fetch and install it via the official installer (`https://claude.ai/install.sh` / `https://claude.ai/install.ps1`) if it's missing. |
+| **macOS / Linux** | Supported natively via `installers/install.sh`. |
+| **Windows** | Supported natively via `installers/install.ps1` (PowerShell 5.1+ or pwsh). |
+| **WSL** | Works, with a caveat: Claude Code plugins are currently known **not to load hooks or monitors inside WSL**. `install.sh` detects WSL (`$WSL_DISTRO_NAME`, `$WSL_INTEROP`, or `microsoft` in `/proc/version`) and installs the fallback copy unconditionally there, regardless of what the plugin route itself reports. |
+| **Team relay** (optional) | A free Cloudflare account, needed only by whoever deploys the relay — see [`relay/README.md`](../relay/README.md). Members joining an already-deployed relay need nothing extra. |
+
+## The installers
+
+```
+installers/install.sh     macOS / Linux / WSL (bash)
+installers/install.ps1    Windows (PowerShell 5.1+ / pwsh)
+```
+
+Both are self-contained, idempotent, and safe to re-run. Both accept:
+
+| Flag | Effect |
+|---|---|
+| (none) | Full install: Node check → Claude CLI check → primary route → fallback route if needed → self-check |
+| `--verify` (bash) / `-VerifyActive` (PowerShell) | Re-run **only** the self-check — no install work, no network calls beyond what the self-check itself needs (a local `claude plugin list`) |
+| `--help` / `-Help` | Usage |
+
+**Flags need the script on disk.** The one-liners in the README pipe the
+script straight into an interpreter, and neither `curl … | bash` nor
+`irm … | iex` can pass arguments to it. Save it first when you want to re-run
+the self-check later:
+
+```sh
+# macOS / Linux / WSL
+curl -fsSL https://raw.githubusercontent.com/thephenyl02-creator/claude-handshake/main/installers/install.sh -o install.sh
+bash install.sh            # install
+bash install.sh --verify   # re-check activation, any time
+```
+
+```powershell
+# Windows
+irm https://raw.githubusercontent.com/thephenyl02-creator/claude-handshake/main/installers/install.ps1 -OutFile install.ps1
+.\install.ps1                 # install
+.\install.ps1 -VerifyActive   # re-check activation, any time
+```
+
+**Exit codes.** The install path exits `0` when the install itself succeeded
+and `1` only when nothing could be installed — `installed-but-not-active` is
+the *expected* outcome of a fresh install and is not reported as a failure, so
+`curl … | bash && …` behaves. The `--verify` / `-VerifyActive` path is the one
+that returns the full three-valued status: `0` active-verified, `1`
+installed-but-not-active, `2` not-installed.
+
+Both scripts port the hardening built for [claude-tier's installers](https://github.com/thephenyl02-creator/claude-tier)
+across four adversarial review rounds, adapted for a full hook+monitor+CLI
+plugin instead of a skill-only one:
+
+- **Claude CLI auto-install** if `claude` isn't found, using the official
+  installer, with the download and run split into separate steps so a
+  network failure is never misdiagnosed as "binary not found."
+- **PATH fix** (bash only) — appends the CLI's bin dir to `~/.zshrc` /
+  `~/.bashrc` if it isn't already there, without ever touching the user's
+  actual PATH for commands this script itself runs (it always uses the
+  absolute binary path).
+- **SSH→HTTPS fallback** — `GIT_CONFIG_KEY_*`/`GIT_CONFIG_VALUE_*` env vars
+  rewrite `git@github.com:`/`ssh://git@github.com/` to `https://github.com/`
+  for the duration of the script only, sidestepping every SSH failure mode
+  (missing `~/.ssh`, unknown host key, no key registered with GitHub).
+- **No-git fallback with a marker file** — see below.
+- **PS 5.1 `irm | iex` caller-scope wrapping** — the entire PowerShell script
+  body runs inside `& { ... } finally { ... }` so variables, functions, and
+  every process-wide change (`$ErrorActionPreference`, `$env:PATH`, the git
+  env overrides) are restored when the script ends, and under `irm | iex`
+  (where `$PSCommandPath` is empty) the script never calls `exit`, so a
+  failure can't kill the caller's whole terminal session.
+- **Backups kept outside the managed directory** — see below.
+
+New in this port (not in claude-tier, which is skill-only and needs none of
+this):
+
+- **Node.js step zero.** See [Requirements](#requirements) above — Windows
+  attempts an automatic install via `winget` (falling back to `choco`) and
+  refreshes `$env:Path` from the registry afterward so the same process can
+  pick up the new install without a fresh terminal; macOS/Linux deliberately
+  does **not** auto-install (no assumption about which package manager you
+  use), it points at the official installer and refuses to continue.
+- **WSL detection** and an unconditional fallback copy there.
+- **The three-valued self-check**, described below.
+
+## The primary route: marketplace + plugin
+
+```sh
+claude plugin marketplace add https://raw.githubusercontent.com/thephenyl02-creator/claude-handshake/main/.claude-plugin/marketplace.json
+claude plugin marketplace update claude-handshake
+claude plugin install claude-handshake@claude-handshake
+claude plugin update claude-handshake@claude-handshake
+```
+
+This is what the installers actually run — note the **raw URL**, not the
+`owner/repo` shorthand. `marketplace add` on a raw URL needs no git at all:
+the CLI downloads and caches the manifest over plain HTTPS, and
+`marketplace update` re-fetches it. The `owner/repo` shorthand (what a human
+types interactively — see the README's "Expert" tier) is a real, supported
+form (`claude plugin marketplace add --help` documents "a URL, path, or
+GitHub repo"), but it may fall back to git/SSH under the hood, which is
+exactly the failure mode an unattended installer script cannot depend on.
+
+Both `marketplace add` and `plugin install` **short-circuit to exit 0 without
+fetching anything** when the target already exists — "already added" and
+"already installed" are both silent no-ops. Only `marketplace update` and
+`plugin update` actually pull a newer version. This is why every run of the
+installer performs all four calls unconditionally: `add` (ignore failure —
+it's a no-op on a re-run anyway) → `marketplace update` (unconditional
+refresh) → `install` (works on a clean machine) → `update` (works when
+already installed; exits 1 when not, so it can never mask a genuine `install`
+failure). The route is considered successful if **either** `install` or
+`update` reported success.
+
+## The fallback route: direct copy + hook registration
+
+Triggered when the primary route fails outright, **or** unconditionally when
+WSL is detected (a reported plugin-route success is not a working install
+there). It needs no git — a `.tar.gz` (bash) / `.zip` (PowerShell) of `main`
+is downloaded directly from GitHub.
+
+1. The archive is extracted and copied to a **versioned directory**:
+   `~/.claude/handshake-plugin/<version>/` (the version comes from the
+   downloaded copy's own `package.json`, read via `node`, not hardcoded in
+   the installer — so it stays correct across releases without an installer
+   edit).
+2. A **marker file** (`.installed-by-claude-handshake-installer`) is written
+   at the root of that versioned copy. On every future run, only a directory
+   carrying this marker is ever replaced or cleaned up automatically — a
+   hand-authored directory that happens to occupy the same path is moved
+   aside to `~/.claude/handshake-plugin-backup.<timestamp>` (bash) /
+   `~/.claude/handshake-plugin-backup.<timestamp>` (PowerShell), **outside**
+   `~/.claude/handshake-plugin/` so a later scan never mistakes it for a
+   managed copy.
+3. Every `${CLAUDE_PLUGIN_ROOT}` / `$CLAUDE_PLUGIN_ROOT` reference inside the
+   copied `.md` and `.json` files is rewritten to the copy's own absolute
+   path — those placeholders are only ever set by the Claude Code plugin
+   host, which this copy is deliberately running outside of.
+4. **`commands/handshake.md` and `skills/handshake/`** are additionally
+   copied to `~/.claude/commands/handshake.md` and `~/.claude/skills/handshake/`.
+   Claude Code auto-loads both locations without any settings edit (the same
+   mechanism claude-tier's skills-dir fallback relies on) — so `/handshake`
+   and the on-demand skill work as soon as Claude Code picks them up.
+   These two are **shared user directories**, not directories the installer
+   owns, so the same ownership rule applies there as everywhere else: an
+   existing file or directory that the installer did not write (or that
+   differs from what is being installed) is moved to
+   `~/.claude/handshake-backup.<timestamp>/` first — outside `~/.claude/skills`,
+   so it can never load as a second, stale `handshake` skill. The replacement
+   is staged alongside and renamed into place, so nothing is deleted before
+   its replacement exists.
+5. **Hooks have no such auto-load directory**, so the installer prints — but
+   deliberately does **not** write — the exact `"hooks"` object to merge into
+   `~/.claude/settings.json` by hand (paths already resolved to the copy's
+   absolute location). Review it (or have your own Claude Code session apply
+   it and show you the diff) before saving; this installer will never edit
+   `settings.json` silently.
+6. **Monitors are not available in fallback mode** — there is no
+   settings.json equivalent for `experimental.monitors`. This is a documented,
+   handled condition, not a defect: claude-handshake already falls back to
+   "heartbeating on turn boundaries" whenever monitors are unavailable
+   ([PROTOCOL.md §8](PROTOCOL.md)), so coordination still works — just at
+   reduced liveness precision (state updates ride your own turns instead of a
+   60s/10min clock).
+
+When the primary route *does* succeed on a later run, the installer removes a
+superseding fallback copy automatically — but only one carrying the marker
+file, contents first and the marker deleted last, so a locked file (Claude
+Code still running) leaves the marker intact and a later run can finish the
+cleanup rather than silently re-creating a duplicate.
+
+## The three-valued self-check
+
+Three values, never a guess in between:
+
+| Value | Meaning |
+|---|---|
+| **not-installed** | Neither the plugin (`claude plugin list`) nor a marked fallback copy was found. |
+| **installed-but-not-active** | The plugin or fallback copy is present, but no hook has proven itself live recently. |
+| **active-verified** | A hook (SessionStart, and everything downstream of it) wrote fresh local state — proof it actually ran, not just that files exist on disk. |
+
+"Fresh" means an mtime less than 30 minutes old — mere existence is never
+enough; a state file from a stale install months ago must not read as active
+today.
+
+But recency alone is not proof either, because **a false `active-verified` is
+worse than a false `installed-but-not-active`**. `state.json` is written by
+every `SessionStart` hook — and also by `bin/handshake.js` itself on `init`,
+`join`, `mute`, `rest` and `sync`. So a fresh `state.json` in
+`~/.claude/handshake/` proves only that *the CLI ran in a terminal*; running
+`/handshake init` with the hooks never registered would otherwise light up as
+"active". The self-check therefore sorts evidence by who could possibly have
+written it:
+
+| Evidence | Who can write it | Counts as proof? |
+|---|---|---|
+| `posttool.tick`, `activity.mark`, `hooks.ticks.json` | `hooks/post-tool-use.js` only | **yes** |
+| `monitor.alive` | `monitors/heartbeat.js` only | **yes** |
+| anything under `~/.claude/plugins/data/claude-handshake*/` | only a plugin process — `CLAUDE_PLUGIN_DATA` is set by the host, never by a terminal | **yes** |
+| `state.json` under `~/.claude/handshake/` | a hook *or* a plain CLI run | no — reported honestly as "the CLI ran, not a hook" |
+| `session.json` | the CLI only, and only on a "loud condition" | not scanned at all |
+
+When only the ambiguous evidence is fresh, the self-check says so explicitly
+and tells you how to produce real proof: make **one edit or Bash call** inside
+a handshake workspace in Claude Code. That fires `PostToolUse`, which nothing
+but a hook can do, and the next `--verify` reports `active-verified`.
+
+The tricky part: **the installer's own process never sees
+`${CLAUDE_PLUGIN_DATA}`** — that variable is set by the Claude Code host
+inside a hook's process, not inherited by an unrelated script you run in your
+terminal. So the self-check scans **both** plausible roots rather than
+guessing one:
+
+- `~/.claude/handshake/<workspace-id>/` — where the CLI and the fallback
+  route's hooks write when no `CLAUDE_PLUGIN_DATA` is set (matches
+  `lib/state.js`'s own fallback rule exactly).
+- `~/.claude/plugins/data/claude-handshake*/<workspace-id>/` — where an
+  installed-plugin route's hooks write (the exact suffix after
+  `claude-handshake` is host-assigned and was observed to vary, e.g.
+  `-inline` for a locally-sourced dev install — the scan globs for the whole
+  family rather than hardcoding one).
+
+Both hooks are workspace-scoped no-ops (PROTOCOL §8: "every hook is a
+sub-10ms no-op outside a handshake workspace") — so immediately after a fresh
+install, **installed-but-not-active is the expected, honest result**, not a
+failure. To move to active-verified:
+
+1. `cd` into a project directory (ideally a git repo).
+2. Start Claude Code there: `claude`.
+3. Run `/handshake init` if the project has no workspace yet.
+4. Start a **new** session (`SessionStart` only runs its network-visible path
+   on `startup`/`resume`/`fork` — a `clear`/`compact` inside the same session
+   won't trigger it).
+5. Re-run the self-check: `install.sh --verify` / `install.ps1 -VerifyActive`.
+
+If the plugin is listed but not reporting `enabled`, the self-check tells you
+to run `/reload-plugins` inside Claude Code and start a new session instead —
+a freshly-installed plugin needs one reload to register before any hook can
+fire at all.
+
+## Upgrading
+
+**Primary route:**
+
+```sh
+claude plugin update claude-handshake@claude-handshake
+```
+
+or simply re-run the installer — it's idempotent and calls `update`
+unconditionally on every run (see [above](#the-primary-route-marketplace--plugin)).
+A restart of Claude Code (or a new session) is required to pick up the
+update, same as any plugin update.
+
+**Fallback route:** re-run the installer. It downloads the current `main`,
+reads the new version from `package.json`, and installs it to a **new**
+versioned directory (`~/.claude/handshake-plugin/<new-version>/`) rather than
+overwriting the one you may currently have loaded — a running Claude Code
+session with hooks pointed at the old path keeps working uninterrupted. Two
+things are **not** automatic and need your own follow-up:
+
+- If the hook set itself changed between versions (a new hook file, a changed
+  matcher), you'll need to re-merge the printed `"hooks"` snippet into
+  `~/.claude/settings.json` — diff it against what's there before overwriting.
+- Old versioned directories under `~/.claude/handshake-plugin/` are not
+  deleted automatically. Once you've confirmed the new version is active
+  (`--verify` / `-VerifyActive` reports `active-verified`) and updated
+  `settings.json`, remove the old one(s) yourself.
+
+## Uninstalling
+
+**Primary route:**
+
+```sh
+claude plugin uninstall claude-handshake@claude-handshake
+```
+
+By default this also removes the plugin's persistent data directory
+(`~/.claude/plugins/data/<id>/` — where your workspace's local state,
+sub-token, and offline queue live). Pass `--keep-data` to preserve it instead
+(useful if you're about to reinstall and want to keep an existing workspace
+identity). To also drop the marketplace registration itself:
+`claude plugin marketplace remove claude-handshake`.
+
+**Fallback route** has no CLI command for this — remove by hand, and **in this
+order**. The settings entries go first: while `settings.json` still points at
+a directory you have already deleted, every hook event fails with a "cannot
+find module" error until you finish.
+
+0. **Close Claude Code.** A running session holds the copy open on Windows and
+   will re-read `settings.json` mid-cleanup elsewhere.
+1. Remove the `"hooks"` entries you merged into `~/.claude/settings.json`
+   (find them by the absolute paths pointing into `handshake-plugin/` — the
+   installer resolved `${CLAUDE_PLUGIN_ROOT}` before printing them). Keep the
+   rest of the file intact; other tools share it.
+2. `~/.claude/commands/handshake.md`
+3. `~/.claude/skills/handshake/`
+4. `~/.claude/handshake-plugin/` (every versioned copy)
+5. `~/.claude/handshake/` — the local state described below. Delete this last,
+   and only if you also want the workspace identity gone.
+
+Anything the installer moved aside on your behalf is left for you to deal with
+deliberately — it is never auto-deleted:
+
+- `~/.claude/handshake-plugin-backup.<timestamp>/` — a pre-existing
+  `handshake-plugin/<version>/` directory the installer did not write.
+- `~/.claude/handshake-backup.<timestamp>/` — your previous
+  `commands/handshake.md` or `skills/handshake/`, if either differed from the
+  version being installed.
+
+Both live **outside** the directories the installer manages, so they are never
+re-discovered as a live command, skill, or plugin copy. Restore from them or
+delete them at your leisure.
+
+> `~/.claude/handshake-spike.log` (from the throwaway M0.5 spike plugin, if it
+> was ever installed) is a *different* file that also starts with `handshake`.
+> Remove the paths above by name — never with a `rm -rf ~/.claude/handshake*`
+> glob, which would sweep up unrelated files.
+
+**Either route**, your workspace's local state — `~/.claude/handshake/<ws>/`
+or the plugin data directory — holds the sub-token and, on ntfy, the topic
+(both bearer credentials, SECURITY.md §3). Neither uninstall path removes a
+**joined workspace's membership on the transport itself** — if you're leaving
+a team's workspace for good, run `/handshake rest` (or ask the founder to
+remove your member) before uninstalling, not after.
+
+## Security: credentials and push protection
+
+claude-handshake's credential formats (`hsk_`, `hsr_`, `hsm_` prefixes, each
+with a checksum) are **deliberately greppable**, so GitHub push protection and
+third-party secret scanners can catch a leak before it's pushed
+(SECURITY.md §3.1). If push protection blocks a commit because it found one
+of these:
+
+- **The default, correct response is to fix the leak**: stop committing the
+  secret (check `.handshake/*` is where the private-repo guard actually
+  expects it, per [SECURITY.md §6](SECURITY.md)), and rotate the credential.
+  Allowlisting the finding does **not** undo an already-pushed commit, and
+  rotation itself does not un-leak git history (SECURITY.md §3.1, §6) — the
+  commit that carried it stays in every clone, fork, and archive that already
+  pulled it.
+- **Allowlisting is documented only for one case**: an intentional,
+  **already-rotated** value kept for documentation or test fixtures (a dead
+  credential that can never be used again). Never allowlist a live credential
+  to make a push go through faster.
+
+Full key-material inventory, holder sets, and offboarding runbooks:
+[SECURITY.md §3, §7](SECURITY.md).
+
+## Troubleshooting
+
+| Symptom | Check |
+|---|---|
+| `node --version` fails after the Windows installer says it installed Node | Open a **new** terminal — PATH changes from `winget`/`choco` don't always propagate to a script's own already-running process even after the refresh attempt. |
+| Plugin route fails every time | Check `claude plugin marketplace list` for a stale `claude-handshake` entry pointing somewhere wrong; `claude plugin marketplace remove claude-handshake` and re-run the installer. |
+| `/handshake` command not recognized | You likely need `/reload-plugins` or a new session — see the self-check section above. |
+| Hooks not firing on WSL | Expected until you've merged the printed `settings.json` snippet by hand — the fallback route never edits it for you. |
+| `handshake doctor` reports `fail` on `node` | You're on Node < 18; upgrade — `node --test` and the CLI's use of global `fetch`/`hkdfSync` need 18+, and doctor recommends 20+. |
+| Unsure if you're on the plugin route or the fallback route | `claude plugin list` shows the plugin if the primary route is active; `Test-Path ~/.claude/handshake-plugin` (or `ls ~/.claude/handshake-plugin`) shows a fallback copy. Both can coexist briefly during a transition — the installer cleans up a superseded fallback copy automatically once the plugin route is confirmed working. |
+
+For anything not covered here: `/handshake doctor` and this file's
+[self-check section](#the-three-valued-self-check) cover activation and
+health; [SECURITY.md](SECURITY.md) covers anything credential- or
+trust-related; [PROTOCOL.md](PROTOCOL.md) is the normative wire behavior if
+something looks like a protocol mismatch.
