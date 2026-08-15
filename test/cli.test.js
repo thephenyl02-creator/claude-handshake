@@ -711,19 +711,22 @@ test('5.4: renewing a claim preserves the original acquired_at on the wire', () 
 test('5.3: re-claiming an EXPIRED subject is a fresh acquisition, not a renewal', () => {
   const box = joinedSandbox();
   const wsId = JSON.parse(run(box, ['status', '--json']).out).workspace.ws;
-  run(box, ['claim', 'Fix the API issue', '--ttl', '1']);
+  // ttl must outlive the test run: the offline queue CORRECTLY discards
+  // task.* envelopes past their claim's TTL (PROTOCOL 10.3), so a 1 s ttl
+  // let the first envelope vanish under load before it was read back.
+  run(box, ['claim', 'Fix the API issue', '--ttl', '60']);
   const original = queuedEnvelopes(box, wsId, 'task.claim')[0].body.acquired_at;
 
   // Expire the lease by hand rather than sleeping: past its TTL the claim is
   // gone (PROTOCOL 5.3), so re-taking it is a new acquisition.
   const file = path.join(box.data, wsId, 'state.json');
   const s = JSON.parse(fs.readFileSync(file, 'utf8'));
-  s.own_claims = s.own_claims.map((c) => Object.assign({}, c, { acquired_at: c.acquired_at - 10_000, renewed_at: c.renewed_at - 10_000 }));
+  s.own_claims = s.own_claims.map((c) => Object.assign({}, c, { acquired_at: c.acquired_at - 70_000, renewed_at: c.renewed_at - 70_000 }));
   fs.writeFileSync(file, JSON.stringify(s, null, 2));
 
   run(box, ['claim', 'Fix the API issue']);
   const again = queuedEnvelopes(box, wsId, 'task.claim')[1];
-  assert.notEqual(again.body.acquired_at, original - 10_000);
+  assert.notEqual(again.body.acquired_at, original - 70_000);
   assert.equal(again.body.renew, undefined, 'an expired claim re-taken is not a renewal');
 });
 

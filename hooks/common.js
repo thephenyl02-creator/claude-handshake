@@ -126,7 +126,10 @@ function resolveWorkspace(cwd) {
     // then re-read through lib/workspace-files.js, which escapes on read
     // because .handshake/* is untrusted data exactly like transport content
     // (SECURITY 5.4). A hook never opens that file itself.
-    const r = sessionLib.resolveWorkspace(cwd || process.cwd(), { noCache: true });
+    // Cached path (PROTOCOL section 8): each hook is its own process, so in
+    // production this resolves exactly once per invocation either way -
+    // bypassing the cache only breaks the sub-10ms budget for repeat callers.
+    const r = sessionLib.resolveWorkspace(cwd || process.cwd());
     if (r && r.ok && r.public && r.public.ws) {
       let pub = r.public;
       if (wf && typeof wf.readWorkspacePublic === 'function') {
