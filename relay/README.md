@@ -27,7 +27,7 @@ npx wrangler deploy
 
 ```sh
 curl https://claude-handshake-relay.<your-subdomain>.workers.dev/health
-# {"ok":true,"service":"claude-handshake-relay","version":"0.1.1","protocol":1}
+# {"ok":true,"service":"claude-handshake-relay","version":"0.1.2","protocol":1}
 ```
 
 Then create the workspace and hand the invite to your team:
@@ -163,6 +163,8 @@ loser gets `409 claim_conflict` with the live claim in the body so it can tell
 its user who holds it. Subject matching is on a normalized key (case,
 punctuation, stopwords — see `src/lib/subject.js`); the owner re-claiming the
 same subject renews it and merges `files[]`.
+
+An OPTIONAL `acquired_at` (Unix ms; non-integer is `400 claim_acquired_at_invalid`, a future value is clamped to now) is honored **only** where the caller's own claim row is created or re-adopted — a renewal keeps the stored value and a peer's live claim is never touched — so `/handshake upgrade` can re-broadcast a claim after a transport migration without resetting the tiebreak input.
 
 ### Messages
 

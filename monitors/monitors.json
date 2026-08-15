@@ -1,0 +1,8 @@
+[
+  {
+    "name": "handshake-heartbeat",
+    "command": "node \"${CLAUDE_PLUGIN_ROOT}/monitors/heartbeat.js\"",
+    "description": "claude-handshake liveness clock: presence heartbeat and claim renewal on the monitor's own clock (60s relay / state-change + 600s ntfy), sentinel-file disarm. Writes nothing to stdout; exits immediately outside a handshake workspace.",
+    "when": "always"
+  }
+]

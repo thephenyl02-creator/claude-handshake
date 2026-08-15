@@ -1,0 +1,22 @@
+{
+  "name": "claude-handshake",
+  "version": "0.1.0",
+  "description": "Peer collaboration for Claude Code: separate Claude instances, on different machines and different users, coordinating one project as a team. Injects a standing block of peer presence and live claims on every turn, gates writes against peers' claimed files, and keeps liveness on a monitor clock.",
+  "author": {
+    "name": "Fenil"
+  },
+  "homepage": "https://github.com/thephenyl02-creator/claude-handshake#readme",
+  "repository": "https://github.com/thephenyl02-creator/claude-handshake",
+  "license": "MIT",
+  "keywords": [
+    "collaboration",
+    "multi-agent",
+    "presence",
+    "coordination",
+    "peer-to-peer"
+  ],
+  "hooks": "./hooks/hooks.json",
+  "experimental": {
+    "monitors": "./monitors/monitors.json"
+  }
+}

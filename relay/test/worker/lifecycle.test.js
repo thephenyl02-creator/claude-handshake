@@ -287,6 +287,144 @@ describe('claims', () => {
   });
 });
 
+// PROTOCOL Appendix B A7 / section 9.4 step 3: /handshake upgrade re-broadcasts
+// live claims on the new transport, and the tiebreak (section 5.4) is decided by
+// the earliest acquired_at — so a migrated claim has to be able to carry its
+// pre-migration age across.
+describe('claim acquired_at (A7)', () => {
+  it('honors a supplied acquired_at when the claim row is created', async () => {
+    const { ws, members } = await setup(['alice']);
+    const before = Date.now() - 3_600_000;
+    const res = await call('POST', '/ws/' + ws.ws + '/claim', {
+      token: members.alice.token,
+      body: { subject: 'migrated work', acquired_at: before }
+    });
+    expect(res.status).toBe(201);
+    expect(res.body.claim.acquired_at).toBe(before);
+    // Old for the tiebreak, freshly live for its TTL: renewed_at is still now.
+    expect(res.body.claim.renewed_at).toBeGreaterThanOrEqual(before + 3_500_000);
+    expect(res.body.claim.expires_at).toBeGreaterThan(Date.now());
+
+    // And it is what peers read, not just what the writer was told.
+    const view = await call('GET', '/ws/' + ws.ws + '/sync', { token: members.alice.token });
+    expect(view.body.claims[0].acquired_at).toBe(before);
+  });
+
+  it('clamps a future acquired_at to now', async () => {
+    const { ws, members } = await setup(['alice']);
+    const sent = Date.now() + 86_400_000;
+    const floor = Date.now();
+    const res = await call('POST', '/ws/' + ws.ws + '/claim', {
+      token: members.alice.token,
+      body: { subject: 'clock ahead', acquired_at: sent }
+    });
+    expect(res.status).toBe(201);
+    expect(res.body.claim.acquired_at).toBeLessThan(sent);
+    expect(res.body.claim.acquired_at).toBeGreaterThanOrEqual(floor);
+    expect(res.body.claim.acquired_at).toBeLessThanOrEqual(Date.now());
+    // Clamping keeps the invariant a future value would break.
+    expect(res.body.claim.acquired_at).toBeLessThanOrEqual(res.body.claim.renewed_at);
+  });
+
+  it('honors it when re-adopting a lease the relay had already expired', async () => {
+    const { ws, members } = await setup(['alice']);
+    await call('POST', '/ws/' + ws.ws + '/claim', {
+      token: members.alice.token,
+      body: { subject: 'long job', ttl: 60 }
+    });
+    await runInDurableObject(workspaceStub(ws.ws), (_instance, state) => {
+      state.storage.sql.exec('UPDATE claims SET renewed_at = ?', Date.now() - 61_000);
+    });
+
+    const original = Date.now() - 7_200_000;
+    const readopt = await call('POST', '/ws/' + ws.ws + '/claim', {
+      token: members.alice.token,
+      body: { subject: 'long job', acquired_at: original }
+    });
+    // The expired row is gone, so this is a create — and the age carries over.
+    expect(readopt.status).toBe(201);
+    expect(readopt.body.renewed).toBe(false);
+    expect(readopt.body.claim.acquired_at).toBe(original);
+  });
+
+  it('ignores it when renewing an existing own claim', async () => {
+    const { ws, members } = await setup(['alice']);
+    const first = await call('POST', '/ws/' + ws.ws + '/claim', {
+      token: members.alice.token,
+      body: { subject: 'steady work' }
+    });
+    expect(first.status).toBe(201);
+    const stored = first.body.claim.acquired_at;
+
+    // Neither direction moves it: not backwards to win a tiebreak...
+    const older = await call('POST', '/ws/' + ws.ws + '/claim', {
+      token: members.alice.token,
+      body: { subject: 'steady work', acquired_at: 1 }
+    });
+    expect(older.status).toBe(200);
+    expect(older.body.renewed).toBe(true);
+    expect(older.body.claim.acquired_at).toBe(stored);
+
+    // ...nor forwards.
+    const newer = await call('POST', '/ws/' + ws.ws + '/claim', {
+      token: members.alice.token,
+      body: { subject: 'steady  WORK!', acquired_at: Date.now() }
+    });
+    expect(newer.status).toBe(200);
+    expect(newer.body.claim.acquired_at).toBe(stored);
+
+    const view = await call('GET', '/ws/' + ws.ws + '/sync', { token: members.alice.token });
+    expect(view.body.claims[0].acquired_at).toBe(stored);
+  });
+
+  it('never lets a backdated acquired_at touch or take a peer live claim', async () => {
+    const { ws, members } = await setup(['alice', 'bob']);
+    const held = await call('POST', '/ws/' + ws.ws + '/claim', {
+      token: members.alice.token,
+      body: { subject: 'the onboarding flow' }
+    });
+    expect(held.status).toBe(201);
+    const aliceAcquired = held.body.claim.acquired_at;
+
+    const stolen = await call('POST', '/ws/' + ws.ws + '/claim', {
+      token: members.bob.token,
+      body: { subject: 'Onboarding  FLOW!', acquired_at: 0 }
+    });
+    // An older acquired_at is not a way in: the relay's own first-come result
+    // stands and the 409 body still describes alice's untouched claim.
+    expect(stolen.status).toBe(409);
+    expect(stolen.body.error).toBe('claim_conflict');
+    expect(stolen.body.claim.owner).toBe(members.alice.member_id);
+    expect(stolen.body.claim.acquired_at).toBe(aliceAcquired);
+
+    const row = await runInDurableObject(workspaceStub(ws.ws), (_instance, state) =>
+      state.storage.sql.exec('SELECT owner, acquired_at FROM claims').toArray()
+    );
+    expect(row).toHaveLength(1);
+    expect(row[0].owner).toBe(members.alice.member_id);
+    expect(row[0].acquired_at).toBe(aliceAcquired);
+  });
+
+  it('rejects a non-integer acquired_at', async () => {
+    const { ws, members } = await setup(['alice', 'bob']);
+    for (const value of ['1755230000000', 1755230000000.5, null, true, NaN, { ms: 1 }]) {
+      const res = await call('POST', '/ws/' + ws.ws + '/claim', {
+        token: members.alice.token,
+        body: { subject: 'typed wrong', acquired_at: value }
+      });
+      expect(res.status).toBe(400);
+      expect(res.body.error).toBe('claim_acquired_at_invalid');
+    }
+
+    // Nothing was claimed by the bad requests, so the subject is still free.
+    const free = await call('POST', '/ws/' + ws.ws + '/claim', {
+      token: members.bob.token,
+      body: { subject: 'typed wrong' }
+    });
+    expect(free.status).toBe(201);
+  });
+});
+
 describe('method and shape guards', () => {
   it('rejects a GET on a POST endpoint', async () => {
     const { ws, members } = await setup(['alice']);

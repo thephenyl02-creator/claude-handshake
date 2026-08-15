@@ -26,6 +26,8 @@ const subject = require('../lib/subject');
 const stateLib = require('../lib/state');
 const sessionLib = require('../lib/session');
 const inviteLib = require('../lib/invite');
+const repoLib = require('../lib/repo');
+const wsFiles = require('../lib/workspace-files');
 const relay = require('../lib/transport-relay');
 const ntfy = require('../lib/transport-ntfy');
 const T = require('../lib/transport');
@@ -182,6 +184,101 @@ function buildEnvelope(wsCtx, type, body) {
   });
 }
 
+// ------------------------------------------------------ the repo layer (M8) --
+
+// Where the durable layer lives: the git working tree root, or nothing. A
+// project that is not a git repo has no durable layer at all - claude-handshake
+// does not invent one in a directory git will never carry, because the whole
+// value of `.handshake/` is that peers get it by pulling.
+function repoRoot(cwd) {
+  const detected = repoLib.detectRepo(cwd || process.cwd());
+  return detected && detected.ok ? detected : null;
+}
+
+// True once `.handshake/` exists in the working tree. Every guard and shard
+// path is a no-op before that, so a plain local workspace never pays for a
+// `git`/`gh` subprocess it has no use for.
+function repoLayerPresent(root) {
+  return Boolean(root) && wsFiles.exists(wsFiles.paths(root).dir);
+}
+
+// SECURITY.md section 6: the guard is re-checked on a cached TTL at every sync,
+// and a repo found public while workspace key material is tracked in it
+// HARD-FAILS posting, loudly, and demands rotation. That is a loud-rejected
+// condition (PROTOCOL 10.2), so it goes through exactly the same session flags
+// as a 403: reported once, posting stopped on that transport for the session,
+// reading untouched.
+function enforceRepoGuard(ctx, opts) {
+  const o = opts || {};
+  const detected = o.detected === undefined ? repoRoot(o.cwd) : o.detected;
+  if (!detected) return null;
+  if (!repoLayerPresent(detected.root)) return null;
+
+  const verdict = repoLib.guard({ cwd: detected.root, repo: detected, state: ctx.state, force: Boolean(o.force) });
+  const tracked = repoLib.trackedSecrets(detected.root);
+  const applied = repoLib.applyGuard({
+    state: ctx.state, flags: ctx.flags, transport: ctx.cfg.transport, verdict, tracked,
+  });
+  if (applied.hard_fail && applied.report) err(applied.message);
+  return { root: detected.root, detected, verdict, tracked, applied };
+}
+
+// A member writes its OWN shard and no other (PLAN.md section 2). Best effort
+// by design: a missing repo layer, an unjoined workspace or a filter refusal
+// must never turn a successful claim into a failed command - the live layer
+// already carried it.
+function writeShard(ctx, kind, fields) {
+  const detected = repoRoot();
+  if (!detected || !repoLayerPresent(detected.root)) return null;
+  const self = ctx.cfg.member;
+  if (!self) return null;
+  try {
+    return wsFiles.appendShardRecord(detected.root, { self, member: self, kind, fields }, {
+      filterOpts: ctx.filterOpts, email: ctx.cfg.git_email || null,
+    });
+  } catch (e) {
+    if (e instanceof FilterViolation) { reportFailure(ctx, e, 'task shard write'); return null; }
+    err('handshake: task shard not written (' + (e && e.message) + ')');
+    return null;
+  }
+}
+
+// Write the split workspace record. Public part always; guarded part only on
+// an affirmative isPrivate:true, else gitignored with the out-of-band
+// instruction printed (SECURITY.md 6).
+function writeRepoLayer(wsId, cfg, opts) {
+  const o = opts || {};
+  const detected = o.detected === undefined ? repoRoot() : o.detected;
+  if (!detected) return null;
+  const root = detected.root;
+  const state = o.state || stateLib.openState(wsId);
+
+  const verdict = repoLib.guard({ cwd: root, repo: detected, state, force: true });
+  const guarded = { ws: wsId, secret: cfg.secret, topic: cfg.topic, enrollment_token: cfg.enrollment_token };
+  const written = wsFiles.writeGuardedPart(root, guarded, verdict, { filterOpts: o.filterOpts });
+  const pub = wsFiles.writeWorkspacePublic(root, Object.assign({}, cfg, { ws: wsId }), {
+    filterOpts: o.filterOpts, secretLocation: written.secret_location,
+  });
+  return { root, detected, verdict, written, public: pub };
+}
+
+function printRepoLayer(layer) {
+  out('');
+  out('repo layer (' + layer.root + ')');
+  out('  public part:  ' + layer.public.file + '  (committed always)');
+  out('  guard:        ' + layer.verdict.verdict + ' - ' + layer.verdict.explanation +
+    (layer.verdict.slug ? '  [' + layer.verdict.slug + ']' : ''));
+  out('  guarded part: ' + layer.written.file +
+    (layer.written.committable ? '  COMMITTABLE (affirmative isPrivate:true)' : '  gitignored, NOT committed'));
+  if (layer.written.instruction) {
+    out('');
+    for (const line of layer.written.instruction.split('\n')) out('  ' + line);
+  }
+  if (layer.public.refused.length) {
+    out('  refused in the public part: ' + layer.public.refused.join(', ') + ' (guarded fields never go there)');
+  }
+}
+
 // ------------------------------------------------------- failure surfacing --
 
 // section 10.1: transport unreachable -> the client MUST NOT interrupt the
@@ -322,6 +419,32 @@ async function cmdInit(args) {
     if (enrollmentToken) out('    enrollment token: ' + enrollmentToken);
     if (recoveryKey) out('    recovery key:     ' + recoveryKey + '   (founder only, out of band, never the repo)');
   }
+
+  // ------------------------------------------------------ the repo layer --
+  const detected = args.flags['no-repo'] ? null : repoRoot();
+  let layer = null;
+  if (detected) {
+    layer = writeRepoLayer(ws, state.read(), { detected, state, filterOpts: { projectDir: process.cwd() } });
+    printRepoLayer(layer);
+    const email = repoLib.localGitEmail(detected.root);
+    if (email) state.update((s) => { s.git_email = email; return s; });
+  } else if (!args.flags['no-repo']) {
+    out('');
+    out('  no git working tree here - no durable layer was written. `.handshake/` only');
+    out('  helps peers when git carries it to them; run `handshake init` inside the repo');
+    out('  (or `git init` first) to get the durable half.');
+  }
+
+  if (detected && args.flags['claude-md']) {
+    const r = wsFiles.writeClaudeMdBlock(detected.root, { consent: true });
+    out('  CLAUDE.md block: ' + r.action + ' (' + r.file + ')');
+  } else if (detected) {
+    out('');
+    out('  Optional: `handshake init --claude-md` (or re-run with it) appends a short');
+    out('  HUMAN-addressed block to CLAUDE.md telling teammates this project uses');
+    out('  claude-handshake. It is not written without that flag.');
+  }
+
   out('');
   out('Next: `handshake invite` to produce a join blob.');
 }
@@ -345,13 +468,37 @@ async function cmdInvite(args) {
   let blob;
   try { blob = inviteLib.encode(fields); } catch (e) { err('handshake: ' + e.message); process.exitCode = 1; return; }
 
-  if (args.flags.json) { json({ invite: blob, describe: inviteLib.describe(inviteLib.decode(blob)) }); return; }
+  // PROTOCOL 9.1: loc:"repo" says "the secret lives in the repo". That is only
+  // TRUE when the guard affirmed private AND the guarded part is actually
+  // committed - otherwise the blob points the joiner at a file they will never
+  // receive, and they will be stuck with no secret and no error to read.
+  let repoNote = null;
+  if (loc === 'repo') {
+    const detected = repoRoot();
+    const guarded = detected ? wsFiles.readGuardedPart(detected.root) : null;
+    if (!detected) repoNote = 'there is no git working tree here, so nothing can distribute the secret through the repo';
+    else if (!guarded) repoNote = 'no ' + wsFiles.DIR + '/' + wsFiles.SECRET_FILE + ' exists yet - run `handshake init` in this repo first';
+    else if (!guarded.committed) repoNote = 'the guarded part is gitignored (the private-repo guard did not affirm isPrivate:true), so the repo will NOT carry the secret to the joiner';
+  }
+
+  if (args.flags.json) { json({ invite: blob, describe: inviteLib.describe(inviteLib.decode(blob)), repo_note: repoNote }); return; }
   out(blob);
   err('');
-  err('This blob is a CREDENTIAL: it carries the workspace secret' +
-    (cfg.transport === 'relay' ? ' and the relay enrollment token' : ' and the ntfy topic') + '.');
-  err('Send it over a channel you would send a password over. Anyone holding it can');
-  err('read and sign workspace traffic (SECURITY.md section 3).');
+  if (loc === 'inline') {
+    err('This blob is a CREDENTIAL: it carries the workspace secret' +
+      (cfg.transport === 'relay' ? ' and the relay enrollment token' : ' and the ntfy topic') + '.');
+    err('Send it over a channel you would send a password over. Anyone holding it can');
+    err('read and sign workspace traffic (SECURITY.md section 3).');
+  } else {
+    err('This blob carries NO secret (loc=repo): the joiner reads the guarded part out of');
+    err('the private repo. Everyone with read access to that repo therefore holds the');
+    err('workspace secret - that is the documented holder set (SECURITY.md 3.1).');
+    if (repoNote) {
+      err('');
+      err('WARNING: ' + repoNote + '.');
+      err('         Use `handshake invite --inline` and hand the blob over out of band instead.');
+    }
+  }
 }
 
 // ================================================================== join ====
@@ -395,8 +542,24 @@ async function cmdJoin(args) {
   let member = memberName;
   let memberToken = null;
 
+  // PROTOCOL 9.1, loc:"repo": the guarded part is distributed BY the private
+  // repo. Read it from the working tree rather than making the human paste a
+  // credential that is already on their disk - and refuse a guarded part
+  // belonging to a different workspace rather than silently keying against it.
+  const detectedJoin = repoRoot();
+  let fromRepo = null;
+  if (fields.loc === 'repo' && detectedJoin) {
+    fromRepo = wsFiles.readGuardedPart(detectedJoin.root);
+    if (fromRepo && fromRepo.ws && fromRepo.ws !== fields.ws) {
+      err('handshake: ' + fromRepo.file + ' belongs to workspace ' + fromRepo.ws + ', not ' + fields.ws + ' - ignoring it');
+      fromRepo = null;
+    }
+    if (fromRepo) out('  reading the guarded part from ' + fromRepo.file);
+  }
+
   if (fields.t === 'relay') {
-    const enrollment = fields.tok || (await ask('enrollment token (input hidden): ', { silent: true })).trim();
+    const enrollment = fields.tok || (fromRepo && fromRepo.enrollment_token) ||
+      (await ask('enrollment token (input hidden): ', { silent: true })).trim();
     try {
       const joined = await relay.joinWorkspace({
         origin: fields.e, ws: fields.ws, enrollmentToken: enrollment, member: memberName,
@@ -413,7 +576,10 @@ async function cmdJoin(args) {
     s.ws = fields.ws; s.name = fields.n; s.transport = fields.t; s.endpoint = fields.e;
     s.protocol = envelope.PROTOCOL_VERSION; s.client = CLIENT;
     if (fields.s) s.secret = fields.s;
+    else if (fromRepo && fromRepo.secret) s.secret = fromRepo.secret;
     if (fields.topic) s.topic = fields.topic;
+    else if (fromRepo && fromRepo.topic) s.topic = fromRepo.topic;
+    if (fromRepo && fromRepo.enrollment_token) s.enrollment_token = fromRepo.enrollment_token;
     s.member = member; s.member_name = memberName;
     if (memberToken) s.member_token = memberToken;
     s.joined_at = Date.now();
@@ -422,9 +588,40 @@ async function cmdJoin(args) {
   });
   stateLib.linkProject(process.cwd(), fields.ws);
 
+  // SECURITY.md 5.4: the non-member-commit warning compares a shard's last
+  // committer against the member emails RECORDED AT JOIN. This is that record,
+  // for this member. Peers' emails are learned the same way on their machines
+  // and never inferred from a shard's own self-declared header - a field an
+  // attacker writes is not evidence about the attacker.
+  if (detectedJoin) {
+    const email = repoLib.localGitEmail(detectedJoin.root);
+    if (email) {
+      state.update((s) => { s.git_email = email; return s; });
+      wsFiles.recordMemberEmail(state, member, email);
+    }
+    if (repoLayerPresent(detectedJoin.root)) {
+      const verdict = repoLib.guard({ cwd: detectedJoin.root, repo: detectedJoin, state, force: true });
+      const tracked = repoLib.trackedSecrets(detectedJoin.root);
+      out('  repo guard: ' + verdict.verdict + ' - ' + verdict.explanation);
+      if (!verdict.private && tracked.any) {
+        err('handshake: this repo is NOT verified private and it tracks workspace key material (' +
+          tracked.secrets.map((s) => s.file).join(', ') + '). Treat the workspace secret as');
+        err('           disclosed and rotate it before relying on this workspace (SECURITY.md 6).');
+      }
+    }
+  }
+
   if (fields.loc === 'repo' && !state.read().secret) {
-    err('handshake: this invite says the workspace secret lives in the repo (loc=repo).');
+    err('handshake: this invite says the workspace secret lives in the repo (loc=repo),');
+    err('           but no readable ' + wsFiles.DIR + '/' + wsFiles.SECRET_FILE + ' was found here.');
     err('           Nothing was signed yet - the secret must be provisioned before posting.');
+    err('           Ask the workspace founder for `handshake invite --inline`, out of band.');
+    process.exitCode = 1; return;
+  }
+
+  if (detectedJoin && args.flags['claude-md']) {
+    const r = wsFiles.writeClaudeMdBlock(detectedJoin.root, { consent: true });
+    out('  CLAUDE.md block: ' + r.action + ' (' + r.file + ')');
   }
 
   const ctx = openWorkspace(fields.ws, args);
@@ -459,12 +656,32 @@ async function cmdClaim(args) {
   const files = typeof args.flags.files === 'string' ? args.flags.files.split(',').map((s) => s.trim()).filter(Boolean).slice(0, 64) : undefined;
 
   const ctx = openWorkspace(found.ws, args);
-  const acquiredAt = Date.now();
+
+  // PROTOCOL 3.2: `acquired_at` is "when this member FIRST acquired the
+  // subject", and 5.4 makes it the tiebreak key. A renewal that stamps
+  // Date.now() therefore does not merely refresh a lease - it rewrites this
+  // member's position in the tiebreak, and on ntfy (where the value travels on
+  // the wire and no server arbitrates) a member who renews often would keep
+  // losing to a peer who claimed later. So: reuse the stored acquired_at
+  // whenever a LIVE own-claim already exists for this subject key -
+  // lib/state.js addOwnClaim() preserves the original across re-adoption for
+  // exactly this reason - and mint a fresh one only for a genuinely new claim.
+  // An EXPIRED claim is not reused: past its TTL the claim is gone (5.3), and
+  // re-taking it is a new acquisition, not a renewal.
+  const held = ctx.state.getOwnClaims().find((c) => c.subject_key === key);
+  const heldAt = held && Number.isFinite(Number(held.acquired_at)) ? Number(held.acquired_at) : null;
+  const isRenewal = heldAt !== null;
+  const acquiredAt = isRenewal ? heldAt : Date.now();
 
   if (ctx.cfg.transport === 'relay') {
     // section 3.1: claims are server state on the relay, NOT envelopes.
     try {
-      const res = await ctx.adapter.claim({ subject: raw, ttl, files });
+      // Appendix B A7 (relay v0.1.2): the relay accepts an optional
+      // `acquired_at`, clamps it to <= now, and honors it only on a fresh
+      // insert or an adoption - never on a renewal. Sending the preserved
+      // value is what keeps ordering across a rebind, a restart or a migration;
+      // the relay derives its own value when we do not send one.
+      const res = await ctx.adapter.claim({ subject: raw, ttl, files, acquired_at: acquiredAt });
       if (res.ok === false && res.conflict) {
         const mine = { acquired_at: acquiredAt, member: ctx.identity.member };
         const theirs = { acquired_at: res.conflict.acquired_at, member: res.conflict.member_id || res.conflict.member };
@@ -480,6 +697,7 @@ async function cmdClaim(args) {
         subject: raw, subject_key: key, ttl,
         acquired_at: Number(claim.acquired_at) || acquiredAt, files,
       });
+      writeShard(ctx, 'claim', { subject: raw, subject_key: key, ttl, files });
       out('claimed "' + key + '"' + (res.renewed ? ' (renewed)' : '') + ' ttl=' + ttl + 's');
     } catch (e) { reportFailure(ctx, e, 'claim'); out('claim not sent (transport unavailable)'); }
     return;
@@ -488,9 +706,11 @@ async function cmdClaim(args) {
   const env = buildEnvelope(ctx, 'task.claim', {
     subject: raw, subject_key: key, ttl, acquired_at: acquiredAt,
     files: files && files.length ? files : undefined,
+    renew: isRenewal ? true : undefined,
   });
   ctx.state.addOwnClaim({ subject: raw, subject_key: key, ttl, acquired_at: acquiredAt, files });
   const res = await send(ctx, env);
+  writeShard(ctx, 'claim', { subject: raw, subject_key: key, ttl, files });
   out('claimed "' + key + '" ttl=' + ttl + 's' + (res.queued ? ' (queued - transport offline)' : '') +
     (ctx.adapter && !ctx.adapter.capabilities().server_claims ? ' [advisory]' : ''));
 }
@@ -511,6 +731,7 @@ async function cmdRelease(args) {
     try {
       await ctx.adapter.release({ subject: raw });
       ctx.state.removeOwnClaim(key);
+      writeShard(ctx, 'release', { subject: raw, subject_key: key, reason });
       out('released "' + key + '"');
     } catch (e) { reportFailure(ctx, e, 'release'); out('release not sent (transport unavailable)'); }
     return;
@@ -518,6 +739,7 @@ async function cmdRelease(args) {
   const env = buildEnvelope(ctx, 'task.release', { subject: raw, subject_key: key, reason });
   ctx.state.removeOwnClaim(key);
   const res = await send(ctx, env);
+  writeShard(ctx, 'release', { subject: raw, subject_key: key, reason });
   out('released "' + key + '"' + (res.queued ? ' (queued)' : ''));
 }
 
@@ -545,7 +767,12 @@ async function cmdDone(args) {
     await send(ctx, rel, { skipDrain: true });
   }
   ctx.state.removeOwnClaim(key);
-  out('done "' + key + '"' + (res.queued ? ' (queued)' : ''));
+  // The durable half. PLAN.md section 6: the shard is written and rides the
+  // next USER-REQUESTED commit - `handshake` never commits anything itself,
+  // because a coordination-only commit is noise in someone else's history.
+  const shard = writeShard(ctx, 'done', { subject: raw, subject_key: key, summary, files });
+  out('done "' + key + '"' + (res.queued ? ' (queued)' : '') +
+    (shard ? '; recorded in ' + path.relative(process.cwd(), shard.file).split(path.sep).join('/') : ''));
 }
 
 // ================================================================== post ====
@@ -610,6 +837,10 @@ async function cmdPost(args) {
 async function cmdSync(args) {
   const found = requireWs(args); if (!found) return;
   const ctx = openWorkspace(found.ws, args);
+  // SECURITY.md 6: the private-repo guard is re-checked on its cached TTL at
+  // EVERY sync. Reading continues either way (PROTOCOL 10.2); what a failed
+  // guard stops is posting.
+  enforceRepoGuard(ctx, { force: Boolean(args.flags['guard-refresh']) });
   if (!ctx.adapter) { err('handshake: no transport configured'); process.exitCode = 1; return; }
   const transport = ctx.cfg.transport;
   const watermark = ctx.state.getWatermark(transport);
@@ -681,6 +912,111 @@ function summarize(e) {
   return '(no text)';
 }
 
+// ================================================================= tasks ====
+
+// The human projection over `.handshake/tasks/*.md`. Assembled on every read
+// and never written back: the shards are the record, this view is a rendering
+// of them (PLAN.md section 2 - "a projection of claims, never a hand-edited
+// master"). Everything shown here has been escaped by lib/escape.js, because a
+// shard is peer-authored data that arrived through git instead of through a
+// transport (SECURITY.md 5.4).
+async function cmdTasks(args) {
+  const detected = repoRoot();
+  if (!detected) {
+    err('handshake: not inside a git working tree - there is no durable layer to project.');
+    process.exitCode = 2; return;
+  }
+  const root = detected.root;
+  if (!repoLayerPresent(root)) {
+    err('handshake: no ' + wsFiles.DIR + '/ in ' + root + ' - run `handshake init` here first.');
+    process.exitCode = 2; return;
+  }
+
+  // The non-member-commit warning (SECURITY.md 5.4). Recorded into local state
+  // as well as printed, so the digest can surface the flag without re-running
+  // git on every injection.
+  let warnings = null;
+  const found = resolveWs(args);
+  let state = null;
+  if (found) {
+    state = stateLib.openState(found.ws);
+    warnings = wsFiles.checkShardAuthors(root, { knownEmails: wsFiles.knownMemberEmails(state) });
+    wsFiles.recordShardWarnings(state, warnings);
+  }
+
+  const limit = args.flags.limit !== undefined ? Number(args.flags.limit) : undefined;
+  const view = wsFiles.projectTasks(root, { warnings, limit: Number.isInteger(limit) ? limit : undefined });
+  if (args.flags.json) { json(view); return; }
+  out(wsFiles.renderTasks(view));
+}
+
+// ================================================================= guard ====
+
+// Run, refresh and report the fail-closed private-repo guard (SECURITY.md 6).
+async function cmdGuard(args) {
+  const detected = repoRoot();
+  const found = resolveWs(args);
+  const state = found ? stateLib.openState(found.ws) : null;
+
+  if (args.flags['ack-rotated']) {
+    if (!state) { err('handshake: not in a workspace, nothing to acknowledge'); process.exitCode = 2; return; }
+    repoLib.acknowledgeRotation(state);
+    out('rotation acknowledged. Nothing about git history changed: a credential that was');
+    out('committed stays in every clone, fork and archive of that commit (SECURITY.md 6).');
+    return;
+  }
+
+  if (!detected) {
+    const report = { repo: false, verdict: 'public', reason: 'not_a_repo', explanation: repoLib.REASONS.not_a_repo };
+    if (args.flags.json) { json(report); return; }
+    out('guard: public (fail-closed) - ' + report.explanation);
+    out('  nothing is committed anywhere, so nothing is at risk; the guard simply has no');
+    out('  affirmative answer, and no answer is treated as public by design.');
+    return;
+  }
+
+  const verdict = repoLib.guard({
+    cwd: detected.root, repo: detected, state,
+    force: args.flags.refresh !== undefined ? Boolean(args.flags.refresh) : true,
+  });
+  const tracked = repoLib.trackedSecrets(detected.root);
+  const applied = state
+    ? repoLib.applyGuard({ state, flags: state.session(sessionId()), transport: (state.read().transport || 'unknown'), verdict, tracked })
+    : { hard_fail: !verdict.private && tracked.any, report: false, message: null, files: tracked.secrets.map((s) => s.file) };
+
+  const report = {
+    repo: true, root: detected.root, slug: verdict.slug, remote: detected.remote,
+    verdict: verdict.verdict, private: verdict.private, reason: verdict.reason,
+    explanation: verdict.explanation, checked_at: verdict.checked_at, source: verdict.source,
+    ttl_ms: repoLib.GUARD_TTL_MS, flip: verdict.flip, previous: verdict.previous,
+    tracked_files: tracked.tracked, tracked_secrets: tracked.secrets,
+    hard_fail: applied.hard_fail,
+    rotation_demanded: state ? repoLib.rotationDemanded(state) : applied.hard_fail,
+    may_commit_secrets: verdict.private === true,
+  };
+  if (args.flags.json) { json(report); return; }
+
+  out('guard: ' + verdict.verdict.toUpperCase() + '  (' + verdict.explanation + ')');
+  out('  repo:            ' + (verdict.slug || detected.remote || detected.root));
+  out('  checked:         ' + new Date(verdict.checked_at).toISOString() + '  [' + verdict.source + ', TTL ' + (repoLib.GUARD_TTL_MS / 1000) + 's]');
+  out('  may commit the guarded part: ' + (verdict.private ? 'YES' : 'NO'));
+  if (verdict.flip) out('  VISIBILITY FLIP: this repo was previously verified private and is not now.');
+  out('  tracked under .handshake/: ' + (tracked.tracked.length ? tracked.tracked.join(', ') : 'nothing'));
+  if (tracked.any) {
+    out('  KEY MATERIAL TRACKED: ' + tracked.secrets.map((s) => s.file + ' (' + s.id + ')').join(', '));
+  }
+  if (report.hard_fail) {
+    out('');
+    out('  HARD FAIL: key material is tracked in a repo the guard cannot prove is private.');
+    out('  Posting is stopped for this session. Rotate the workspace secret, then run');
+    out('  `handshake guard --ack-rotated`. Rotation stops FUTURE use; it does not un-leak');
+    out('  the commit, which lives on in every clone, fork and archive (SECURITY.md 6).');
+    process.exitCode = 1;
+  } else if (!verdict.private) {
+    out('  the guarded part stays gitignored and is distributed out of band.');
+  }
+}
+
 // ================================================================ cursor ====
 
 async function cmdCursor(args) {
@@ -724,6 +1060,13 @@ async function cmdStatus(args) {
   const child = sessionLib.detectChildMode({ monitorSentinel: path.join(ctx.state.dir, 'monitor.alive') });
   const monitors = sessionLib.monitorAlive(path.join(ctx.state.dir, 'monitor.alive'));
 
+  // The guard state comes from the CACHE here, never from a fresh probe:
+  // `status` must stay fast and must not burn a GitHub API call per keystroke.
+  // A cached affirmative older than the 600 s TTL is reported as a stale
+  // affirmative, which is NOT an affirmative (SECURITY.md 6).
+  const repoState = ctx.state.repoStatus();
+  const cachedGuard = repoLib.cachedVerdict(ctx.state);
+
   const credentialState = ctx.cfg.transport === 'relay'
     ? (ctx.cfg.member_token ? (stopped ? 'rejected (' + stopped.code + ')' : 'present') : 'missing - not joined')
     : (ctx.cfg.topic ? (stopped ? 'rejected (' + stopped.code + ')' : 'present (topic is a bearer credential)') : 'missing');
@@ -758,6 +1101,18 @@ async function cmdStatus(args) {
     own_claims: ctx.state.getOwnClaims().length,
     child_mode: child,
     monitors: monitors ? 'running' : 'unavailable',
+    repo: {
+      guard: cachedGuard ? {
+        verdict: cachedGuard.verdict, reason: cachedGuard.reason, explanation: cachedGuard.explanation,
+        checked_at: cachedGuard.checked_at, age_ms: cachedGuard.age_ms, stale: cachedGuard.stale,
+        slug: cachedGuard.slug, may_commit_secrets: cachedGuard.private === true,
+        ttl_ms: repoLib.GUARD_TTL_MS, source: 'cache',
+      } : null,
+      rotation_demanded: repoState.rotation_demanded,
+      last_hard_fail: (repoState.guard && repoState.guard.last_hard_fail) || null,
+      shard_warning: (repoState.warnings && repoState.warnings.flag) || null,
+      non_member_commits: (repoState.warnings && repoState.warnings.non_member_commits) || [],
+    },
   };
 
   if (args.flags.json) { json(report); return; }
@@ -780,6 +1135,25 @@ async function cmdStatus(args) {
   const suppressed = Object.entries(counts).filter(([k]) => k.startsWith('loud_') || k === 'silent_offline');
   if (suppressed.length) out('suppressed this session: ' + suppressed.map(([k, v]) => k + '=' + v).join(', '));
   out('queue: ' + ctx.queue.size() + ' pending envelope(s); own claims: ' + report.own_claims);
+  // SECURITY.md 6 / PROTOCOL 10.2: the guard's state is part of an honest
+  // status. "not checked" is printed as not checked, never as safe.
+  if (cachedGuard) {
+    out('repo guard: ' + cachedGuard.verdict + ' - ' + cachedGuard.explanation +
+      '  [cached ' + Math.round(cachedGuard.age_ms / 1000) + 's ago' + (cachedGuard.stale ? ', STALE' : '') + ']');
+    out('  secrets may be committed: ' + (cachedGuard.private ? 'yes' : 'NO - the guarded part stays out of the repo'));
+  } else {
+    out('repo guard: not checked yet - run `handshake guard` (until then, treat this repo as public)');
+  }
+  if (report.repo.rotation_demanded) {
+    out('  ROTATION DEMANDED: key material was tracked in a repo the guard could not prove');
+    out('  private. Rotate, then `handshake guard --ack-rotated`. History is not un-leaked.');
+  }
+  if (report.repo.shard_warning === 'non_member_commit') {
+    out('  WARNING: a task shard was last modified by a non-member commit (' +
+      report.repo.non_member_commits.map((c) => c.file).join(', ') + ') - treat it as unattributed');
+  } else if (report.repo.shard_warning === 'unverified_shard_authors') {
+    out('  note: shard authorship is unverified for some members - unknown, not clean');
+  }
   if (report.local_switches.muted) out('MUTED (local): peer chatter is not injected. Outbound posting is unaffected.');
   if (report.local_switches.resting) out('RESTING: broadcasting stopped this session; listening continues; claims left to expire on TTL.');
   // section 8: a host without monitors MUST say so.
@@ -845,14 +1219,17 @@ async function cmdLeave(args) {
   if (mine.length) body.open_claims = mine;
   const env = buildEnvelope(ctx, 'ws.leave', body);
   const res = await send(ctx, env);
-  // The parting note MUST also be written to the local task shard so the
-  // record exists in both the live and durable layers (PROTOCOL 3.2). The repo
-  // half of that shard is M8's; the local half is written here.
+  // The parting note MUST also be written to the task shard so the record
+  // exists in both the live and durable layers (PROTOCOL 3.2): a closed Claude
+  // always leaves its record in both, so a peer who was offline for the whole
+  // session still finds out what happened by pulling.
   ctx.state.update((s) => {
     s.last_leave = { reason, summary: summary || null, open_claims: mine, at: Date.now() };
     return s;
   });
-  out('signed off (' + reason + ')' + (res.queued ? ' - parting note queued, kept up to 24 h' : ''));
+  const shard = writeShard(ctx, 'parting', { reason, summary, open_claims: mine });
+  out('signed off (' + reason + ')' + (res.queued ? ' - parting note queued, kept up to 24 h' : '') +
+    (shard ? '; parting record in ' + path.relative(process.cwd(), shard.file).split(path.sep).join('/') : ''));
 }
 
 // ================================================================ doctor ====
@@ -905,6 +1282,94 @@ async function cmdDoctor(args) {
       cfg.transport === 'relay' ? (cfg.member_token ? 'member sub-token present (local only, never the repo)' : 'no member sub-token - run join')
         : (cfg.topic ? 'topic present (bearer credential, same guard as the secret)' : 'no topic - run init'));
     add('offline queue', 'pass', state.queue({ transport: cfg.transport, endpoint: cfg.endpoint, topic: cfg.topic || '', token: cfg.member_token || '' }).size() + ' pending');
+  }
+
+  // ------------------------------------------------ SECURITY.md 6 checks --
+  const detected = repoRoot();
+  if (!detected) {
+    add('git working tree', 'warn', 'not inside a git working tree - no durable layer, and the guard is moot');
+  } else {
+    add('git working tree', 'pass', detected.root + (detected.slug ? '  [' + detected.slug + ']' : '  (no github remote)'));
+
+    const verdict = repoLib.guard({
+      cwd: detected.root, repo: detected, state: found ? state : null,
+      force: Boolean(args.flags['guard-refresh']),
+    });
+    add('private-repo guard', verdict.private ? 'pass' : 'warn',
+      verdict.verdict + ' - ' + verdict.explanation +
+      ' [' + verdict.source + ', TTL ' + (repoLib.GUARD_TTL_MS / 1000) + 's]' +
+      (verdict.private ? '; the guarded part may be committed' : '; the guarded part must stay out of the repo') +
+      (verdict.flip ? '; VISIBILITY FLIP since the last affirmative' : ''));
+
+    const tracked = repoLib.trackedSecrets(detected.root);
+    if (!tracked.ok) {
+      add('public repo + tracked secret', 'warn', 'could not ask git what is tracked (' + tracked.reason + ') - unknown, not clean');
+    } else if (!tracked.any) {
+      add('public repo + tracked secret', 'pass', 'no workspace key material is tracked under ' + wsFiles.DIR + '/');
+    } else if (verdict.private) {
+      add('public repo + tracked secret', 'warn',
+        'key material IS tracked (' + tracked.secrets.map((s) => s.file).join(', ') +
+        ') in a repo verified private - permitted, and it means every reader of this repo holds it (SECURITY.md 3.1)');
+    } else {
+      add('public repo + tracked secret', 'fail',
+        'key material is tracked (' + tracked.secrets.map((s) => s.file + ':' + s.id).join(', ') +
+        ') in a repo the guard could NOT prove private - rotate the workspace secret now');
+    }
+
+    const hist = repoLib.tokenInHistory(detected.root, { runner: undefined });
+    if (!hist.ok) {
+      add('token in git history', 'warn', 'the history scan did not complete (' + hist.reason + ') - unknown, which is not the same as clean');
+    } else if (!hist.hits.length) {
+      add('token in git history', 'pass', 'no hsk_/hsr_/hsi1_ value appears in any reachable commit (bounded scan: ' +
+        repoLib.HISTORY_MAX_COUNT + ' commits per pattern)');
+    } else {
+      add('token in git history', 'fail',
+        hist.hits.length + ' commit(s) touch a credential-shaped value: ' +
+        hist.hits.slice(0, 3).map((h) => h.sha + ' (' + h.needle + ')').join(', ') +
+        ' - rotate; rewriting history does not reach clones that already exist (SECURITY.md 6)');
+    }
+
+    if (repoLayerPresent(detected.root)) {
+      const guardedFile = wsFiles.readGuardedPart(detected.root);
+      const ign = wsFiles.paths(detected.root).gitignore;
+      let ignText = '';
+      try { ignText = fs.readFileSync(ign, 'utf8'); } catch (_) { ignText = ''; }
+      const ignoresSecret = ignText.split('\n').some((l) => l.trim() === wsFiles.SECRET_FILE);
+      if (!guardedFile) add('guarded part', 'warn', 'no ' + wsFiles.DIR + '/' + wsFiles.SECRET_FILE + ' here');
+      else if (verdict.private) add('guarded part', 'pass', 'present; guard affirms private' + (ignoresSecret ? ' but it is still gitignored - peers will not receive it' : ''));
+      else add('guarded part', ignoresSecret ? 'pass' : 'fail',
+        ignoresSecret ? 'present and gitignored, distributed out of band (fail-closed as designed)'
+          : 'present and NOT gitignored in a repo the guard could not prove private');
+
+      const shardCheck = found
+        ? wsFiles.checkShardAuthors(detected.root, { knownEmails: wsFiles.knownMemberEmails(state) })
+        : null;
+      if (shardCheck) {
+        const verified = shardCheck.results.filter((r) => r.status === 'ok').length;
+        const uncommitted = shardCheck.results.filter((r) => r.status === 'uncommitted').length;
+        const tally = shardCheck.results.length + ' shard(s): ' + verified + ' verified, ' +
+          uncommitted + ' not committed yet, ' + shardCheck.unknown.length + ' unverifiable';
+        if (shardCheck.mismatches.length) {
+          add('task shard authors', 'fail', shardCheck.mismatches.map((m) => m.file + ' last committed by ' + m.email).join('; ') +
+            ' - non-member commit (SECURITY.md 5.4). ' + tally);
+        } else if (shardCheck.unknown.length) {
+          add('task shard authors', 'warn', tally + ' - an unverifiable author is UNKNOWN, not verified-clean');
+        } else if (!shardCheck.results.length) {
+          add('task shard authors', 'pass', 'no shards yet');
+        } else {
+          add('task shard authors', 'pass', tally);
+        }
+      }
+    }
+
+    const block = wsFiles.readClaudeMdBlock(detected.root);
+    add('CLAUDE.md block', 'pass', block.present
+      ? (block.current ? 'present and current' : 'present but out of date - re-run with --claude-md to refresh it')
+      : 'absent (never written without --claude-md; that is the default, not a defect)');
+  }
+
+  if (found && repoLib.rotationDemanded(state)) {
+    add('rotation demanded', 'fail', 'the guard hard-failed earlier and the rotation has not been acknowledged - rotate, then `handshake guard --ack-rotated`');
   }
 
   const child = sessionLib.detectChildMode({ monitorSentinel: found ? path.join(state.dir, 'monitor.alive') : null });
@@ -1096,6 +1561,7 @@ async function cmdRest(args) {
   try { fs.writeFileSync(sentinel, JSON.stringify({ session: sessionId(), at: Date.now() }) + '\n', { mode: 0o600 }); }
   catch (e) { err('handshake: could not write the disarm sentinel (' + e.message + ')'); }
 
+  writeShard(ctx, 'parting', { reason: 'rest', summary, open_claims: mine });
   ctx.flags.stopPosting(ctx.cfg.transport, 'rest');
   ctx.state.update((s) => { s.rest = { session: sessionId(), at: Date.now(), open_claims: mine }; return s; });
 
@@ -1238,7 +1704,7 @@ const COMMANDS = {
   init: cmdInit, invite: cmdInvite, join: cmdJoin,
   claim: cmdClaim, release: cmdRelease, done: cmdDone, change: cmdChange,
   post: cmdPost, note: cmdNote, warn: cmdWarn, presence: cmdPresence,
-  sync: cmdSync, cursor: cmdCursor, status: cmdStatus,
+  sync: cmdSync, cursor: cmdCursor, status: cmdStatus, tasks: cmdTasks, guard: cmdGuard,
   rotate: cmdRotate, leave: cmdLeave, doctor: cmdDoctor,
   mute: cmdMute, unmute: cmdUnmute, rest: cmdRest, upgrade: cmdUpgrade,
 };
@@ -1246,9 +1712,9 @@ const COMMANDS = {
 const USAGE = [
   'handshake <command> [options]',
   '',
-  '  init      [--relay <origin> | --ntfy <base-url>] [--name <name>]',
+  '  init      [--relay <origin> | --ntfy <base-url>] [--name <name>] [--no-repo] [--claude-md]',
   '  invite    [--inline | --repo] [--json]',
-  '  join      <hsi1_...> [--as <member name>]',
+  '  join      <hsi1_...> [--as <member name>] [--claude-md]',
   '  claim     "<subject>" [--ttl <seconds>] [--files a,b]',
   '  change    "<subject>" --change files|ttl|tiebreak_loss|scope [--files a,b] [--note "..."]',
   '  release   "<subject>" [--reason done|superseded|tiebreak_loss|manual|expired]',
@@ -1257,9 +1723,11 @@ const USAGE = [
   '  warn      overlap --subject "..." --peer <member> --peer-subject "..." [--jaccard 50-100]',
   '  presence  working|waiting|blocked|tooling_broken [--note "..."] [--branch <b>] [--agents <n>]',
   '  post      <note.*|warn.overlap|task.change> --text "..." [--paths a,b]',
-  '  sync      [--limit <n>] [--json] [--inject-digest]',
+  '  sync      [--limit <n>] [--json] [--inject-digest] [--guard-refresh]',
   '  cursor    [--commit]',
   '  status    [--json]',
+  '  tasks     [--json] [--limit <n>]   projection over .handshake/tasks/ (never a master file)',
+  '  guard     [--refresh] [--json] [--ack-rotated]   the fail-closed private-repo guard',
   '  rotate    [--grace <seconds>]',
   '  leave     [--reason signoff|session_end|error] [--summary "..."]',
   '  mute      [on|off]        stop injecting peer chatter (LOCAL only)',

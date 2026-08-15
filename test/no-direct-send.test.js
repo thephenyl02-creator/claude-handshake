@@ -52,8 +52,14 @@ test('every publish path gates before it hands anything to a transport', () => {
 
   // The relay's server-state endpoints carry authored fields too (presence
   // notes, branches, claim subjects, file lists) and gate them directly.
-  for (const method of ['async heartbeat(presence)', 'async claim({ subject: subj, ttl, files })', 'async release({ subject: subj })']) {
-    const body = relay.slice(relay.indexOf(method));
+  // Matched by method NAME, not by full signature: a signature grows an
+  // argument now and then (relay v0.1.2 added acquired_at to claim), and a
+  // brittle match here would silently stop checking the gate instead of
+  // failing loudly.
+  for (const method of ['async heartbeat(', 'async claim(', 'async release(']) {
+    const at = relay.indexOf(method);
+    assert.notEqual(at, -1, 'the relay adapter must still define ' + method);
+    const body = relay.slice(at);
     const end = body.indexOf('\n  }');
     assert.match(body.slice(0, end), /sendGate\(/, method + ' must gate its authored fields');
   }

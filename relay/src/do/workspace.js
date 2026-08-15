@@ -476,6 +476,22 @@ export class WorkspaceDO extends DurableObject {
     const files = this.#normalizeFiles(body.files);
     if (files === null) return err(400, 'claim_files_invalid');
 
+    // OPTIONAL acquired_at (PROTOCOL Appendix B A7, section 9.4 step 3): the
+    // tiebreak input (section 5.4) survives a client re-creating its OWN claim
+    // — after a transport migration, or after a restart that re-adopts a lease
+    // the relay had already expired. Without it, every migrated claim would be
+    // reborn as the youngest and migration would silently reorder the tiebreak.
+    //
+    // Clamped rather than refused: a client whose clock runs ahead of the
+    // relay's would otherwise store acquired_at > renewed_at and hand itself a
+    // claim that loses every tiebreak. Backdating is bounded by where it is
+    // honored, not by its value — see the insert branch below.
+    let acquiredAt = now;
+    if (body.acquired_at !== undefined) {
+      if (!Number.isInteger(body.acquired_at)) return err(400, 'claim_acquired_at_invalid');
+      acquiredAt = Math.min(body.acquired_at, now);
+    }
+
     this.#expireClaims(now);
     const existing = this.sql.exec('SELECT * FROM claims WHERE subject_key = ?', key).toArray()[0];
     if (existing && existing.owner !== member.member_id) {
@@ -486,6 +502,10 @@ export class WorkspaceDO extends DurableObject {
       return err(409, 'claim_conflict', { claim: live });
     }
     if (existing) {
+      // A renewal never rewrites acquired_at — not from the stored row, and not
+      // from the request: the column is absent from this UPDATE on purpose. The
+      // value is what the lease has been held since, so a member that renews
+      // hourly must not be able to walk its own claim's age forward or back.
       const merged = this.#mergeFiles(JSON.parse(existing.files), files);
       this.sql.exec(
         'UPDATE claims SET subject = ?, renewed_at = ?, ttl = ?, files = ? WHERE subject_key = ?',
@@ -501,12 +521,18 @@ export class WorkspaceDO extends DurableObject {
       // this cap one member's sub-token can fill the object with live rows.
       const held = this.sql.exec('SELECT COUNT(*) AS n FROM claims').toArray()[0].n;
       if (held >= cfg(this.env, 'MAX_CLAIMS')) return err(409, 'workspace_claims_full');
+      // The only place a caller-supplied acquired_at is written. A live claim
+      // belonging to anyone else has already returned 409 above, so backdating
+      // can shape the caller's own row and nothing else — it never edits a
+      // peer's lease and never changes who wins here, which the Durable Object
+      // decides by arrival order (section 5.4). renewed_at stays `now`: a
+      // migrated claim is old for the tiebreak but freshly live for its TTL.
       this.sql.exec(
         'INSERT INTO claims (subject_key, subject, owner, acquired_at, renewed_at, ttl, files) VALUES (?, ?, ?, ?, ?, ?, ?)',
         key,
         subject,
         member.member_id,
-        now,
+        acquiredAt,
         now,
         ttl,
         JSON.stringify(files)

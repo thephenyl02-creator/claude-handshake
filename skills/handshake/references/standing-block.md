@@ -118,12 +118,12 @@ caps (SECURITY §5.3). A `<` or `>` surviving into a slot is a receive-path bug.
 
 ## Rendered examples (measured)
 
-**Full — 2 peers, 2 claims, digest with overflow: 561 chars / 571 bytes**
+**Full — 2 peers, 2 claims, digest with overflow: 562 chars / 572 bytes**
 
 ```
 <handshake ws:acme-api tier:relay>
 peers: alex working "onboarding flow" (live) · sam waiting (quiet 14m)
-claims: onboarding flow — alex 1h left · api rate limiting — you
+claims: onboarding flow — alex, 1h left · api rate limiting — you
 new 2: [blocker · sam] staging migration lock stuck, nobody can migrate
        [discovery · alex] POST /signup returns 202 now, not 200
        +3 more — /handshake status
