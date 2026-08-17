@@ -186,7 +186,8 @@ carrying your live claims across. Full details and the free-tier limits:
 `rotate` is also routed (`/handshake rotate`) but is an offboarding action that
 needs the recovery key — never run it on your own initiative. Full verb
 reference and confirmation rules: [commands/handshake.md](commands/handshake.md);
-decision tree and worked examples: [skills/handshake/SKILL.md](skills/handshake/SKILL.md).
+decision tree and worked examples:
+[skills/handshake-coordination/SKILL.md](skills/handshake-coordination/SKILL.md).
 
 ## Requirements
 
@@ -220,7 +221,7 @@ Nothing here is injected silently beyond that block — the fetch cap (20
 messages/sync) and the inject cap (5 items) are deliberately different
 numbers so a busy sync never balloons what lands in context. Full template,
 truncation order, and rendered examples:
-[skills/handshake/references/standing-block.md](skills/handshake/references/standing-block.md).
+[skills/handshake-coordination/references/standing-block.md](skills/handshake-coordination/references/standing-block.md).
 
 ## Troubleshooting
 

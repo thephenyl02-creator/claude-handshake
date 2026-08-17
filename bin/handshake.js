@@ -355,6 +355,17 @@ function refuseIfChild(command) {
 
 // ================================================================== init ====
 
+// A member name for the founder, derived rather than prompted: `init` must
+// work unattended (deploy-relay calls the same path). Charset matches the join
+// rule (printable ASCII, 1-64) - PROTOCOL section 1 keeps ids ASCII because
+// they land in peers' model context.
+function defaultMemberName() {
+  let base = '';
+  try { base = String(require('os').userInfo().username || '').trim(); } catch (_) { base = ''; }
+  base = base.replace(/[^\x20-\x7e]/g, '').replace(/\s+/g, '-').slice(0, 48);
+  return base || 'founder';
+}
+
 async function cmdInit(args) {
   const name = typeof args.flags.name === 'string' ? args.flags.name : path.basename(process.cwd());
   const relayOrigin = typeof args.flags.relay === 'string' ? args.flags.relay : null;
@@ -386,6 +397,31 @@ async function cmdInit(args) {
     topic = ntfy.newTopic();
   }
 
+  // The founder is a MEMBER of the workspace they just created. Without this
+  // `init` leaves `member: (not joined)` and the very next thing the quickstart
+  // tells them to do - claim, note, presence - dies with "from.member is
+  // required - join the workspace first". Nobody should have to join their own
+  // workspace with their own invite.
+  const founderName = typeof args.flags.as === 'string' && args.flags.as.trim()
+    ? args.flags.as.trim()
+    : defaultMemberName();
+  let founderMember = founderName;
+  let founderToken = null;
+  if (transport === 'relay') {
+    try {
+      const joined = await relay.joinWorkspace({
+        origin: endpoint, ws, enrollmentToken, member: founderName,
+      });
+      founderMember = joined.member_id || founderName;
+      founderToken = joined.token;
+    } catch (e) {
+      // Not fatal: the workspace exists and the invite still works. Say so
+      // plainly rather than leaving a half-state the user cannot diagnose.
+      err('handshake: workspace created, but enrolling you as a member failed (' +
+        (e && e.code ? e.code : 'unknown') + '). Run `handshake join <invite>` to finish.');
+    }
+  }
+
   const state = stateLib.openState(ws);
   state.ensure();
   state.update((s) => {
@@ -395,6 +431,9 @@ async function cmdInit(args) {
     if (topic) s.topic = topic;
     if (enrollmentToken) s.enrollment_token = enrollmentToken;
     if (recoveryKey) s.recovery_key = recoveryKey;
+    s.member = founderMember; s.member_name = founderName;
+    if (founderToken) s.member_token = founderToken;
+    s.joined_at = Date.now();
     s.created_at = Date.now();
     s.project_dir = process.cwd();
     return s;
@@ -735,6 +774,9 @@ async function cmdClaim(args) {
   });
   ctx.state.addOwnClaim({ subject: raw, subject_key: key, ttl, acquired_at: acquiredAt, files });
   const res = await send(ctx, env);
+  // Only when the claim actually went out: beating into a transport that just
+  // failed doubles the wait for no gain (the queue carries both anyway).
+  if (!res.queued) await refreshAdvisoryPresence(ctx);
   writeShard(ctx, 'claim', { subject: raw, subject_key: key, ttl, files });
   out('claimed "' + key + '" ttl=' + ttl + 's' + (res.queued ? ' (queued - transport offline)' : '') +
     (ctx.adapter && !ctx.adapter.capabilities().server_claims ? ' [advisory]' : ''));
@@ -764,6 +806,7 @@ async function cmdRelease(args) {
   const env = buildEnvelope(ctx, 'task.release', { subject: raw, subject_key: key, reason });
   ctx.state.removeOwnClaim(key);
   const res = await send(ctx, env);
+  if (!res.queued) await refreshAdvisoryPresence(ctx);   // clears for peers now too
   writeShard(ctx, 'release', { subject: raw, subject_key: key, reason });
   out('released "' + key + '"' + (res.queued ? ' (queued)' : ''));
 }
@@ -1280,6 +1323,10 @@ async function cmdDoctor(args) {
   // not-loaded plugin is a silently inert one. v0.1.0 shipped exactly that
   // bug; this check is what makes the class impossible to ship blind again.
   try {
+    // Shelling out to the host CLI is slow (measured 2.2-18.4s) and depends on
+    // the machine, so it is opt-out: tests and other automated callers set
+    // HANDSHAKE_SKIP_HOST_CHECKS=1 rather than paying it on every run.
+    if (process.env.HANDSHAKE_SKIP_HOST_CHECKS === '1') throw new Error('skipped by HANDSHAKE_SKIP_HOST_CHECKS');
     const r = require('child_process').spawnSync(
       process.platform === 'win32' ? 'cmd.exe' : 'claude',
       process.platform === 'win32' ? ['/d', '/s', '/c', 'claude', 'plugin', 'list'] : ['plugin', 'list'],
@@ -1518,6 +1565,20 @@ async function cmdChange(args) {
 // ============================================================== presence ====
 
 // Trim to fit the 2048-byte body cap, oldest-renewed_at first (section 3.2).
+// PROTOCOL section 8: on ntfy presence publishes "on state change + a 600s
+// keepalive", and a claim IS a state change. Without this a peer does not see
+// a new claim until the next keepalive - up to 10 minutes during which the
+// PreToolUse gate has nothing to warn about. (The task.claim envelope does
+// reach them, but the claim VIEW is rebuilt from presence, section 9.3
+// resurrection.) Relay needs none of this: claims are server state there.
+async function refreshAdvisoryPresence(ctx) {
+  try {
+    if (!ctx.cfg || ctx.cfg.transport !== 'ntfy') return;
+    const body = presenceBodyFor(ctx, { state: 'working' }, ctx.state.getOwnClaims());
+    await send(ctx, buildEnvelope(ctx, 'presence.update', body));
+  } catch (_) { /* best-effort: never fail the claim because the beat failed */ }
+}
+
 function presenceBodyFor(ctx, base, ownClaims) {
   const claims = ownClaims.map((c) => ({
     subject: String(c.subject).slice(0, 120), subject_key: c.subject_key,

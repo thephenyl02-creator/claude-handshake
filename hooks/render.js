@@ -1,7 +1,7 @@
 'use strict';
 // claude-handshake M6: the standing-block renderer.
 //
-// Normative: skills/handshake/references/standing-block.md (the EXACT template
+// Normative: skills/handshake-coordination/references/standing-block.md (the EXACT template
 // and its measured examples), PROTOCOL section 6.2 (inject cap 5 items, ~600
 // char standing block, `+N more` overflow) and section 10.2 (a trimmed list
 // without its overflow marker is a lie).

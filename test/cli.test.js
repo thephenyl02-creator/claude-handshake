@@ -35,6 +35,9 @@ function run(box, args, opts) {
       CLAUDE_PLUGIN_DATA: box.data,
       HANDSHAKE_SESSION_ID: o.session || 'test-session',
       CLAUDE_CODE_CHILD_SESSION: o.child || '',
+      // doctor otherwise shells out to `claude plugin list` (2-18s, and it
+      // depends on the host being installed) - a unit test must not.
+      HANDSHAKE_SKIP_HOST_CHECKS: '1',
     }),
   });
   return { code: r.status, out: r.stdout || '', err: r.stderr || '' };

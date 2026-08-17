@@ -1,5 +1,5 @@
 ---
-name: handshake
+name: handshake-coordination
 description: >-
   Coordinate with other people's Claude Code instances working the same project.
   Use whenever the repo has a `.handshake/` workspace and the standing
@@ -13,7 +13,12 @@ description: >-
   and the parting summary at sign-off.
 ---
 
-# handshake — the coordination brain
+# handshake-coordination — the coordination brain
+
+Invoked as the `handshake-coordination` skill. The user-typed command stays
+`/handshake` (`commands/handshake.md`) — the two must not share a name, because
+Claude Code registers commands and skills into ONE namespace keyed by the file
+or directory name.
 
 Separate Claude Code instances, different users, different accounts, different
 machines, one project. **The user manages the project; you manage coordination.**

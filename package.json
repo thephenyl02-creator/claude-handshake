@@ -1,6 +1,6 @@
 {
   "name": "claude-handshake",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Peer collaboration for Claude Code — separate Claude instances, different users and machines, working one project as a team. In active development; see PLAN.md.",
   "repository": {
     "type": "git",

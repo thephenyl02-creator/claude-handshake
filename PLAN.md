@@ -200,7 +200,7 @@ loud user-visible state, not silent degradation.
 
 ```
 .claude-plugin/plugin.json + marketplace.json     # claude-tier release pattern
-skills/handshake/SKILL.md          # on-demand brain (overlap tree, examples)
+skills/handshake-coordination/SKILL.md  # on-demand brain (overlap tree, examples)
 hooks/  commands/  monitors/monitors.json
 bin/handshake.js  lib/*.js         # CLI via plugin bin/ (PATH-injected)
 relay/ (worker + wrangler.toml [new_sqlite_classes!] + DO tests)

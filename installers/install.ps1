@@ -618,10 +618,13 @@ if ($HandshakeExtraArgs.Count -gt 0) {
             # A previous run may have used the fallback; the plugin copy
             # supersedes it. The fallback route writes THREE things, so all
             # three have to be superseded together:
-            #   1. $FallbackRoot\<version>\            (carries $Marker)
-            #   2. $ClaudeDir\skills\handshake\        (carries $Marker)
+            #   1. $FallbackRoot\<version>\                    (carries $Marker)
+            #   2. $ClaudeDir\skills\handshake-coordination\   (carries $Marker)
             #   3. $ClaudeDir\commands\handshake.md    (a single file - no
             #      marker is possible, so identity is proven by content)
+            # Releases up to v0.1.2 wrote (2) as $ClaudeDir\skills\handshake\
+            # instead; that legacy path is superseded by the same rules
+            # (marker or nothing).
             # Removing only (1) left (2) and (3) behind pointing at the very
             # directory this run had just deleted, and made /handshake and the
             # skill load twice - once from the orphans, once from the plugin.
@@ -634,15 +637,17 @@ if ($HandshakeExtraArgs.Count -gt 0) {
                 $markedFallbacks = @(Get-ChildItem -Path $FallbackRoot -Directory -ErrorAction SilentlyContinue |
                     Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName $Marker) })
             }
-            $userSkill = Join-Path $ClaudeDir 'skills\handshake'
+            $userSkill = Join-Path $ClaudeDir 'skills\handshake-coordination'
+            $userSkillLegacy = Join-Path $ClaudeDir 'skills\handshake'
             $userCmd = Join-Path $ClaudeDir 'commands\handshake.md'
             $userSkillIsOurs = Test-Path -LiteralPath (Join-Path $userSkill $Marker)
+            $userSkillLegacyIsOurs = Test-Path -LiteralPath (Join-Path $userSkillLegacy $Marker)
             # The gate for touching the SHARED user-level locations at all: is
             # there any evidence THIS installer's fallback route ever ran here?
             # Without it, a machine that only ever used the plugin route would
             # have a hand-written ~\.claude\commands\handshake.md moved aside
             # for no reason.
-            $fallbackTraces = ($markedFallbacks.Count -gt 0) -or $userSkillIsOurs
+            $fallbackTraces = ($markedFallbacks.Count -gt 0) -or $userSkillIsOurs -or $userSkillLegacyIsOurs
             $userBakSupersede = Join-Path $ClaudeDir "handshake-backup.$((Get-Date).ToString('yyyyMMddHHmmss'))"
 
             # (3) command file - compared against the fallback copies BEFORE
@@ -683,18 +688,21 @@ if ($HandshakeExtraArgs.Count -gt 0) {
                 }
             }
 
-            # (2) skill directory - marker or nothing.
-            if (Test-Path -LiteralPath $userSkill) {
-                if ($userSkillIsOurs) {
-                    Remove-Item -Recurse -Force -LiteralPath $userSkill -ErrorAction SilentlyContinue
-                    if (Test-Path -LiteralPath $userSkill) {
-                        Write-Warn2 "Could not remove the superseded $userSkill (a file may be in use by a running Claude Code session)."
+            # (2) skill directories - marker or nothing. Both the current name
+            # and the pre-rename one (releases up to v0.1.2 wrote
+            # skills\handshake) are candidates, under the same ownership rule.
+            foreach ($sk in @($userSkill, $userSkillLegacy)) {
+                if (-not (Test-Path -LiteralPath $sk)) { continue }
+                if (Test-Path -LiteralPath (Join-Path $sk $Marker)) {
+                    Remove-Item -Recurse -Force -LiteralPath $sk -ErrorAction SilentlyContinue
+                    if (Test-Path -LiteralPath $sk) {
+                        Write-Warn2 "Could not remove the superseded $sk (a file may be in use by a running Claude Code session)."
                         Write-Warn2 'Close Claude Code and re-run this installer, or the skill may load twice.'
                     } else {
-                        Write-Ok "Removed the superseded user-level skill $userSkill (the plugin provides it now)"
+                        Write-Ok "Removed the superseded user-level skill $sk (the plugin provides it now)"
                     }
                 } elseif ($fallbackTraces) {
-                    Write-Warn2 "$userSkill was not written by this installer - leaving it untouched."
+                    Write-Warn2 "$sk was not written by this installer - leaving it untouched."
                     Write-Warn2 'It may shadow the plugin''s own handshake skill; remove it yourself if that is not what you want.'
                 }
             }
@@ -847,8 +855,8 @@ if ($HandshakeExtraArgs.Count -gt 0) {
                 # applies: never delete before the replacement exists, never
                 # destroy something we did not write, and keep any backup
                 # OUTSIDE the managed directory (a backup left inside
-                # ~\.claude\skills would load as a second, stale `handshake`
-                # skill).
+                # ~\.claude\skills would load as a second, stale
+                # `handshake-coordination` skill).
                 $cmdDir = Join-Path $ClaudeDir 'commands'
                 $skillDir = Join-Path $ClaudeDir 'skills'
                 $userBak = Join-Path $ClaudeDir "handshake-backup.$((Get-Date).ToString('yyyyMMddHHmmss'))"
@@ -889,9 +897,15 @@ if ($HandshakeExtraArgs.Count -gt 0) {
                     }
                 }
 
-                $srcSkill = Join-Path $dest 'skills\handshake'
+                # The skill directory is `handshake-coordination`, NOT
+                # `handshake`: Claude Code registers commands\*.md and
+                # skills\*\SKILL.md into ONE namespace keyed by the
+                # file/directory name (the SKILL.md frontmatter `name:` is not
+                # what registers), so `commands\handshake.md` +
+                # `skills\handshake\` collided under a single name.
+                $srcSkill = Join-Path $dest 'skills\handshake-coordination'
                 if (Test-Path -LiteralPath $srcSkill) {
-                    $destSkill = Join-Path $skillDir 'handshake'
+                    $destSkill = Join-Path $skillDir 'handshake-coordination'
                     $stageSkill = Join-Path $skillDir ('.handshake-installing.' + $PID)
                     Remove-Item -Recurse -Force -LiteralPath $stageSkill -ErrorAction SilentlyContinue
                     $staged = $false
@@ -912,8 +926,8 @@ if ($HandshakeExtraArgs.Count -gt 0) {
                                 # delete it.
                                 try {
                                     New-Item -ItemType Directory -Path $userBak -Force -ErrorAction Stop | Out-Null
-                                    Move-Item -LiteralPath $destSkill -Destination (Join-Path $userBak 'skills-handshake') -ErrorAction Stop
-                                    Write-Warn2 "Existing $destSkill was not written by this installer - moved it to $userBak\skills-handshake"
+                                    Move-Item -LiteralPath $destSkill -Destination (Join-Path $userBak 'skills-handshake-coordination') -ErrorAction Stop
+                                    Write-Warn2 "Existing $destSkill was not written by this installer - moved it to $userBak\skills-handshake-coordination"
                                 } catch {
                                     Write-Err "Could not move $destSkill aside - leaving it untouched."
                                     $slotFree = $false
@@ -935,6 +949,29 @@ if ($HandshakeExtraArgs.Count -gt 0) {
                         }
                         if ($moved) {
                             Write-Ok "Skill copied: $destSkill"
+                            # Upgrade from the pre-rename layout: releases up to
+                            # v0.1.2 installed this same skill as
+                            # $ClaudeDir\skills\handshake. Left behind it would
+                            # load a second, stale copy AND re-create the very
+                            # name collision this rename fixes. Same ownership
+                            # rule as everywhere else: the marker is the only
+                            # proof, so an unmarked directory at that path is
+                            # somebody else's and is never touched.
+                            $legacySkill = Join-Path $skillDir 'handshake'
+                            if (Test-Path -LiteralPath $legacySkill) {
+                                if (Test-Path -LiteralPath (Join-Path $legacySkill $Marker)) {
+                                    Remove-Item -Recurse -Force -LiteralPath $legacySkill -ErrorAction SilentlyContinue
+                                    if (Test-Path -LiteralPath $legacySkill) {
+                                        Write-Warn2 "Could not remove the pre-rename copy at $legacySkill (a file may be in use by a running Claude Code session)."
+                                        Write-Warn2 'Close Claude Code and re-run this installer, or the skill may load twice.'
+                                    } else {
+                                        Write-Ok "Removed the pre-rename copy of this skill at $legacySkill"
+                                    }
+                                } else {
+                                    Write-Warn2 "$legacySkill exists but was not written by this installer - leaving it untouched."
+                                    Write-Warn2 "It is unrelated to the skill just installed at $destSkill; remove it yourself if it shadows /handshake."
+                                }
+                            }
                         } else {
                             Remove-Item -Recurse -Force -LiteralPath $stageSkill -ErrorAction SilentlyContinue
                             Write-Warn2 "Could not install $destSkill - the on-demand skill will not load."

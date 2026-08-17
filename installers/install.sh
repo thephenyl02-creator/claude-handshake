@@ -618,10 +618,12 @@ elif [ "$NEED_FALLBACK" -eq 0 ]; then
   # A previous run may have used the fallback; the plugin copy supersedes it.
   # The fallback route writes THREE things, so all three have to be superseded
   # together:
-  #   1. $FALLBACK_ROOT/<version>/           (carries $MARKER)
-  #   2. $CLAUDE_DIR/skills/handshake/       (carries $MARKER)
+  #   1. $FALLBACK_ROOT/<version>/                     (carries $MARKER)
+  #   2. $CLAUDE_DIR/skills/handshake-coordination/    (carries $MARKER)
   #   3. $CLAUDE_DIR/commands/handshake.md   (a single file - no marker is
   #      possible, so identity is proven by content)
+  # Releases up to v0.1.2 wrote (2) as $CLAUDE_DIR/skills/handshake/ instead;
+  # that legacy path is superseded by the same rules (marker or nothing).
   # Removing only (1) left (2) and (3) behind pointing at the very directory
   # this run had just deleted, and made /handshake and the skill load twice -
   # once from the orphans, once from the plugin.
@@ -636,10 +638,13 @@ elif [ "$NEED_FALLBACK" -eq 0 ]; then
     MARKED_FALLBACKS="$MARKED_FALLBACKS$FB
 "
   done
-  USER_SKILL="$CLAUDE_DIR/skills/handshake"
+  USER_SKILL="$CLAUDE_DIR/skills/handshake-coordination"
+  USER_SKILL_LEGACY="$CLAUDE_DIR/skills/handshake"
   USER_CMD="$CLAUDE_DIR/commands/handshake.md"
   USER_SKILL_IS_OURS=0
   [ -f "$USER_SKILL/$MARKER" ] && USER_SKILL_IS_OURS=1
+  USER_SKILL_LEGACY_IS_OURS=0
+  [ -f "$USER_SKILL_LEGACY/$MARKER" ] && USER_SKILL_LEGACY_IS_OURS=1
   # The gate for touching the SHARED user-level locations at all: is there any
   # evidence THIS installer's fallback route ever ran here? Without it, a
   # machine that only ever used the plugin route would have a hand-written
@@ -647,6 +652,7 @@ elif [ "$NEED_FALLBACK" -eq 0 ]; then
   FALLBACK_TRACES=0
   [ -n "$MARKED_FALLBACKS" ] && FALLBACK_TRACES=1
   [ "$USER_SKILL_IS_OURS" -eq 1 ] && FALLBACK_TRACES=1
+  [ "$USER_SKILL_LEGACY_IS_OURS" -eq 1 ] && FALLBACK_TRACES=1
   SUPERSEDE_BAK="$CLAUDE_DIR/handshake-backup.$(date +%s)"
 
   # (3) command file - compared against the fallback copies BEFORE they are
@@ -683,20 +689,23 @@ MARKED_FALLBACK_LIST
     fi
   fi
 
-  # (2) skill directory - marker or nothing.
-  if [ -e "$USER_SKILL" ]; then
-    if [ "$USER_SKILL_IS_OURS" -eq 1 ]; then
-      if rm -rf "$USER_SKILL" && [ ! -e "$USER_SKILL" ]; then
-        ok "Removed the superseded user-level skill $USER_SKILL (the plugin provides it now)"
+  # (2) skill directories - marker or nothing. Both the current name and the
+  # pre-rename one (releases up to v0.1.2 wrote skills/handshake) are candidates,
+  # under exactly the same ownership rule.
+  for SK in "$USER_SKILL" "$USER_SKILL_LEGACY"; do
+    [ -e "$SK" ] || continue
+    if [ -f "$SK/$MARKER" ]; then
+      if rm -rf "$SK" && [ ! -e "$SK" ]; then
+        ok "Removed the superseded user-level skill $SK (the plugin provides it now)"
       else
-        warn "Could not remove the superseded $USER_SKILL (a file may be in use)."
+        warn "Could not remove the superseded $SK (a file may be in use)."
         warn "Close Claude Code and re-run this installer, or the skill may load twice."
       fi
     elif [ "$FALLBACK_TRACES" -eq 1 ]; then
-      warn "$USER_SKILL was not written by this installer - leaving it untouched."
+      warn "$SK was not written by this installer - leaving it untouched."
       warn "It may shadow the plugin's own handshake skill; remove it yourself if that is not what you want."
     fi
-  fi
+  done
 
   # (1) fallback copies. Contents first, marker last: if a locked file blocks
   # full removal, the marker survives and a later run can still recognize and
@@ -859,7 +868,8 @@ else
   # owns, so the same rule as the fallback copy applies: never delete before
   # the replacement exists, never destroy something we did not write, and keep
   # any backup OUTSIDE the managed directory (a backup left inside
-  # ~/.claude/skills would load as a second, stale `handshake` skill).
+  # ~/.claude/skills would load as a second, stale `handshake-coordination`
+  # skill).
   USER_BAK="$CLAUDE_DIR/handshake-backup.$(date +%s)"
   mkdir -p "$CLAUDE_DIR/commands" "$CLAUDE_DIR/skills"
 
@@ -884,18 +894,22 @@ else
     fi
   fi
 
-  if [ -d "$DEST/skills/handshake" ]; then
-    USER_SKILL_PATH="$CLAUDE_DIR/skills/handshake"
+  # The skill directory is `handshake-coordination`, NOT `handshake`: Claude Code
+  # registers commands/*.md and skills/*/SKILL.md into ONE namespace keyed by the
+  # file/directory name (the SKILL.md frontmatter `name:` is not what registers),
+  # so `commands/handshake.md` + `skills/handshake/` collided under one name.
+  if [ -d "$DEST/skills/handshake-coordination" ]; then
+    USER_SKILL_PATH="$CLAUDE_DIR/skills/handshake-coordination"
     SKILL_DEST="$USER_SKILL_PATH"
     SKILL_STAGE="$CLAUDE_DIR/skills/.handshake-installing.$$"
     rm -rf "$SKILL_STAGE"
-    if cp -R "$DEST/skills/handshake" "$SKILL_STAGE" && [ -f "$SKILL_STAGE/SKILL.md" ]; then
+    if cp -R "$DEST/skills/handshake-coordination" "$SKILL_STAGE" && [ -f "$SKILL_STAGE/SKILL.md" ]; then
       : > "$SKILL_STAGE/$MARKER" 2>/dev/null || true
       if [ -e "$SKILL_DEST" ] && [ ! -f "$SKILL_DEST/$MARKER" ]; then
         # Not ours (or written by a pre-marker version of this installer):
         # move it aside rather than delete it.
-        if mkdir -p "$USER_BAK" && mv "$SKILL_DEST" "$USER_BAK/skills-handshake"; then
-          warn "Existing $USER_SKILL_PATH was not written by this installer - moved it to $USER_BAK/skills-handshake"
+        if mkdir -p "$USER_BAK" && mv "$SKILL_DEST" "$USER_BAK/skills-handshake-coordination"; then
+          warn "Existing $USER_SKILL_PATH was not written by this installer - moved it to $USER_BAK/skills-handshake-coordination"
         else
           err "Could not move $USER_SKILL_PATH aside - leaving it untouched."
           SKILL_DEST=""
@@ -906,6 +920,26 @@ else
       fi
       if [ -n "$SKILL_DEST" ] && mv "$SKILL_STAGE" "$SKILL_DEST"; then
         ok "Skill copied: $USER_SKILL_PATH"
+        # Upgrade from the pre-rename layout: releases up to v0.1.2 installed
+        # this same skill as $CLAUDE_DIR/skills/handshake/. Left behind it would
+        # load a second, stale copy AND re-create the very name collision this
+        # rename fixes. Same ownership rule as everywhere else: the marker is
+        # the only proof, so an unmarked directory at that path is somebody
+        # else's and is never touched.
+        LEGACY_SKILL="$CLAUDE_DIR/skills/handshake"
+        if [ -e "$LEGACY_SKILL" ]; then
+          if [ -f "$LEGACY_SKILL/$MARKER" ]; then
+            if rm -rf "$LEGACY_SKILL" && [ ! -e "$LEGACY_SKILL" ]; then
+              ok "Removed the pre-rename copy of this skill at $LEGACY_SKILL"
+            else
+              warn "Could not remove the pre-rename copy at $LEGACY_SKILL (a file may be in use)."
+              warn "Close Claude Code and re-run this installer, or the skill may load twice."
+            fi
+          else
+            warn "$LEGACY_SKILL exists but was not written by this installer - leaving it untouched."
+            warn "It is unrelated to the skill just installed at $USER_SKILL_PATH; remove it yourself if it shadows /handshake."
+          fi
+        fi
       else
         rm -rf "$SKILL_STAGE"
         warn "Could not install $USER_SKILL_PATH - the on-demand skill will not load."

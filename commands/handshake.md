@@ -3,8 +3,8 @@ description: Peer coordination — status, workspace setup, claims, and local sw
 argument-hint: "[status | init | join <blob> | invite | claim <subject> | release | done | mute | rest | doctor | deploy-relay | upgrade]"
 ---
 
-Route `$ARGUMENTS` with the table below. Load the `handshake` skill for anything
-beyond running the command — subject authoring, overlap handling, note rules and
+Route `$ARGUMENTS` with the table below. Load the `handshake-coordination` skill
+for anything beyond running the command — subject authoring, overlap handling, note rules and
 status honesty all live there.
 
 **No arguments → `status`.** Unknown first word → print the verb list, run

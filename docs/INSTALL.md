@@ -187,8 +187,9 @@ is downloaded directly from GitHub.
    copied `.md` and `.json` files is rewritten to the copy's own absolute
    path — those placeholders are only ever set by the Claude Code plugin
    host, which this copy is deliberately running outside of.
-4. **`commands/handshake.md` and `skills/handshake/`** are additionally
-   copied to `~/.claude/commands/handshake.md` and `~/.claude/skills/handshake/`.
+4. **`commands/handshake.md` and `skills/handshake-coordination/`** are
+   additionally copied to `~/.claude/commands/handshake.md` and
+   `~/.claude/skills/handshake-coordination/`.
    Claude Code auto-loads both locations without any settings edit (the same
    mechanism claude-tier's skills-dir fallback relies on) — so `/handshake`
    and the on-demand skill work as soon as Claude Code picks them up.
@@ -197,9 +198,20 @@ is downloaded directly from GitHub.
    existing file or directory that the installer did not write (or that
    differs from what is being installed) is moved to
    `~/.claude/handshake-backup.<timestamp>/` first — outside `~/.claude/skills`,
-   so it can never load as a second, stale `handshake` skill. The replacement
-   is staged alongside and renamed into place, so nothing is deleted before
-   its replacement exists.
+   so it can never load as a second, stale `handshake-coordination` skill. The
+   replacement is staged alongside and renamed into place, so nothing is deleted
+   before its replacement exists.
+
+   The skill directory was named `skills/handshake/` up to and including v0.1.2.
+   It had to be renamed because Claude Code registers commands and skills into
+   **one** namespace keyed by the file/directory name, not by the SKILL.md
+   frontmatter `name:` — so `commands/handshake.md` and `skills/handshake/`
+   both registered as `handshake` and the plugin inventory listed the name
+   twice. On a machine that installed the older layout through this route, the
+   installer removes the leftover `~/.claude/skills/handshake/` **only** when it
+   carries the installer's marker file; an unmarked directory at that path is
+   hand-authored and is left alone, with a warning that it may shadow
+   `/handshake`.
 5. **Hooks have no such auto-load directory**, so the installer prints — but
    deliberately does **not** write — the exact `"hooks"` object to merge into
    `~/.claude/settings.json` by hand (paths already resolved to the copy's
@@ -235,20 +247,22 @@ fallback route wrote, not just the versioned directory:
 | Left over from the fallback route | How ownership is proven | What the upgrade does |
 |---|---|---|
 | `~/.claude/handshake-plugin/<version>/` | carries the marker file | contents removed first, marker deleted last, so a locked file (Claude Code still running) leaves the marker intact and a later run can finish the cleanup |
-| `~/.claude/skills/handshake/` | carries the marker file | removed; **without** the marker it is left completely untouched (with a warning that it may shadow the plugin's own skill) |
+| `~/.claude/skills/handshake-coordination/` | carries the marker file | removed; **without** the marker it is left completely untouched (with a warning that it may shadow the plugin's own skill) |
+| `~/.claude/skills/handshake/` (the pre-rename name, ≤ v0.1.2) | carries the marker file | removed; **without** the marker it is left completely untouched (with the same warning) |
 | `~/.claude/commands/handshake.md` | a single file, so no marker is possible — proven by comparing it byte-for-byte against the `commands/handshake.md` of a marked fallback copy, *before* those copies are deleted | identical → removed; differing (hand-edited, or from an older release whose fallback directory is already gone) → moved to `~/.claude/handshake-backup.<timestamp>/commands-handshake.md` first, so nothing is destroyed but it can no longer shadow the plugin's `/handshake` |
 
 None of that runs at all unless there is evidence *this installer's* fallback
 route ran on the machine (a marked fallback copy, or a marked
-`skills/handshake/`). On a machine that only ever used the plugin route, a
-hand-written `~/.claude/commands/handshake.md` is never touched.
+`skills/handshake-coordination/` or `skills/handshake/`). On a machine that only
+ever used the plugin route, a hand-written `~/.claude/commands/handshake.md` is
+never touched.
 
 Skipping the cleanup is also correct in one case and the installer does it: if
 `claude plugin list` reports the plugin as **failed to load**, the fallback copy
 is kept, because deleting it would leave nothing running at all.
 
 Leaving the orphans behind was a real defect (fixed): the upgrade deleted the
-directory while `~/.claude/skills/handshake/SKILL.md` still contained absolute
+directory while the user-level `skills/…/SKILL.md` still contained absolute
 paths into it, and `/handshake` plus the skill then loaded twice — once from
 the orphans, once from the plugin.
 
@@ -402,7 +416,8 @@ points at a directory you have already deleted, every hook event fails with a
    installer resolved `${CLAUDE_PLUGIN_ROOT}` before printing them). Keep the
    rest of the file intact; other tools share it.
 2. `~/.claude/commands/handshake.md`
-3. `~/.claude/skills/handshake/`
+3. `~/.claude/skills/handshake-coordination/` (and `~/.claude/skills/handshake/`
+   if a release at or before v0.1.2 installed the pre-rename name there)
 4. `~/.claude/handshake-plugin/` (every versioned copy)
 5. `~/.claude/handshake/` — the local state described below. Delete this last,
    and only if you also want the workspace identity gone.
@@ -413,8 +428,8 @@ deliberately — it is never auto-deleted:
 - `~/.claude/handshake-plugin-backup.<timestamp>/` — a pre-existing
   `handshake-plugin/<version>/` directory the installer did not write.
 - `~/.claude/handshake-backup.<timestamp>/` — your previous
-  `commands/handshake.md` or `skills/handshake/`, if either differed from the
-  version being installed.
+  `commands/handshake.md` or `skills/handshake-coordination/`, if either
+  differed from the version being installed.
 
 Both live **outside** the directories the installer manages, so they are never
 re-discovered as a live command, skill, or plugin copy. Restore from them or
