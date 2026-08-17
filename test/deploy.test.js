@@ -271,10 +271,10 @@ test('cmdDeployRelay persists the workspace, mints a round-trippable invite, sho
   const io = captureIo();
   const savedCwd = process.cwd();
   const savedChild = process.env.CLAUDE_CODE_CHILD_SESSION;
-  const savedData = process.env.CLAUDE_PLUGIN_DATA;
+  const savedData = process.env.HANDSHAKE_STATE_DIR;
   const savedExit = process.exitCode;
   delete process.env.CLAUDE_CODE_CHILD_SESSION;      // this test process is itself a child; the flow refuses one
-  process.env.CLAUDE_PLUGIN_DATA = data;
+  process.env.HANDSHAKE_STATE_DIR = data;
   process.chdir(project);
   try {
     await mod.COMMANDS['deploy-relay']({
@@ -286,7 +286,7 @@ test('cmdDeployRelay persists the workspace, mints a round-trippable invite, sho
     io.restore();
     process.chdir(savedCwd);
     if (savedChild === undefined) delete process.env.CLAUDE_CODE_CHILD_SESSION; else process.env.CLAUDE_CODE_CHILD_SESSION = savedChild;
-    if (savedData === undefined) delete process.env.CLAUDE_PLUGIN_DATA; else process.env.CLAUDE_PLUGIN_DATA = savedData;
+    if (savedData === undefined) delete process.env.HANDSHAKE_STATE_DIR; else process.env.HANDSHAKE_STATE_DIR = savedData;
     process.exitCode = savedExit;
   }
 
@@ -408,7 +408,7 @@ test('REAL spawn: the fake npx on PATH drives availability -> login -> deploy ->
 function runCli(args, opts) {
   const o = opts || {};
   const env = Object.assign({}, process.env, {
-    CLAUDE_PLUGIN_DATA: o.data || tmp('clidata'),
+    HANDSHAKE_STATE_DIR: o.data || tmp('clidata'),
     HANDSHAKE_SESSION_ID: 'deploy-test',
   });
   if (o.child) env.CLAUDE_CODE_CHILD_SESSION = '1';

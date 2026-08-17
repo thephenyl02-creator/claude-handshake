@@ -32,7 +32,7 @@ function run(box, args, opts) {
     encoding: 'utf8',
     timeout: 30000,
     env: Object.assign({}, process.env, {
-      CLAUDE_PLUGIN_DATA: box.data,
+      HANDSHAKE_STATE_DIR: box.data,
       HANDSHAKE_SESSION_ID: o.session || 'test-session',
       CLAUDE_CODE_CHILD_SESSION: o.child || '',
       // doctor otherwise shells out to `claude plugin list` (2-18s, and it
@@ -364,10 +364,10 @@ test('every command outside a workspace exits 2 with a pointer, never a stack tr
   }
 });
 
-test('the state directory is the one CLAUDE_PLUGIN_DATA points at', () => {
+test('the state directory is the one HANDSHAKE_STATE_DIR points at', () => {
   const box = sandbox();
   initNtfy(box);
-  assert.equal(stateLib.stateRoot({ CLAUDE_PLUGIN_DATA: box.data }), path.resolve(box.data));
+  assert.equal(stateLib.stateRoot({ HANDSHAKE_STATE_DIR: box.data }), path.resolve(box.data));
   assert.equal(fs.existsSync(path.join(box.data, 'workspaces.json')), true);
 });
 

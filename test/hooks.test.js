@@ -51,7 +51,7 @@ function mkWorkspace(opts) {
     ws: WS, name: 'acme-api', transport: o.transport || 'relay',
     overlap_gate: o.overlap_gate || 'warn', protocol: 1,
   }));
-  const state = stateLib.openState(WS, { env: { CLAUDE_PLUGIN_DATA: data } });
+  const state = stateLib.openState(WS, { env: { HANDSHAKE_STATE_DIR: data } });
   state.ensure();
   state.write({
     ws: WS, name: 'acme-api', transport: o.transport || 'relay', member: 'me00',
@@ -67,7 +67,7 @@ function runHook(script, payload, opts) {
     encoding: 'utf8',
     cwd: o.cwd,
     timeout: 20000,
-    env: baseEnv(Object.assign({ CLAUDE_PLUGIN_DATA: o.data }, o.env || {})),
+    env: baseEnv(Object.assign({ HANDSHAKE_STATE_DIR: o.data }, o.env || {})),
   });
 }
 
@@ -395,7 +395,7 @@ test('the monitor disarm sentinel is what stops the clock, and nothing else', ()
   fs.writeFileSync(disarm, JSON.stringify({ session: 's-x', at: Date.now() }));
   const res = spawnSync(process.execPath, [path.join(ROOT, 'monitors', 'heartbeat.js')], {
     cwd: w.proj, encoding: 'utf8', timeout: 20000,
-    env: baseEnv({ CLAUDE_PLUGIN_DATA: w.data, CLAUDE_PROJECT_DIR: w.proj }),
+    env: baseEnv({ HANDSHAKE_STATE_DIR: w.data, CLAUDE_PROJECT_DIR: w.proj }),
   });
   assert.strictEqual(res.status, 0, 'the monitor self-exits on the sentinel');
   assert.strictEqual(res.stdout, '', 'a monitor NEVER writes to stdout [S5]');
@@ -406,7 +406,7 @@ test('the monitor exits immediately when no workspace resolves', () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hs-m6-bare-'));
   const res = spawnSync(process.execPath, [path.join(ROOT, 'monitors', 'heartbeat.js')], {
     cwd: tmp, encoding: 'utf8', timeout: 20000,
-    env: baseEnv({ CLAUDE_PLUGIN_DATA: path.join(tmp, 'data'), CLAUDE_PROJECT_DIR: tmp }),
+    env: baseEnv({ HANDSHAKE_STATE_DIR: path.join(tmp, 'data'), CLAUDE_PROJECT_DIR: tmp }),
   });
   assert.strictEqual(res.status, 0);
   assert.strictEqual(res.stdout, '');
@@ -685,8 +685,8 @@ test('every hook is a sub-10 ms no-op outside a handshake workspace', () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hs-m6-none-'));
   const deep = path.join(tmp, 'a', 'b', 'c', 'd');
   fs.mkdirSync(deep, { recursive: true });
-  const prev = process.env.CLAUDE_PLUGIN_DATA;
-  process.env.CLAUDE_PLUGIN_DATA = path.join(tmp, 'data');
+  const prev = process.env.HANDSHAKE_STATE_DIR;
+  process.env.HANDSHAKE_STATE_DIR = path.join(tmp, 'data');
   try {
     const C = require(path.join(HOOKS, 'common.js'));
     assert.strictEqual(C.resolveWorkspace(deep), null);
@@ -701,7 +701,7 @@ test('every hook is a sub-10 ms no-op outside a handshake workspace', () => {
     }
     assert.ok(best < 10, 'best-case resolution cost per hook: ' + best.toFixed(2) + ' ms');
   } finally {
-    if (prev === undefined) delete process.env.CLAUDE_PLUGIN_DATA; else process.env.CLAUDE_PLUGIN_DATA = prev;
+    if (prev === undefined) delete process.env.HANDSHAKE_STATE_DIR; else process.env.HANDSHAKE_STATE_DIR = prev;
   }
 });
 
@@ -722,7 +722,7 @@ test('a truncated or absent stdin payload still exits 0 within the backstop', ()
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'hs-m6-stdin-'));
   const res = spawnSync(process.execPath, [path.join(HOOKS, 'user-prompt-submit.js'), 'UserPromptSubmit'], {
     input: '{"hookEventName":"UserPromptSubmit","sess', encoding: 'utf8', cwd: tmp, timeout: 20000,
-    env: baseEnv({ CLAUDE_PLUGIN_DATA: path.join(tmp, 'data') }),
+    env: baseEnv({ HANDSHAKE_STATE_DIR: path.join(tmp, 'data') }),
   });
   assert.strictEqual(res.status, 0);
   assert.strictEqual(res.stdout, '');

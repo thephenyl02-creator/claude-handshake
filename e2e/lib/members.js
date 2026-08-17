@@ -103,7 +103,11 @@ class Member {
 
   env(extra) {
     const e = scrubbedEnv();
-    e.CLAUDE_PLUGIN_DATA = this.dataDir;
+    // The state root: HANDSHAKE_STATE_DIR, the explicit override the CLI and
+    // hooks BOTH honor (lib/state.js stateRoot). CLAUDE_PLUGIN_DATA is no
+    // longer the state key - it is the asymmetric var that caused the
+    // empty-standing-block bug.
+    e.HANDSHAKE_STATE_DIR = this.dataDir;
     e.CLAUDE_PLUGIN_ROOT = H.REPO_ROOT;
     e.HANDSHAKE_SESSION_ID = this.sessionId;
     return Object.assign(e, extra || {});

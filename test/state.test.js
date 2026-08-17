@@ -33,9 +33,17 @@ function envOf(type, body, ts) {
 
 // ------------------------------------------------------------- locations ---
 
-test('state root: CLAUDE_PLUGIN_DATA wins, else ~/.claude/handshake via homedir()', () => {
-  assert.equal(St.stateRoot({ CLAUDE_PLUGIN_DATA: path.join(os.tmpdir(), 'pd') }), path.resolve(path.join(os.tmpdir(), 'pd')));
+test('state root: the CLI and hooks resolve the SAME dir (HANDSHAKE_STATE_DIR > CLAUDE_CONFIG_DIR/handshake > ~/.claude/handshake)', () => {
+  // Explicit override wins, used as-is.
+  assert.equal(St.stateRoot({ HANDSHAKE_STATE_DIR: path.join(os.tmpdir(), 'pd') }), path.resolve(path.join(os.tmpdir(), 'pd')));
+  // A custom config dir: both CLI and hook inherit it, so they still agree.
+  assert.equal(St.stateRoot({ CLAUDE_CONFIG_DIR: path.join(os.tmpdir(), 'cfg') }), path.join(path.resolve(path.join(os.tmpdir(), 'cfg')), 'handshake'));
+  // Default.
   assert.equal(St.stateRoot({}), path.join(os.homedir(), '.claude', 'handshake'));
+  // CLAUDE_PLUGIN_DATA is the ASYMMETRIC var (hook has it, Bash-tool CLI does
+  // not) and MUST be ignored, or a workspace made by the CLI is invisible to
+  // the hook. This assertion is the regression guard for the empty-block bug.
+  assert.equal(St.stateRoot({ CLAUDE_PLUGIN_DATA: path.join(os.tmpdir(), 'pd') }), path.join(os.homedir(), '.claude', 'handshake'));
   // No literal "~" ever reaches the filesystem.
   assert.equal(St.stateRoot({}).includes('~'), false);
   assert.equal(St.stateDir(WS, {}), path.join(os.homedir(), '.claude', 'handshake', WS));
