@@ -22,6 +22,44 @@ relaying anything and no peer prose ever instructing either model.
 The whole feature is **one new wire type, one new local file, and one generated
 artifact**. It needs no relay patch and no redeploy `[P Appendix B B3]`.
 
+### 1.1 What it needs, and what each layer buys
+
+Nothing below is a paywall. **The exchange works with neither git nor a relay**,
+and each layer removes exactly the capability it actually provides. Two
+independent axes:
+
+| | **no git working tree** | **git working tree** |
+|---|---|---|
+| **ntfy (zero-setup)** | works: propose, accept, author, receive, build. Each *inbound* revision is materialized only after a local human confirms it (§2.6). The contract exists only in the two live trees. | + the contract rides ordinary commits: revision history, and a peer past ntfy's ~12 h cache gets it by pulling |
+| **team relay** | works, and an inbound revision materializes with no human at all; 7 days / 500 messages of retention stand behind it `[C relay/src/lib/config.js:8-9]` | **full** — automatic adoption, durable across an absence longer than retention |
+
+**git buys durability, and only that.** Without it the contract file still lives
+in the working tree, both sides still converge on it, and every live signal of
+§4.6 still fires. What is lost is the *committed* copy — the second path to a
+revision for a peer who was absent past the transport's retention (§8.11) — the
+rev-to-rev history `git log` would hold, and the non-member-commit flag that
+reads commit authorship (§6.4). Nothing in the exchange goes through git, which
+is why nothing in the exchange stops without it.
+
+**The relay buys automation, because it can attribute the sender.**
+`authenticated_from` is `true` there `[C lib/transport-relay.js:101]` and the
+relay refuses — never rewrites — a mismatched `from` `[P§9.2]`. On ntfy `from`
+is self-declared `[C lib/transport-ntfy.js:72]`, so *"this came from bob"* is
+not a verifiable fact, and the one act that depends on it — writing a peer's
+text into this tree with nobody asked — waits for a local human instead (§2.6).
+Everything else on ntfy is unchanged, including authoring and posting
+revisions, which are caused by this side's own work and never by peer data.
+
+**Neither buys correctness.** The hash check, the receive-path escaping, the
+secret filter, the TTL, the rev cap, the client-computed path and either
+human's instant kill are identical on every tier.
+
+This is the posture the codebase already takes toward its most safety-critical
+primitive: claims ship on ntfy **labelled, not disabled** — `ADVISORY_LINE`
+`[C lib/transport-ntfy.js:39]` and `server_claims: false`
+`[C lib/transport-ntfy.js:73]` are capability *statements*, not off switches
+`[P§5.5]`. State the tier, degrade the capability, never refuse the feature.
+
 ---
 
 ## 2. The consent boundary
@@ -51,9 +89,10 @@ pass before asking for the same treatment. An offer fails it. A seam passes it.
 ### 2.2 How it is agreed — two commands, ever
 
 **A:** `handshake seam open "<name>" --with bob --mine "<subject>" --theirs "<subject>"`.
-Refused unless A already holds a live claim on `mine`; refused on an
-unauthenticated transport (§2.6); refused from a child session
-`[C bin/handshake.js:374-381]`. Posts `task.seam{propose}`.
+Refused unless A already holds a live claim on `mine`; refused from a child
+session `[C bin/handshake.js:374-381]`. Permitted on every transport; on an
+unauthenticated one it prints the gate that comes with it (§2.6). Posts
+`task.seam{propose}`.
 
 **B:** arrival is a **count and a pointer** in the standing block (`· seam`) —
 no peer prose is injected, nothing is claimed, no plan changes. B's human reads
@@ -78,9 +117,12 @@ Four client acts and one model permission. Nothing else.
    equal the proposer's own ledger row;
 2. **client** — materialize a verified counterparty `contract` into
    `.handshake/seam/<seam_id>.md`, a path the **client computes from its own
-   ledger**, never one the peer names;
+   ledger**, never one the peer names — automatically where
+   `capabilities().authenticated_from` is true, and on an unauthenticated
+   transport only after the local confirmation of §2.6;
 3. **client** — post `task.seam{adopt, seam_id, rev, hash}`, three values it
-   computed or verified itself, carrying no authored content;
+   computed or verified itself, carrying no authored content; it trails a
+   materialization, so on ntfy it trails that human act;
 4. **client** — deactivate on a verified `end` (only ever *removes* capability);
 5. **model** — build its **own** side against the current materialized
    revision, inside its own claim and its own files, without asking its human;
@@ -120,6 +162,8 @@ is scoped to a peer **note** `[C docs/SECURITY.md:272-273]`. For each item:
 closes traversal by construction. That is not a new posture: `shardFileName`
 already derives a filename from a member id rather than accepting one
 `[C lib/workspace-files.js:267]`. No source file is ever written from peer data.
+Where `from` is self-declared the write additionally waits for the local
+confirmation of §2.6, so on that tier a peer alone never causes it at all.
 The model writing its *own* side's files is not an exception at all — item 2
 says "outside the current task", and the seam's two named subjects *are* the
 current task.
@@ -166,26 +210,64 @@ mechanical exceptions live in the **client**, where they are code rather than
 discipline. This is the strongest structural property of the design and it
 costs zero characters on every turn of every session.
 
-### 2.6 Relay-only, and why the carriage makes that sharper
+### 2.6 Where `from` is self-declared: the confirmation gate
 
 `capabilities().authenticated_from` is `true` on the relay
 `[C lib/transport-relay.js:101]` and `false` on ntfy
 `[C lib/transport-ntfy.js:72]`, where `from` is self-declared and any holder of
-the workspace secret can sign as any member `[P§9.3]` `[P SECURITY §2]`.
+the workspace secret can sign as any member `[P§9.3]`
+`[C docs/SECURITY.md:76-79]`.
 
-> Consent-once is only sound where identity is authenticated. Where `from` is
-> self-declared, consenting once to "bob" is consenting once to anyone holding
-> the topic.
+> Consent-once names a counterparty. Where `from` is self-declared, *"from
+> bob"* is not a fact — it is a claim by whoever holds the topic.
 
-`handshake seam open` refuses on ntfy with that one sentence and
-`/handshake upgrade`. This is a stronger conclusion here than it would be for a
-hash-only design: because a contract **materializes as a file write into the
-peer's working tree** (§2.5 item 2), an unauthenticated `from` would let any
-secret-holder write a file into any member's tree and steer what that member's
-Claude builds. That is a materially larger capability than the false-stale
-denial-of-service a hash-only channel would expose, so the carriage choice
-that buys machine speed (§4) is exactly the choice that makes the tier gate
-non-negotiable. **No `--unauthenticated` override is offered.**
+What that costs is narrow, and it is not the feature. Every predicate the client
+checks **about itself** holds identically on ntfy — the `seam_id` is in its own
+ledger, the rev ordering is its own, the SHA-256 is over the text it received,
+the path is one it computed, the TTL is its own clock. Exactly one predicate is
+unverifiable, *"this came from bob"*, and exactly one act rests on it:
+**writing a peer's text into this tree with nobody asked** — a real capability
+precisely because the contract materializes as a file write (§2.5 item 2)
+rather than travelling as a hash. So that act is gated and nothing else is:
+
+> **On a transport whose `authenticated_from` is false, a received `contract`
+> is verified, recorded and shown, and is materialized only after a local human
+> confirms it. Proposing, accepting, receiving, authoring and posting revisions
+> are unchanged.**
+
+The confirmation is a notice plus a typed command, never a prompt at sync time,
+and that is forced rather than chosen: syncs land in hooks, which print nothing
+but designed injections and where UserPromptSubmit is local-cache-only with zero
+network `[P§8]`. So the arrival raises a notice and the human runs
+**`handshake seam pull <id>`** — the verb §8.4 already needs — which prints, in
+the register `join` uses `[C bin/handshake.js:586-601]`:
+
+- the seam name, id and both subjects, and the rev the ledger expected;
+- the sender **as claimed**, in the wording the client already prints for this
+  transport: `self-declared, HMAC-signed - NOT server-verified`
+  `[C bin/handshake.js:594-596]` `[C bin/handshake.js:1200]`, plus the advisory
+  line `[C lib/transport-ntfy.js:39]`;
+- `rev N`, the hash, and **the full contract text, escaped, exactly as it would
+  be written**, with the path it would be written to;
+- one sentence saying that anyone holding this workspace's topic could have
+  signed as bob;
+
+then a typed confirmation, with `--yes` refused as `join` refuses it. On
+acceptance the client runs the ordinary materializer and posts `adopt`.
+
+**On the relay none of that is printed**, because the client has already
+mechanically checked the only thing the human would be checking: the wrapper
+`from` equals `envelope.from.member` `[C lib/transport-relay.js:223]` and the
+relay refused to store the message under any other member's id `[P§9.2]`. The
+revision appears in the block's rev detail and in notices, after the fact.
+
+The honesty limit, which must not be upgraded later: the gate is worth what a
+typed confirmation is worth (§2.7) — an audit line and a display, **not proof of
+consent**, and it does not make ntfy attribution real. What it buys is
+mechanical: the automatic peer-caused write is gone, and the human supplies the
+one input no local check can — whether they were expecting a revision from bob
+at all. No flag turns it off; `/handshake upgrade` is how it goes away, and §12
+says what that actually buys.
 
 ### 2.7 Kill, and what each control is honestly worth
 
@@ -203,11 +285,17 @@ Honestly, and this wording must not be upgraded later:
 - The **TTL** and the **rev cap** are mechanical — they live in the client's
   send path and hold against a model that never loaded SKILL.md.
 - The **receiver-side authorization** (§7.2) is real on the relay, where `from`
-  is refused-not-rewritten `[P§9.2]`.
-- The **typed confirmation** is a speed bump and an audit line, **not proof of
-  consent**: the model drives the terminal, and `ask()` reads piped stdin when
-  there is no TTY `[C bin/handshake.js:86-113]`. `SECURITY §1.2` already places
-  "the local user's own model" out of scope and that wording stands.
+  is refused-not-rewritten `[P§9.2]`. On ntfy the same checks run, but the
+  counterparty check compares a self-declared field: it filters mistakes and
+  stops nothing a topic-holder cannot forge, which is why §2.6 puts a human in
+  front of the one act that depends on it.
+- The **typed confirmation** — at `accept`, and at §2.6's `pull` — is a speed
+  bump and an audit line, **not proof of consent**: the model drives the
+  terminal, and `ask()` reads piped stdin when there is no TTY
+  `[C bin/handshake.js:86-113]`. `SECURITY §1.2` already places "the local
+  user's own model" out of scope and that wording stands. §2.6's gate is
+  therefore not a security control; what it mechanically removes is the
+  *automatic* write.
 - The **SKILL.md rules** about what a revision may say are discipline of the
   same family as "never auto-join". They are not controls. Say so in
   SECURITY.md.
@@ -258,7 +346,9 @@ because both render the same header and the same escaped text from the same
 signed envelope.
 
 **No commit is required for the two live participants.** That is the property
-the whole design is built to buy, and it is worth being explicit about the
+the whole design is built to buy — and it is also why the feature works with no
+git at all (§1.1): git carries the contract to someone who was *not* there,
+never between two people who are. It is worth being explicit about the
 alternative that was rejected: a design in which the contract is an ordinary
 source file (a `.d.ts`, an OpenAPI fragment) and the wire carries only its
 hash is *cleaner in one respect* — the contract becomes executable, and the
@@ -305,6 +395,11 @@ catch that and tell the human to shorten the contract — **never silently trim*
 which would ship a half-contract that hashes differently on the two sides. For
 ordinary ASCII interface text the character cap is the binding one and the
 byte cap is slack.
+
+A **third** cap exists on the zero-setup tier — ntfy's 4096-byte per-message
+limit `[C lib/transport-ntfy.js:33,118-121]` — and it never binds, measured
+rather than assumed: a full 1200-character ASCII contract builds a 2244-byte
+ntfy wire message, and a body at the whole 2048-byte cap builds 3152.
 
 **A contract that does not fit in 1200 characters is not one seam.** Split it,
 or narrow it. This is the same disciplining constraint as *"a claim subject is
@@ -378,8 +473,11 @@ clause, and an exemption clause is a `v` bump wearing a v1.1 label.
 
 No new message type; all three are derived from local state.
 
-1. **rev behind** — my materialized rev < the highest rev I have verified. The
-   window is one sync, because the client materializes *during* the sync.
+1. **rev behind** — my materialized rev < the highest rev I have verified. On an
+   authenticated transport the window is one sync, because the client
+   materializes *during* the sync; on an unauthenticated one it is however long
+   the §2.6 confirmation takes, which is exactly why this signal is a rendered
+   notice and not an assumption.
 2. **peer has not adopted my rev** — I authored rev 5, their last `adopt` was
    rev 4. My half is built against something they have not agreed to. This is
    the single most valuable fact in a two-tree co-build and it is why `adopt`
@@ -511,7 +609,7 @@ peer-derived cache and local truth.
 
 | Layer | Path | Written by | Job | Cannot |
 |---|---|---|---|---|
-| **contract** | `.handshake/seam/<seam_id>.md` (working tree) | the client, from a verified message | the artifact both trees converge on; rides ordinary commits for durability and for anyone absent | grant anything — it is inert without local consent |
+| **contract** | `.handshake/seam/<seam_id>.md` (working tree) | the client, from a verified message | the artifact both trees converge on; **where a git working tree exists** it also rides ordinary commits, for durability and for anyone absent (§6.4) | grant anything — it is inert without local consent |
 | **ledger** | `<state>/<ws>/seams.json`, `0600` | the client | the consent record, the rev/adopt bookkeeping, the kill state | leave this machine |
 
 ### 6.1 Why a separate file
@@ -561,6 +659,29 @@ adds **none**, and the reason is that it does not need them:
 `[C lib/workspace-files.js:54,312-318]`. The seam directory is a separate
 directory with a separate writer rule (the client, from verified messages),
 which does not interact with shard ownership at all.
+
+### 6.4 Outside a git working tree
+
+`repoRoot()` is null when there is no git working tree, and the durable layer is
+then not written at all — deliberately, because *"the whole value of
+`.handshake/` is that peers get it by pulling"* `[C bin/handshake.js:217-220]`.
+`init` says so `[C bin/handshake.js:499-502]`, `tasks` refuses
+`[C bin/handshake.js:1043-1045]`, `doctor` warns `[C bin/handshake.js:1540]`.
+
+The seam contract is the **one** `.handshake/` artifact still written there, and
+the departure is deliberate because its first reader is different: a shard
+exists for a peer who pulls, while the contract exists for **this side's own
+model**, which reads it whether or not git will ever carry it. So the
+materializer writes `.handshake/seam/<seam_id>.md` under the project directory
+with or without a repo — and the client MUST NOT call it durable when it is not:
+`status` already reports `durable layer: none` `[C bin/handshake.js:1204]`, and
+`handshake seam` says the contract is local-only.
+
+Lost, exactly as §1.1 states and no more: the committed copy (§8.11), the
+history `git log` would hold over the file — the ledger keeps `{rev, hash}`, not
+old text — and `checkShardAuthors` `[C lib/workspace-files.js:412]`, which reads
+commit authorship and here has none to read. The live exchange and all three
+signals of §4.6 are untouched: none of them goes through git.
 
 *(Making the durable layer readable — a SessionStart scan of
 `.handshake/tasks/*.md` — is a genuinely valuable change that `docs/DELEGATION.md`
@@ -630,7 +751,11 @@ All discard-and-count:
 
 On the relay these are real checks because `from` is refused-not-rewritten
 (`403 from_mismatch`) `[P§9.2]`, and a client MUST additionally check wrapper
-`from` == `envelope.from.member`.
+`from` == `envelope.from.member` `[C lib/transport-relay.js:223]`. Every one of
+them also runs on ntfy and every one of them is worth running there — but the
+counterparty check reads a self-declared field, so it filters mistakes and stale
+seams rather than authenticating anyone, which is the whole reason §2.6 exists
+and the whole extent of what §2.6 changes.
 
 ### 7.3 Rendering, and the budget arithmetic
 
@@ -678,11 +803,17 @@ suffix without arbitration.** That is a consequence of putting the detail in
 M7/M11 measured the block before the literals are written.
 
 Local truth — *your rev 6 has not been adopted*, *the contract file was
-hand-edited*, *the seam expired* — rides the **notices** channel beside
-`conflictNotices` `[C hooks/common.js:553-570]`: regenerated from state every
-turn, therefore never consumed by the watermark (unlike a digest item, which is
-consumed at injection and appears exactly once `[P§6.3]`), capped at 2 × 96
-chars and dropped only at the very last rung `[C hooks/render.js:186-188,262]`.
+hand-edited*, *the seam expired*, and on an unauthenticated transport *bob's
+rev 5 is waiting for `handshake seam pull`* — rides the **notices** channel
+beside `conflictNotices` `[C hooks/common.js:553-570]`: regenerated from state
+every turn, therefore never consumed by the watermark (unlike a digest item,
+which is consumed at injection and appears exactly once `[P§6.3]`), capped at
+2 × 96 chars and dropped only at the very last rung
+`[C hooks/render.js:186-188,262]`. Four kinds into two slots means an order is
+required, and the pending-revision notice takes the first slot where it applies:
+it is the only one that gates progress, and the model cannot infer it from the
+block (the rev detail shows what *this* side authored and what the peer
+adopted, never what is sitting unmaterialized).
 
 ---
 
@@ -704,7 +835,8 @@ without the value and never re-encodes around it `[C SKILL.md §5]`.
 **8.4 Contract file hand-edited.** The client refuses to overwrite, raises a
 local notice, and offers `handshake seam pull <id>` (take the peer's rev,
 discarding the edit) or `seam end`. No silent destruction, no silent
-divergence.
+divergence. `pull` is the same verb §2.6 uses, and for the same reason: a human
+authorizing one write of a peer's rev into this tree.
 
 **8.5 Peer's client is v1.0.** It validates, verifies, dedupes, then fails the
 `TYPES` check and returns `{ok:false, code:'unknown_type', kind:'ignore'}` —
@@ -731,6 +863,8 @@ reading a file — fine, and it is escaped and framed like any other
 are void at migration** and both sides are told once through notices. The
 contract files survive as artifacts; re-consent is a new seam, which is two
 commands and ten seconds because the text is carried forward from the file.
+Migration is also the tier change of §1.1: the seam that reopens on the relay is
+the same feature with §2.6's gate gone, not a feature that was previously off.
 
 **8.9 Repo public / guard failed.** Posting hard-fails loudly and demands
 rotation `[P SECURITY §6]`. The seam's outbound half stops; the contract file
@@ -742,13 +876,18 @@ sender_seq)` at the envelope `[P§2.6]`, idempotent replay at the relay, and
 `(seam_id, rev, hash)` at the ledger. A repeat updates `last_seen_at` and
 nothing else.
 
-**8.11 Relay eviction.** Retention is 7 days **and** the last 500 messages —
-`MESSAGE_TTL_SECONDS: 604800` alongside `MESSAGE_MAX: 500`
-`[C relay/src/lib/config.js:8-9]`. On a busy workspace a revision can be evicted
-well inside its TTL. The working-tree contract file is then the only path, and
-only if someone committed. A two-person seam is quiet by construction, so this
-is unlikely to bite — but it is a bound, not a guarantee, and `status` should
-not imply otherwise.
+**8.11 The revision is gone from the transport.** On the relay, retention is
+7 days **and** the last 500 messages — `MESSAGE_TTL_SECONDS: 604800` alongside
+`MESSAGE_MAX: 500` `[C relay/src/lib/config.js:8-9]` — so on a busy workspace a
+revision can be evicted well inside its TTL. On ntfy the bound is much tighter
+and is not ours: the operator's cache is ~12 h, undocumented and
+operator-controlled, and past it the cursor ladder reports a **truncated read**
+rather than silence `[C lib/transport-ntfy.js:23-24,160-163]`. In both cases the
+working-tree contract file is the only remaining path, and only where git
+carried it (§6.4); with no git the seam is re-opened and the text carried
+forward from whichever side still holds the file. A two-person seam is quiet by
+construction, so the relay bound is unlikely to bite — but these are bounds, not
+guarantees, and `status` should not imply otherwise.
 
 **8.12 `mute` and `rest`.** `rest` stops the outbound half, so no revisions and
 no adopts. `mute` suppresses the digest only; the claims-line `· seam` marker
@@ -759,7 +898,9 @@ chatter — which falls out of `hooks/render.js` for free.
 
 ## 9. Scenario, end to end, including a mid-build absence
 
-Relay tier. alice = A (frontend), bob = B (backend). One project, one repo.
+Relay tier, git working tree — the full configuration. alice = A (frontend),
+bob = B (backend). One project, one repo. What the other three tiers do at the
+points where they diverge is stated after the table.
 
 | Time | What happens | Where it lands |
 |---|---|---|
@@ -767,9 +908,9 @@ Relay tier. alice = A (frontend), bob = B (backend). One project, one repo.
 | **09:02** | A's Claude proposes in **one line** — the register of the tiebreak-loss line, *"the one moment surfacing to the human is correct"* `[P§5.4]`. A's human says yes. `handshake seam open "auth session" --with bob --mine "login form" --theirs "session endpoint"`. Admission check: `login form` vs `session endpoint` share no token, Jaccard 0 — disjoint, admissible (§4.7). Confirmation printed and typed. Posts `task.seam{propose}`. | wire + ledger |
 | **09:03** | B's next inbound refresh — SessionStart, or ~every 5th PostToolUse tick (`SYNC_EVERY_N_TICKS = 5` `[C hooks/common.js:48]` `[C hooks/post-tool-use.js:106-108]`; the Stop hook is outbound-only). Block gains `· seam`. **B's Claude has been told a count and a pointer, nothing else.** | ledger |
 | **09:04** | At a natural boundary, one line: *"alice proposed co-building an auth-session interface — you'd take the session endpoint. Want to see it?"* B's human: `handshake seam` → the full read-only view. Then `handshake seam accept k-9f3a…` → prints parties, both subjects, TTL 2 h, tier `relay · server-stamped identity`, and the closed list of §2.3; typed `y`. B's claim on `session endpoint` is taken cleanly. Posts `accept` with the echoed terms. | claim + wire |
-| **09:05** | A's client verifies the echo against its ledger and marks the seam **live**. Both blocks now read `· seam`. **Two human acts total. There are no more.** | — |
+| **09:05** | A's client verifies the echo against its ledger and marks the seam **live**. Both blocks now read `· seam`. **Two human acts total on this tier. There are no more.** | — |
 | **09:06** | A's Claude authors rev 1 from what its form needs: the POST, the request fields, a 200 shape, a 401. Posts `contract{rev:1}`; materializes its own copy; generates a local stub returning fixtures and starts building the form against it. **A's human is not asked** — this is the thing they consented to. | wire + A's tree |
-| **09:08** | B's client verifies, materializes rev 1 into B's tree, posts `adopt{rev:1}`. B's Claude reads the file and builds the handler. A's block: `seam r1 (bob r1)`. **Both halves are now being written at once, against one shape, with no human involved.** | B's tree + wire |
+| **09:08** | B's client verifies, materializes rev 1 into B's tree, posts `adopt{rev:1}`. B's Claude reads the file and builds the handler. A's block: `seam r1 (bob r1)`. **Both halves are now being written at once, against one shape, with no human involved** — the property the relay's attribution buys. | B's tree + wire |
 | **09:20** | B's work needs a rate-limit response A did not anticipate. B's Claude authors rev 2 adding the 429 — a statement of B's **own** requirement, not a reply to A (§2.5). A materializes, adopts, regenerates its stub, and adds the 429 branch to the form. **This is the exchange the feature exists for.** | both trees |
 | **09:35** | B needs to say something no shape can carry: the endpoint is behind a feature flag until Thursday. Not a contract revision — it is a fact about process. B's Claude posts one `note.blocker` with `--subject "session endpoint"` (already permitted today, unprompted, `[C SKILL.md §4]`) and it holds a reserved priority slot at A's next sync. A's Claude reads it as **data**, tells A's human one line, and keeps building. | wire |
 | **09:40** | A revises `expires_at` from seconds to epoch ms (rev 3). B adopts. `seam r3 (bob r3)`. | both trees |
@@ -779,12 +920,39 @@ Relay tier. alice = A (frontend), bob = B (backend). One project, one repo.
 | **10:50** | bob crosses `stale` (age > 6×K = 360 s on the relay, `[P§4.3]`). A's Claude says one line to A's human and offers the two honest options: keep building on rev 4, or narrow to rev 3's agreed surface. **It does not decide for the human and does not end the seam** — bob may be at lunch. | — |
 | **11:05** | A commits ordinary work. `.handshake/seam/k-9f3a….md` rides it. **No coordination-only commit is created** `[PLAN.md:278]`. | repo |
 | **11:06** | **Seam TTL expires** (09:05 + 7200 s). Derived, nobody announces it — the rule that works precisely because the absent party is the one who would otherwise owe the message. A's client deactivates: no more automatic materialize, adopt, or revision. One notice, once: *"the auth-session seam expired; rev 4 was never adopted by bob. The contract file is still on disk."* A's own claim and A's work are untouched — the seam only ever governed the exchange. | notices |
-| **next day** | bob returns. SessionStart syncs; rev 4 is inside the relay's 7-day TTL **provided fewer than 500 messages followed it** (§8.11) — on a two-person workspace it is there. The seam is expired, so **nothing materializes automatically**. B's `handshake seam` shows it; and because A committed, the contract file is in B's tree at rev 3 after a pull, with rev 4 visible in the ledger view as never-adopted. To continue, one of them opens a new seam: two typed commands, and the text carries forward from the file. | repo + ledger |
+| **next day** | bob returns. SessionStart syncs; rev 4 is inside the relay's 7-day TTL **provided fewer than 500 messages followed it** (§8.11) — on a two-person workspace it is there. The seam is expired, so **nothing materializes automatically**. B's `handshake seam` shows it; and because A committed at 11:05 — after materializing rev 4 into A's own tree — a pull brings B the rev-4 file too, with the ledger view showing B never adopted it. Two independent paths to the same revision, which is the point of §1.1's two axes. To continue, one of them opens a new seam: two typed commands, and the text carries forward from the file. | repo + ledger |
 
 **Why the absent case works:** A never blocked; A always knew exactly which
 revision was agreed and which was assumed; expiry needed no message from the
 absent party; and the durable artifact survived in the repo without anyone
 making a coordination commit.
+
+**Where the tiers diverge — five points, and one thing a tier cannot do.**
+
+- **09:04, accept.** On ntfy the tier line reads `ntfy · self-declared identity`
+  plus the advisory line, and B's claim on `session endpoint` is
+  `unauthenticated-advisory` `[P§5.5]` — a loss is surfaced to B's human instead
+  of refused at a source, where the relay's `409` is authoritative.
+- **09:08 / 09:20 / 09:40, each inbound revision.** Relay: verified,
+  materialized and adopted with nobody asked. ntfy: a notice, then
+  `handshake seam pull k-9f3a…`, the §2.6 screen, one typed `y`, then the same
+  write and the same `adopt`. Both models keep working in between — the gate
+  delays a materialization, it never blocks either side's own half.
+- **11:05, the commit.** Git tiers only. Without a working tree nothing happens
+  here and nothing is lost here: the file is already in both trees.
+- **11:06, expiry.** Identical everywhere — derived from `opened_at + ttl`,
+  announced by nobody.
+- **next day, bob returns.** The only point where a tier genuinely cannot do the
+  thing, and it takes *both* layers missing. *Relay + git*: two paths, as the
+  table says. *Relay, no git*: rev 4 is inside the 7-day retention, so the wire
+  carries it; there is simply no file to pull. *ntfy + git*: bob is far past the
+  ~12 h cache, so the wire has nothing and the read says so rather than
+  reporting silence `[C lib/transport-ntfy.js:160-163]` — the committed file is
+  the path, and it works. *ntfy, no git*: neither path exists, so bob learns
+  nothing about rev 4 at all; A re-opens a seam and A's client carries its own
+  file's text forward as rev 1. That last line is a real loss, it is said in
+  `status` rather than papered over, and it is the honest reason to run either
+  layer — either one, not both.
 
 ---
 
@@ -800,20 +968,26 @@ redeploy, no new endpoint. Buildable in a week.
    `status`. **Consent lives here and only here** (§6.2).
 3. `handshake seam open "<name>" --with <m> --mine "<s>" --theirs "<s>" [--ttl 7200]`
    — refuses unless the caller holds a live claim on `mine`; refuses on Jaccard
-   ≥ 50 (§4.7); refuses on ntfy with the one-line reason and `/handshake
-   upgrade`; prints once where the contract file will appear.
+   ≥ 50 (§4.7); prints once where the contract file will appear, whether git
+   will carry it, and on an unauthenticated transport the §2.6 gate it implies.
 4. `handshake seam accept <id>` — `join`-shaped: prints parties, both subjects,
-   TTL, tier and the §2.3 closed list; **refuses `--yes`**; requires a typed
-   confirmation `[C bin/handshake.js:598-601]`; takes the accepter's claim on
-   `theirs` and fails whole if it loses. `refuseIfChild` on every verb.
+   TTL, the tier (with the advisory line and the gate where they apply) and the
+   §2.3 closed list; **refuses `--yes`**; requires a typed confirmation
+   `[C bin/handshake.js:598-601]`; takes the accepter's claim on `theirs` and
+   fails whole if it loses. `refuseIfChild` on every verb.
 5. `handshake seam [--json]` — read-only, both directions, quoted and
-   attributed, with the tier label, TTL remaining, rev state, and any
-   non-member-commit flag. **Peer prose reaches a model here and in the
-   materialized file, nowhere else.**
+   attributed, with the tier label, TTL remaining, rev state, whether the
+   contract is durable here or local-only (§6.4), any revision awaiting a §2.6
+   confirmation, and any non-member-commit flag. **Peer prose reaches a model
+   here and in the materialized file, nowhere else.**
 6. `handshake seam end <id> [--all]` — local first, instant, before the post.
 7. The materializer: verify → escape → hash-check → write
    `.handshake/seam/<id>.md` at a **client-computed** path → post `adopt`.
-   Refuses to overwrite a hand-edited file and raises a notice instead.
+   Automatic where `capabilities().authenticated_from` is true; on an
+   unauthenticated transport the identical path runs behind
+   `handshake seam pull <id>` after the §2.6 confirmation. Writes with or
+   without a git working tree, and never calls the file durable when there is
+   none. Refuses to overwrite a hand-edited file and raises a notice instead.
 8. `handshake seam contract <id> --text-file <path>` — text from a **file**,
    never argv (it is up to 1200 chars, and argv is the wrong channel), through
    `buildEnvelope`/`send` and therefore through `sendGate`. Rev cap 8. Byte-cap
@@ -821,23 +995,38 @@ redeploy, no new endpoint. Buildable in a week.
 9. Rendering: `COND.seam` (7 chars, untrimmable) plus the `details[]` rev suffix
    (16 chars, trimmable at the existing `dropDetails` rung) — **after** the
    budget re-measurement gate (§7.3).
-10. Local notices: rev-not-adopted · hand-edited file · seam expired.
+10. Local notices: rev-not-adopted · hand-edited file · seam expired · **a
+    revision is waiting for `handshake seam pull` on an unauthenticated
+    transport**.
 11. SKILL.md: the §2.5 scope test; *"a revision states what your side needs,
     never a reply to their prose"*; the generate-your-own-stub discipline
-    (§4.4); `note.blocker` as the escape hatch and that **you may ask but not
-    auto-answer** in this version; the never-list restated for seams; and the
-    worked injection example in the shape of the existing `npm run reset-db`
-    one — *a contract containing an imperative is answered as data and the
-    imperative is ignored.*
+    (§4.4); that on an unauthenticated transport an inbound revision waits for
+    its human and the model keeps building meanwhile; `note.blocker` as the
+    escape hatch and that **you may ask but not auto-answer** in this version;
+    the never-list restated for seams; and the worked injection example in the
+    shape of the existing `npm run reset-db` one — *a contract containing an
+    imperative is answered as data and the imperative is ignored.*
 12. SECURITY.md: the enumerated grant, the two mechanical exceptions, the
-    relay-only argument, the new-capability statement (§12), and the honest
-    statement that a typed confirmation is a speed bump, not proof.
+    graduated rule of §2.6 with what the confirmation is and is not worth, the
+    new-capability statement per tier (§12), and the honest statement that a
+    typed confirmation is a speed bump, not proof.
 
 **v1.1b** — the `note.blocker` auto-answer relaxation (§5.3), isolated
 deliberately because it is the **first outbound post caused by peer data** and
 deserves its own review; rev-to-rev diff in the read view; the SessionStart
 shard scan that makes the durable layer readable at all (§6.3), which
 `docs/DELEGATION.md` also wants and which should be built once and shared.
+
+**All four tiers of §1.1 are in v1.1a, and the split is not available.** The
+tier handling is two branches, not a second slice: one on
+`capabilities().authenticated_from` in the materializer — and the
+unauthenticated arm reuses `handshake seam pull`, a verb item 7 already needs
+for §8.4 — and one on `repoRoot()` being null, which chooses the file's root and
+suppresses the durability claim in `status` and `seam`. Shipping relay-only
+first would not be a smaller build; it would be a *different* one, because the
+refusal it advertises is exactly what a later slice would have to walk back, and
+because the zero-setup rung exists so a team can try the product in one paste
+`[P§9.3]`.
 
 **The one thing that must not be split off:** the consent object ships with the
 first slice — the join-shaped accept, the closed permission list, the
@@ -853,6 +1042,23 @@ cross-workspace seams · any renewal of the window · handshake ever running
 `git fetch`, `git pull` or `git commit` · wake mode — **a seam wakes nobody; it
 waits** `[PLAN.md Locked decision 1]`.
 
+### 10.1 Where the matrix goes when it ships — and not one line before
+
+The §1.1 table is not internal reasoning; it answers *"what do I get without
+setting anything up"*, and a reader who finds it only here will not find it.
+When v1.1a lands, the same two axes and the same per-tier losses go in
+**README** (beside the transport ladder, so the on-ramp says what it does and
+does not include) and in **`docs/INSTALL.md`** (beside the git and relay steps,
+each stating the capability it adds rather than implying the feature needs it).
+One source of truth, three renderings.
+
+**Until it is built, it is advertised nowhere** — not README, not INSTALL, not
+the skill, not release notes, not a "coming soon" line. This is a proposal, and
+PROTOCOL is explicit that nothing aspirational reaches the shipped docs:
+*"features that do not exist in v1 appear only in Deferred beyond v1"*
+`[C docs/PROTOCOL.md:7-8]`. A capability matrix for an unbuilt feature is the
+most expensive kind of copy to have to retract.
+
 ---
 
 ## 11. Appendix B delta rows
@@ -864,7 +1070,7 @@ Protocol version integer stays `1`. Three rows. **E1 amends a line marked
 |---|---|---|---|
 | **E1** | Add one row to the §3 catalog: `task.seam` — *"this member proposes, accepts, revises, acknowledges or ends a bounded two-party interface agreement"*. The closed-catalog sentence *"a v1 client MUST NOT originate a type outside this table"* `[C docs/PROTOCOL.md:228-229]` is amended to name v1.1's table. Client edit: `'task.seam'` into `TYPES` `[C lib/envelope.js:41-47]`, enforced for senders at `[C lib/envelope.js:379]`. | `[P§3]` | §11's *"A v2 MAY add new event types"* `[C docs/PROTOCOL.md:1022]` is scoped to **v2**; citing it as cover for a v1.1 change is a category error. This is a deliberate widening, ratified or not at all. It is safe to take because the **receiver** path degrades rather than breaks — a v1.0 peer counts `unknown_type` and ignores it — and the degradation shape is unusually good: a v1.0 peer never accepts, so no seam ever opens, so nothing half-works (§8.5). |
 | **E2** | Add one row to the §3.2 body-schema table: the §7.1 schema. `to` carries the addressing-only MUST-NOTs verbatim. `accept` echoes the terms and a mismatched echo MUST be discarded. Receiver-side authorization per §7.2. | `[P§3.2]` | A type without a frozen body schema is not interoperable. `ttl` rather than `expires_at` because `queueExpiryAt` already gives a `task.*` envelope `base + body.ttl × 1000` `[C lib/state.js:143-146]`, so **§10.3 needs no amendment**; and a `seam.*` namespace would fall to the 3600 s note bound `[C lib/state.js:148-151]` and expire a live agreement in the queue. `hash` is 64 hex because 32 and 48 are refused by the client's own secret filter (§4.3, measured). |
-| **E3** | Add one row to the §3.1 carriage table: `task.seam` travels as an **envelope** — `POST /ws/:id/post` on the relay. It is **not** server state, so it is **not** added to `RELAY_NON_CARRIED_TYPES` `[C lib/envelope.js:49-52]` and **Appendix B A6 is untouched**. It is **not** a priority type — `isPriorityType` `[C lib/envelope.js:53-55]` is unchanged on client and relay. Plus one normative client rule: **a v1.1 client MUST NOT originate `task.seam` on a transport whose `capabilities().authenticated_from` is false.** | `[P§3.1]`, `[P§6.1]` | Carriage must be stated or two clients disagree about where the message lives. Off the priority list because the reserved 5-of-20 floor is frozen on both sides and per-sender-fair round-robin already serves a two-member workspace; a revision that misses a fetch round is still pending at the next one, because the cursor has not advanced past it — delayed, not lost. **No relay work at all: Appendix B B3 already has the deployed relay accepting any type matching the type regex, except the four server-state types** `[C docs/PROTOCOL.md:1121]`. |
+| **E3** | Add one row to the §3.1 carriage table: `task.seam` travels as an **envelope** — `POST /ws/:id/post` on the relay. It is **not** server state, so it is **not** added to `RELAY_NON_CARRIED_TYPES` `[C lib/envelope.js:49-52]` and **Appendix B A6 is untouched**. It is **not** a priority type — `isPriorityType` `[C lib/envelope.js:53-55]` is unchanged on client and relay. Plus two normative client rules, both about **adoption**, neither about carriage of the type. **(i)** A v1.1 client MAY originate and MUST accept `task.seam` on **every** transport. On a transport whose `capabilities().authenticated_from` is false it MUST NOT materialize a received `contract` — and therefore MUST NOT post the resulting `adopt` — without a local human confirmation naming the self-declared sender (§2.6); where that capability is true it MUST materialize and adopt automatically. Nothing else differs by transport: proposing, accepting, receiving, verifying, recording, rendering, authoring and posting revisions are identical, and there is no override flag in either direction. **(ii)** Where no git working tree is present the client MUST still write the contract file and MUST NOT present it as durable (§6.4). | `[P§3.1]`, `[P§6.1]` | Carriage must be stated or two clients disagree about where the message lives. The tier rule is scoped to automatic adoption because that is the only act that rests on `from` being a fact; a blanket refusal to originate would turn a capability *statement* into an off switch, which is not what this codebase does with `authenticated_from`'s siblings — `server_claims: false` `[C lib/transport-ntfy.js:73]` labels claims advisory `[P§5.5]` rather than disabling the most safety-critical primitive in the product. Off the priority list because the reserved 5-of-20 floor is frozen on both sides and per-sender-fair round-robin already serves a two-member workspace; a revision that misses a fetch round is still pending at the next one, because the cursor has not advanced past it — delayed, not lost. **No relay work at all: Appendix B B3 already has the deployed relay accepting any type matching the type regex, except the four server-state types** `[C docs/PROTOCOL.md:1121]`. |
 
 ### Explicitly NOT amended
 
@@ -896,21 +1102,47 @@ text.
 
 ## 12. What this costs, without euphemism
 
-**A genuinely new capability for a malicious member on the relay tier.** A
-member in an accepted seam can write a file into the counterparty's working
-tree at one client-computed path, and can influence what that counterparty's
-Claude builds on its own half. Today a member can post notes (data the model
-must not act on) and claims; it cannot cause a file to appear in a peer's tree.
-`SECURITY §1.2` already places a malicious current member out of scope, and the
-human accepted this seam **with that member by name** — but "out of scope" is
-not a licence to widen what that adversary can do and say nothing. It must be
-**written into SECURITY.md**, not inferred from it. Bounds that hold regardless:
-one path, never source; no shell, install, commit or config; the seam TTL;
-either human's instant kill; and the contract escaped on write and on read.
+**A genuinely new capability for a malicious member, and it is not the same
+capability on both tiers.** On the relay, a member in an accepted seam can write
+a file into the counterparty's working tree at one client-computed path with no
+human in the way, and can influence what that counterparty's Claude builds on
+its own half. Today a member can post notes (data the model must not act on) and
+claims; it cannot cause a file to appear in a peer's tree. On ntfy the automatic
+write does not exist (§2.6), so what a topic-holder gains is narrower — the
+ability to *impersonate* a member and put a confirmation screen in front of a
+human — which is smaller in kind but available to anyone holding the topic, not
+only to a member. `SECURITY §1.2` already places a malicious current member out
+of scope, and the human accepted this seam **with that member by name** — but
+"out of scope" is not a licence to widen what that adversary can do and say
+nothing. Both statements must be **written into SECURITY.md**, not inferred from
+it. Bounds that hold regardless: one path, never source; no shell, install,
+commit or config; the seam TTL; either human's instant kill; and the contract
+escaped on write and on read.
 
-**Relay-only.** The zero-setup on-ramp does not get the feature. I judge this
-correct (§2.6) and it gives the transport ladder a feature-shaped reason to
-exist, but it is a real adoption cost and a product decision, not a technicality.
+**What the relay actually buys, stated as what it provides.** Attribution —
+`from` refused-not-rewritten `[P§9.2]`, which is what makes automatic adoption
+sound and is the entire difference in the feature. Member removal — instant, on
+the recovery key, releasing that member's claims `[P§9.2 row 14]`, where ntfy
+has no revocation at all and offboarding means a new topic, a new secret and a
+re-invite `[C docs/SECURITY.md:82-84]`. Retention — 7 days and 500 messages
+`[C relay/src/lib/config.js:8-9]` against an operator-controlled ~12 h cache.
+Server-held claims, one winner at the source, instead of advisory ones `[P§5.5]`.
+None of that is a feature withheld from the zero-setup rung; each is a thing the
+relay can do that ntfy has no mechanism to do.
+
+**What the zero-setup rung costs, and one thing it is better at.** Every inbound
+revision costs one human `pull`, which is real friction on a fast-iterating
+seam and is the honest reason to upgrade. The publish budget is ~150 transport
+operations per member per day counting heartbeats `[C lib/transport-ntfy.js:28]`,
+and a revision is one of them. Claims are advisory, so the accept-side claim in
+§2.2 can lose to a peer nobody arbitrates. Against that: on ntfy the contract
+text is **encrypted on the wire** `[C lib/transport-ntfy.js:75]` while the relay
+sees plaintext bodies `[C lib/transport-relay.js:104]` `[P SECURITY §1.2]`. The
+ladder is not a straight line, and copy that presents it as one is wrong.
+
+**Without git.** No committed copy, no history, no non-member-commit flag
+(§6.4). The exchange is unaffected; the recovery path after an absence longer
+than the transport's retention is what is gone (§9, "next day").
 
 **Prose is deliberately thin.** No questions in the type, no replies, no
 per-revision notes, no decline. The bet is that a revision is a question that
@@ -956,6 +1188,13 @@ Recorded because they were load-bearing and were re-verified against the tree:
 5. **§5.4's loser MUST post automatically on a peer-derived verdict.** This is
    the existing precedent for a peer-triggered automatic outbound post, and it
    is what makes `adopt` a reuse rather than an invention (§2.5 item 8).
+6. **This document's own earlier draft was wrong to make the feature
+   relay-only** — a MUST NOT on originating `task.seam` where
+   `authenticated_from` is false. That reads an off switch out of a capability
+   *statement*, which is not what this codebase does with its siblings
+   (§1.1). The unverifiable predicate supports gating exactly one act, and the
+   draft's own argument survives as the reason that act is the one gated
+   (§2.6).
 
 ---
 
@@ -967,7 +1206,7 @@ each other and they should never be presented as a ladder to climb.
 | | **`note.info` judged overlap** | **The seam** | **`task.offer` (DELEGATION)** |
 |---|---|---|---|
 | **Speech act** | *"I judge these to be one job; here is the boundary."* | *"Let us build the two halves of one interface together."* | *"Will you do this work?"* |
-| **Human involvement** | none — a Claude posts one note about its own claim | **once per side, ever** | **every exchange** |
+| **Human involvement** | none — a Claude posts one note about its own claim | **once per side, ever** on an authenticated transport; on ntfy, plus one typed confirmation per inbound revision (§2.6) | **every exchange** |
 | **Duration** | one message, terminal | bounded, expiring, revisable | one offer, accepted or not |
 | **New wire surface** | none | one type | one type |
 | **Exists today** | **yes** | proposed | proposed |
