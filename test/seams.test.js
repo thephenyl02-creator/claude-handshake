@@ -36,7 +36,7 @@ const MEMBER_TOKEN = 'hsm_0123456789abcdef_' + 'd'.repeat(64);
 
 let n = 0;
 function tmp(tag) {
-  return fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'hs-seam-' + (tag || '') + (n++) + '-')));
+  return fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'hs-seam-' + (tag || '') + (n++) + '-')));
 }
 
 // ------------------------------------------------------------- fake wrangler --

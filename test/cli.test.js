@@ -18,7 +18,11 @@ const DEAD_ENDPOINT = 'http://127.0.0.1:9';     // discard port: always refused
 
 let n = 0;
 function sandbox() {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'hs-cli-' + (n++) + '-'));
+  // realpathSync.NATIVE, not plain realpathSync: plain resolves junctions but
+  // leaves an 8.3 SHORT NAME alone, and Windows CI runs under a RUNNER~1 temp
+  // path while git reports the long form. That mismatch made path.relative()
+  // emit a '../../../../../../runneradmin/...' escape into a shard record.
+  const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'hs-cli-' + (n++) + '-')));
   const project = path.join(root, 'project');
   fs.mkdirSync(project, { recursive: true });
   return { root, project, data: path.join(root, 'data') };

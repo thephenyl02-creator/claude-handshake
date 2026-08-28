@@ -19,7 +19,7 @@ const stateLib = require('../lib/state');
 
 let n = 0;
 function tmpDir(tag) {
-  return fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'hs-repo-' + (tag || '') + (n++) + '-')));
+  return fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'hs-repo-' + (tag || '') + (n++) + '-')));
 }
 
 // A throwaway git repo. Nothing here touches the developer's real config:

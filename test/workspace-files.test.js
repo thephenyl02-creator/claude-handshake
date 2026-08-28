@@ -27,7 +27,7 @@ const { FilterViolation } = require('../lib/outbound');
 
 let n = 0;
 function tmpDir(tag) {
-  return fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'hs-wf-' + (tag || '') + (n++) + '-')));
+  return fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'hs-wf-' + (tag || '') + (n++) + '-')));
 }
 
 function gitRepo(opts) {
