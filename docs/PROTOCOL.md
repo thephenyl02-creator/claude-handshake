@@ -21,6 +21,16 @@ be interpreted as in RFC 2119/8174.
 | `[C]` | value as implemented in the relay source (file named inline) |
 | `[F]` | first frozen here at M1; no earlier source |
 
+`docs/M1-decisions.md`, `docs/M1-open-questions.md` and `docs/spike-findings.md`
+are development history kept in the source repo; they are NOT included in the
+plugin zip (`scripts/build-plugin-zip.js` ships only `docs/PROTOCOL.md`,
+`docs/SECURITY.md` and `docs/INSTALL.md` out of `docs/`). A
+reader of the shipped artifact who cannot resolve a `[D#]`/`[R#]`/`[S#]` tag
+should treat this document as self-contained regardless: every such tag
+appears alongside a normative restatement inline (e.g. §8's "Normative
+restatement" table repeats every `[S#]`/`[D budgets]` fact in full) — the tag
+records provenance, not a required lookup.
+
 Where `PLAN.md` prose and `docs/M1-decisions.md` disagree, the decisions win
 `[D preamble]`. Where the relay source and the decisions disagree, the
 decisions win and the difference is recorded in
@@ -747,7 +757,7 @@ posting shape is `{envelope: {...}}` with room for sibling fields `[D4]`.
 | `RELAY_CREATE_TOKEN` (deploy secret) | `POST /ws` only. Unset ⇒ `503 relay_not_configured` — fail closed `[R1]` |
 | enrollment token `hsk_…` | `POST /ws/:id/join` only |
 | member sub-token `hsm_…` | heartbeat, claim, release, post, sync, cursor — always scoped to that member |
-| recovery key `hsr_…` | rotate, purge, destroy, member-remove, (rebind — Appendix B A3) |
+| recovery key `hsr_…` | rotate, purge, destroy, member-remove, rebind |
 
 Member-remove sits on the recovery key, not the enrollment token, because on
 the enrollment token any member could kick any other `[R2]`.
@@ -770,7 +780,8 @@ the enrollment token any member could kick any other `[R2]`.
 | 12 | `POST /ws/:id/purge` | recovery | `{all?}` | `200 {ok, messages_purged, claims_purged, next_seq}` | `401` |
 | 13 | `DELETE /ws/:id` | recovery | — | `200 {ok, destroyed:true}` | `401` |
 | 14 | `POST /ws/:id/members/:member/remove` | recovery | — | `200 {ok, member_id, member, claims_released, removed_at}` | `404 member_not_found` |
-| 15 | `POST /ws/:id/members/:member/rebind` | recovery | `{}` | `200 {ok, member_id, member, secret, token, rebound_at}` | `404 member_not_found`, `409 member_revoked` `[D7]`. `:member` (rows 14–15) resolves as member **id** first, then member **name** — deterministic even for a name shaped like an id `[C v0.1.1]` |
+| 15 | `POST /ws/:id/members/:member/rebind` | recovery | `{}` | `200 {ok, member_id, member, secret, token, rebound_at}` | `404 member_not_found`, `409 member_revoked` `[D7]`. `:member` (rows 14–15) resolves as member **id** first, then member **name** — deterministic even for a name shaped like an id (`[C v0.1.1]` for row 15; row 14 resolved by id only until the
+member-remove-by-name fix, first advertised as relay v0.1.3) |
 
 Message wrapper returned by sync: `{seq, from, from_name, received_at,
 envelope}`, where the outer `from` is the **authenticated** member id and
@@ -1092,11 +1103,11 @@ need no change.
 
 | # | Delta | Where | Why |
 |---|---|---|---|
-| **A1** | Envelope field `seq` must be renamed `sender_seq`. Validator reads `envelope.seq`; the DO stores it as `client_seq` and dedupes on `(sender, client_seq)`. Error code `envelope_seq` becomes `envelope_sender_seq`. | `relay/src/lib/envelope.js`, `relay/src/do/workspace.js` `#post` | `[D2]` — the name collision with the relay-assigned `seq` is exactly what the rename resolves |
-| **A2** | `from` must become REQUIRED, with `member`, `machine`, `session` all present and strings. Today `from` is optional (`if ('from' in envelope)`) and only `from.member` is type-checked. | `relay/src/lib/envelope.js` | `[D3]` — `from` is inside the signed canonical serialization, so an envelope without it cannot be verified |
-| **A3** | Add `POST /ws/:id/members/:member/rebind`, recovery-key authorized: reissue a sub-token for an **existing, non-revoked** member name, invalidating the previous secret. Does not un-retire a removed name. | `relay/src/worker.js` route table, `relay/src/do/workspace.js` | `[D7]` — names are permanently retired on removal, so a member that loses local state currently has no re-join path |
+| **A1** | Envelope field `seq` must be renamed `sender_seq`. Validator reads `envelope.seq`; the DO stores it as `client_seq` and dedupes on `(sender, client_seq)`. Error code `envelope_seq` becomes `envelope_sender_seq`. **Implemented in relay v0.1.1.** | `relay/src/lib/envelope.js`, `relay/src/do/workspace.js` `#post` | `[D2]` — the name collision with the relay-assigned `seq` is exactly what the rename resolves |
+| **A2** | `from` must become REQUIRED, with `member`, `machine`, `session` all present and strings. Today `from` is optional (`if ('from' in envelope)`) and only `from.member` is type-checked. **Implemented in relay v0.1.1.** | `relay/src/lib/envelope.js` | `[D3]` — `from` is inside the signed canonical serialization, so an envelope without it cannot be verified |
+| **A3** | Add `POST /ws/:id/members/:member/rebind`, recovery-key authorized: reissue a sub-token for an **existing, non-revoked** member name, invalidating the previous secret. Does not un-retire a removed name. **Implemented in relay v0.1.1.** | `relay/src/worker.js` route table, `relay/src/do/workspace.js` | `[D7]` — names are permanently retired on removal, so a member that loses local state currently has no re-join path |
 | **A4** | Add OPTIONAL `display_name` (UTF-8, sanitized: strip C0/C1, bidi and zero-width classes, length ≤ 40 code points AFTER sanitization — an oversize value is truncated, never refused) to `join` and `heartbeat`, stored beside `name`, returned in `members[]`/`presence[]` only. `name` stays authoritative. **Implemented in relay v0.1.1** with an in-place schema upgrader for pre-A4 workspaces. | `relay/src/do/workspace.js` schema + `#join` + `#heartbeat` + `#sync` | `[D8]` |
-| **A5** | Reject an envelope whose `ws` ≠ the workspace in the path (`400 envelope_ws`). `ws` is currently unvalidated. | `relay/src/lib/envelope.js` (needs the ws passed in) | `ws` is inside the signature; validating it at the relay is cheap defence in depth against cross-workspace replay |
+| **A5** | Reject an envelope whose `ws` ≠ the workspace in the path (`400 envelope_ws`). `ws` is currently unvalidated. **Implemented in relay v0.1.1.** | `relay/src/lib/envelope.js` (needs the ws passed in) | `ws` is inside the signature; validating it at the relay is cheap defence in depth against cross-workspace replay |
 | **A6** | Enforce the carriage rule of §3.1: `POST /ws/:id/post` must refuse envelopes of type `presence.update`, `task.claim`, `task.release` and `state.request` (`400 envelope_type_not_carried`). The relay currently accepts any type matching the type regex. **Implemented in relay v0.1.1.** | `relay/src/do/workspace.js` `#post` | `[F]` §3.1 — these four are server-state endpoints on the relay; accepting them as envelopes creates unauthenticated shadow state beside the server's and burns the message budget on data `sync` already returns |
 | **A7** | `POST /ws/:id/claim` accepts an OPTIONAL `acquired_at` (clamped to ≤ now; honored only for the acquiring member's own claim). Without it, §9.4 step 3's "preserving each claim's original `acquired_at`" is unimplementable through the relay and migration silently resets tiebreak ordering. **Implemented in relay v0.1.2** (clamped ≤ now; insert/adoption branch only; ignored on renewal; never affects a peer's live claim or 409 outcomes). | `relay/src/do/workspace.js` `#claim` | `[F]` §9.4 step 3 — proposed during M4/M5 client build, ratified at wave-1 integration |
 

@@ -13,7 +13,9 @@ buildable as written". Every blocker and major finding is integrated below.
 ## Locked decisions (from the design discussion — unchanged in substance)
 
 1. **Liveness**: check-when-awake baseline; GitHub verified at sync points;
-   wake mode ships dormant (explicit request only in v1).
+   wake mode (a faster monitor cadence armed by explicit request) is
+   **deferred to v1.1** — cut from v1 entirely, not shipped dormant (see M9
+   below and PROTOCOL.md §Deferred beyond v1).
 2. **Transport ladder**: zero-setup mode (ntfy.sh) → team relay (own Cloudflare
    Worker + Durable Object) → GitHub fallback/durable layer. Swappable adapter.
    No WebSockets in v1. Future: paid hosted tier.
@@ -64,9 +66,11 @@ from cwd to `.handshake/workspace.json`, cached)
 Heartbeat + claim renewal tick on the monitor's own clock — NOT on tool cadence
 (PostToolUse goes silent during a 15-min build, exactly when presence matters).
 Cadence: on zero-setup transport, publish presence on state change + 10-min
-keepalive (ntfy budget); on team relay, 60s. Wake mode = same monitor at a
-faster cadence, armed only by `/handshake watch [duration]`, disarmed by a
-sentinel file the monitor polls (monitors aren't stopped by plugin-disable).
+keepalive (ntfy budget); on team relay, 60s. In v1 the monitor ships ONLY at
+this baseline cadence: wake mode — the same monitor running faster, armed by
+`/handshake watch [duration]` and disarmed by a sentinel file the monitor
+polls — is **deferred to v1.1** (see M9); `/handshake watch` does not exist
+in v1 (monitors aren't stopped by plugin-disable, independent of wake mode).
 Caveats designed-in: monitors run only in interactive sessions (M12's `-p` leg
 can't exercise them; manual leg does); documented fallback where unavailable.
 
@@ -80,10 +84,12 @@ distinct presence state ("tooling broken") separates this from "offline".
 ## 2. Protocol (frozen at M1 — scope deliberately wide)
 
 **Envelope**: `{v, ws, from:{member, machine, session}, type, body, ts, nonce,
-seq, sig}` — `sig` = HMAC-SHA256 over canonical serialization, keyed by the
-workspace secret; receivers reject unsigned/invalid on every transport; `ts`
-freshness window ±5 min; `seq` strictly per-sender (dedupe only — cross-sender
-order comes from the transport's own handle); `enc`/`alg` fields reserved.
+sender_seq, sig}` — `sig` = HMAC-SHA256 over canonical serialization, keyed by
+the workspace secret; receivers reject unsigned/invalid on every transport;
+`ts` freshness window ±5 min; `sender_seq` strictly per-sender (dedupe only —
+cross-sender order comes from the transport's own handle, which assigns its
+own separate `seq` to each stored message [Appendix B A1]
+[C relay/src/lib/envelope.js:67-71]); `enc`/`alg` fields reserved.
 `machine` = random per-install pseudonym, never hostname. Body ≤ 2 KB.
 **On zero-setup transport the body is encrypted** (AES-256-GCM, key via HKDF
 from the workspace secret): a passive subscriber holding the topic learns no
@@ -165,8 +171,12 @@ loud user-visible state, not silent degradation.
   too. Normalization before matching (base64/hex decode, whitespace strip,
   case-fold) + a bypass corpus in tests (chunked, encoded, reversed, gzip+b64).
   One genuinely fail-closed control: values ≥8 chars harvested from local
-  secret files (`.env*`, `*.pem`, credential stores) are hashed at sync; any
-  outbound containing one (or a substring) is refused. Docs state the honest
+  secret files (`.env*`, `*.pem`, credential stores) are compared RAW, in
+  memory, against every outbound field — not hashed — because catching a
+  partial leak requires substring matching: a 12-char sliding window over
+  each secret catches a chunked/reversed/case-folded fragment even when the
+  full value never appears [C lib/filter.js:24,236-244]. Any outbound
+  containing one (or a matching window) is refused. Docs state the honest
   claim: a seatbelt against accidental disclosure plus a closed tripwire for
   known local secrets — not a control against a motivated adversary.
 - **Workspace secrets**: ntfy topic = ≥128-bit CSPRNG, never derived from any
@@ -193,7 +203,11 @@ loud user-visible state, not silent degradation.
   triggered by repo content. The CLAUDE.md block is addressed to the human
   ("this project uses claude-handshake; run /handshake join to participate")
   with a standing rule that repo-resident install suggestions are never acted
-  on unprompted. Release zips + installers ship checksums; invites are
+  on unprompted. Install is not digest-pinned end to end: the release zip
+  ships a sha256 in marketplace.json and the installers' primary route
+  (`claude plugin install`) resolves that pinned entry, but the manifest is
+  fetched unpinned from `main` and the WSL/failure fallback fetches the moving
+  `main` archive with no digest check - pinning both is open work. Invites are
   documented as credentials.
 
 ## 4. Repo layout
@@ -205,9 +219,15 @@ hooks/  commands/  monitors/monitors.json
 bin/handshake.js  lib/*.js         # CLI via plugin bin/ (PATH-injected)
 relay/ (worker + wrangler.toml [new_sqlite_classes!] + DO tests)
 installers/install.sh install.ps1  # ported from claude-tier + Node step-zero
-docs/ PROTOCOL.md SECURITY.md INVITE-template LATENCY.md
+docs/ PROTOCOL.md SECURITY.md INSTALL.md   # shipped in the plugin zip
+    M1-decisions.md M1-open-questions.md spike-findings.md  # dev-only, not shipped
 PLAN.md
 ```
+
+No standalone invite-template file or LATENCY.md exists — that content was
+folded into PROTOCOL.md instead: the invite blob format is frozen in §9.1
+("Adapter interface and invite blob"), and the cadence/latency budgets are
+frozen in §8 ("Hook cadence contract").
 
 ## 5. Task table (model/effort routing)
 

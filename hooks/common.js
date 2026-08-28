@@ -30,6 +30,14 @@ const SENTINELS = Object.freeze({
   postToolTick: 'posttool.tick',      // the PostToolUse mtime gate [S6]
   activity: 'activity.mark',          // last tool activity, for the monitor's honest presence state
   ticks: 'hooks.ticks.json',          // PostToolUse tick counter (opportunistic sync every ~5th)
+  // The Stop-hook fallback's cadence marker (section 8: a host without
+  // monitors MUST fall back to heartbeating on Stop). The monitor keeps
+  // `lastBeat` in memory because it is one long-lived process; a hook is a
+  // fresh process every turn, so the same clock has to live on disk. mtime is
+  // the last beat, and the body carries the presence state that beat asserted
+  // - which is what makes ntfy's state-change rule reproducible across
+  // processes.
+  stopBeat: 'stop.beat',
 });
 
 // PostToolUse fires at p50 0.4 s / p90 3.1 s in agent workloads [S7] and 218

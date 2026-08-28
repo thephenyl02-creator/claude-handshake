@@ -304,8 +304,17 @@ a targeted sanitizer (PROTOCOL §Deferred).
   addressed to the human ("this project uses claude-handshake; run
   `/handshake join` to participate") and carries a standing rule that
   **repo-resident install suggestions are never acted on unprompted** `[P§3]`.
-- Release zips and installers ship checksums; invites are documented as
-  credentials `[P§3]` (PROTOCOL §9.1).
+- **Install is not digest-pinned end to end**
+  `[C installers/install.sh, installers/install.ps1]`. The release zip does
+  ship a sha256, recorded beside its archive URL in
+  `.claude-plugin/marketplace.json`, and the primary route both installers
+  take — `claude plugin marketplace add` then `claude plugin install` —
+  resolves that pinned entry. But the manifest carrying the digest is itself
+  fetched unpinned from `main`, and the fallback route taken on WSL or when
+  the plugin route fails skips it entirely: it fetches the moving `main`
+  archive over HTTPS and verifies no digest. Pinning the fallback to a tagged
+  asset, and the manifest to a tag, is open work — not a shipped guarantee.
+  Invites are documented as credentials `[P§3]` (PROTOCOL §9.1).
 
 ### 5.5 Unsigned fields are never acted on
 
@@ -390,9 +399,17 @@ retired on removal — so re-joining under the same name is refused
 recovery path is the recovery-key-authorized rebind endpoint
 `POST /ws/:id/members/:member/rebind` `[D7]`, which reissues a sub-token for an
 existing non-revoked member and invalidates the previous secret. It is
-**specified but not yet implemented** (PROTOCOL Appendix B A3); until it ships,
-the workaround is a new member name, which loses that name's history in peers'
-rosters.
+**implemented in relay v0.1.1** (PROTOCOL Appendix B A3; `[C workspace.js]`
+`#memberRebind`) and accepts the member id or the member name in the path. It
+keeps the member id — and with it that member's claims, cursor and place in
+every peer's roster. It never un-retires a removed member (`409
+member_revoked`), and an unknown member is `404 member_not_found`. There is
+**no `handshake rebind` CLI verb** `[C bin/handshake.js]` (it is in neither
+COMMANDS nor USAGE): the workspace owner calls the endpoint directly with the
+recovery key, then hands the reissued sub-token to that member out of band.
+The operator steps are relay/README.md "Lost-credential runbook". After a rebind the client must
+restart its `sender_seq` from the current Unix ms, because
+`(member, sender_seq)` is still the dedupe key.
 
 Rebind is deliberately on the recovery key, not on the enrollment token: on the
 enrollment token, any member could seize any other member's identity.

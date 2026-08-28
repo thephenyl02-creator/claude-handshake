@@ -177,8 +177,14 @@ carrying your live claims across. Full details and the free-tier limits:
 | `claim <subject>` | Claim a subject in your own words ("onboarding flow") | no |
 | `release` | Give up a claim | no |
 | `done` | Finish and record a claim | no |
+| `post <type>` | Send a note, overlap warning, or task-change alert. Flags differ by type: `note.*` needs `--text` (optional `--paths`, the only type that takes it); `warn.overlap` needs `--subject`, `--peer`, `--peer-subject` and is refused below a 50 % subject overlap; `task.change` needs `--subject` plus `--change files\|ttl\|tiebreak_loss\|scope` | no |
 | `mute` | Stop peer chatter from reaching your context (local only — your own claims/notes still go out) | no |
+| `unmute` | Alias for `mute off` (local only) | no |
 | `rest` | Sign off for this session; stop broadcasting | no |
+| `sync` | Fetch unread items and peer presence; read-only unless `--inject-digest` advances the local watermark | no |
+| `cursor` | Show (or `--commit` to persist) where reading last left off | no |
+| `tasks` | Read-only projection over `.handshake/tasks/*.md`. Warns when a shard's last commit came from an email other than the one recorded for *that shard's own member* — the check is per-shard, not a membership lookup — and reports `unverified` (a note, not a warning) where no email was recorded for that member, or where the shard's last commit could not be read at all | no |
+| `guard` | Report the fail-closed private-repo verdict; `--ack-rotated` records a local acknowledgment only | no |
 | `doctor` | Pass/warn/fail health check (Node, workspace, credentials, transport, private-repo guard, git history, more) | no |
 | `deploy-relay` | Deploy your own Cloudflare relay in **one command** (no `wrangler` typing) and print the invite | yes |
 | `upgrade` | Migrate an existing zero-setup workspace → team relay (deploys one for you if you have none) | yes |

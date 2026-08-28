@@ -165,9 +165,20 @@ The transport never judges meaning (PROTOCOL §5.2); neither does a score. Pick:
 
 Emit `warn.overlap` only after judging genuine overlap, never on the raw score:
 `node bin/handshake.js warn overlap --subject "<yours>" --peer <member>
---peer-subject "<theirs>" --jaccard <int ≥50>`.
+--peer-subject "<theirs>"`.
+
+Do not compute a score to pass in. The CLI measures it from the two subjects
+and that measured value is what goes on the wire, so `jaccard` stays a fact the
+peer can check rather than a number you asserted. (`--jaccard` is still
+accepted so the older command form does not break; it is ignored.) The judgement
+above is still entirely yours — what you decide is *whether* to run this
+command, not what number it carries.
 
 ### 3.3 Jaccard < 50 → nothing. No warning, no note, no mention.
+
+The CLI enforces this floor too: below 50 it prints a refusal and sends
+nothing, whatever you pass it. Treat that as the rule confirming itself, not as
+something to work around.
 
 ### 3.4 PreToolUse path warning → stop, check, decide
 
@@ -336,7 +347,7 @@ to `.handshake/` by hand: those files are a projection of claims (PROTOCOL §5).
 | Release | `node bin/handshake.js release "<subject>" --reason done\|superseded\|tiebreak_loss\|manual` |
 | Finish | `node bin/handshake.js done "<subject>" --summary "…"` |
 | Note | `node bin/handshake.js note discovery\|error\|fix\|blocker\|info "<text>" [--paths a,b] [--subject "<claim>"]` |
-| Overlap warning | `node bin/handshake.js warn overlap --subject "…" --peer <member> --peer-subject "…" --jaccard <50-100>` |
+| Overlap warning | `node bin/handshake.js warn overlap --subject "…" --peer <member> --peer-subject "…"` (the score is measured for you; refused under 50) |
 | Presence at the edges | `node bin/handshake.js presence working\|waiting\|blocked\|tooling_broken [--note "…"]` |
 | Status | `node bin/handshake.js status [--json]` |
 | Sign off | `node bin/handshake.js leave --reason signoff\|session_end\|error --summary "…"` |

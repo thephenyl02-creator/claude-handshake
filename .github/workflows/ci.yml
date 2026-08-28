@@ -1,0 +1,91 @@
+name: CI
+
+# claude-handshake CI. Runs the two deterministic, zero-model-token suites
+# ('npm test' at repo root and in relay/) plus a cheap parse/lint gate over
+# the installers. Nothing here needs a secret, publishes, deploys, or tags.
+#
+# Deliberately NOT here: an e2e job. 'npm run test:e2e' drives a real
+# `wrangler dev` process and needs two free ports; the CI runner environment
+# for that hasn't been worked out, so it stays a manually-run suite (see
+# e2e/run.js's own header) rather than a job that would be flaky or silently
+# skipped here.
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+        # windows-latest is the platform this suite is actually developed
+        # and verified on (see docs/spike-findings.md, test/deploy.test.js's
+        # header on the Windows npx.cmd spawn path). The ubuntu-latest leg
+        # has NEVER been run before this workflow existed - it may well be
+        # red on the first push. That is information about an unverified
+        # platform, not a bug in this workflow; do not "fix" it by dropping
+        # the ubuntu leg.
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          # Node 24: what this repo is developed against (docs/spike-findings.md
+          # header; `node -v` on the dev machine) and inside the range both
+          # relay/package.json devDependencies require - wrangler ^4.123.0
+          # ("engines": ">=22.0.0") and vitest ^4.1.0
+          # ("engines": "^20.0.0 || ^22.0.0 || >=24.0.0").
+          node-version: '24'
+
+      # Root package.json has no "dependencies"/"devDependencies" and no
+      # package-lock.json - nothing to install before the root suite.
+      - name: root suite (npm test)
+        run: npm test
+
+      - name: relay suite install (npm ci in relay/)
+        run: npm ci
+        working-directory: relay
+
+      - name: relay suite (npm test in relay/)
+        run: npm test
+        working-directory: relay
+
+  installer-lint:
+    name: installer syntax gate (bash -n + shellcheck)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Parse/lint ONLY - installers/install.sh is never executed here.
+      - name: bash -n (parse only)
+        run: bash -n installers/install.sh
+      - name: shellcheck
+        # shellcheck ships preinstalled on ubuntu-latest runners.
+        # --severity=error only: this is the first time these 1,025 lines have
+        # ever been linted, so style/info/warning notes would make the gate red
+        # on arrival for cosmetics and get it deleted. Real bugs still fail.
+        # Lower the severity once the backlog below error is cleaned up.
+        run: shellcheck --severity=error installers/install.sh
+
+  installer-lint-windows:
+    name: installer syntax gate (PowerShell parse-only)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: PowerShell parser (parse only, never dot-sourced or invoked)
+        shell: pwsh
+        run: |
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path 'installers/install.ps1'),
+            [ref]$null,
+            [ref]$errors
+          ) | Out-Null
+          if ($errors -and $errors.Count -gt 0) {
+            $errors | ForEach-Object { Write-Error $_.Message }
+            exit 1
+          }
+          Write-Host "installers/install.ps1 parses cleanly ($($errors.Count) errors)."

@@ -187,7 +187,22 @@ function renewLocal(state, now) {
 
 function quit() { try { process.exit(0); } catch (_) { /* ignore */ } }
 
-process.on('uncaughtException', () => quit());
-process.on('unhandledRejection', () => quit());
+// The host starts this file as a SCRIPT - `node "${CLAUDE_PLUGIN_ROOT}/monitors/heartbeat.js"`
+// [C monitors/monitors.json] - so the clock, and the exit-0 safety net that
+// belongs to a long-lived monitor, are armed on direct execution only.
+// Requiring the module (test/heartbeat.test.js reaches the fold/push helpers
+// that way) must neither start a monitor nor install process-wide handlers in
+// its host, which would swallow that host's own failures.
+if (require.main === module) {
+  process.on('uncaughtException', () => quit());
+  process.on('unhandledRejection', () => quit());
+  main();
+}
 
-main();
+// The fold/push surface exists so the rules of PROTOCOL section 7.2 rule 3 can
+// be executed by a test instead of only described in one. `beat` is exported
+// for a second reason: hooks/stop.js is section 8's no-monitor fallback and
+// MUST take the same beat, not a second implementation of one - a duplicate
+// would drift on the fold, the push delta or the local renewal and only be
+// caught in production.
+module.exports = { beat, fold, pendingPush, markPushed, renewLocal, MAX_FILES, POLL_MS };

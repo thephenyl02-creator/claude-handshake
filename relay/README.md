@@ -24,7 +24,8 @@ That is the whole thing. From a terminal it is `handshake deploy-relay`. It
 runs every step below for you — you never type `wrangler`:
 
 - fetches `wrangler` through `npx` (nothing is installed globally, and the
-  version is pinned to the one this relay was tested against);
+  version is pinned to the wrangler **major** this relay was tested against —
+  see "Wrangler version" below);
 - opens your browser once to authorize Cloudflare;
 - deploys the Worker (from a writable copy — wrangler needs to write `.wrangler/`);
 - checks `GET /health` returns `{ok:true, protocol:1}`;
@@ -54,7 +55,7 @@ npx wrangler deploy
 
 ```sh
 curl https://claude-handshake-relay.<your-subdomain>.workers.dev/health
-# {"ok":true,"service":"claude-handshake-relay","version":"0.1.2","protocol":1}
+# {"ok":true,"service":"claude-handshake-relay","version":"0.1.3","protocol":1}
 ```
 
 Then create the workspace and hand the invite to your team:
@@ -88,6 +89,51 @@ finds your hostname cannot create workspaces on your account's quota.
 Editing anything under `src/` then `npx wrangler deploy` again is safe: Durable
 Object storage survives a redeploy. Do **not** change `new_sqlite_classes` in
 `wrangler.toml` — see below.
+
+### Wrangler version
+
+The README used to say wrangler is "pinned to the one this relay was tested
+against." That overstated it. `lib/deploy.js` only extracts the **major**
+version out of `relay/package.json`'s wrangler dependency and runs
+`wrangler@<major>` [C lib/deploy.js:118-131] — so `deploy-relay` always fetches
+whatever the latest `4.x.y` (or current major) happens to be that day, not a
+single exact version. That is a deliberate tradeoff (an exact pin would mean
+manually bumping it forever, and Cloudflare rotates the CLI often), not a bug
+— just don't read "pinned" as "frozen to one version."
+
+### Running it locally
+
+`npm run dev` inside `relay/` starts `wrangler dev`, but `POST /ws` - workspace
+creation - fails closed with `503 relay_not_configured` out of the box, which
+stops you at step one: without a workspace there is nothing for the other
+endpoints to act on. That is the same
+guard that protects a real deployment: `POST /ws` checks `env.RELAY_CREATE_TOKEN`
+before it will mint a workspace, and refuses with that 503 when it's unset
+[C src/worker.js:49]. Locally, nothing sets it for you.
+
+Two ways to set it, in order of convenience:
+
+```sh
+cd relay
+npx wrangler dev --var RELAY_CREATE_TOKEN:dev-token
+```
+
+This is the exact recipe the e2e harness uses to run the real relay locally
+[C e2e/lib/relay-dev.js:4-7] — SQLite-backed Durable Objects work fine under
+`wrangler dev`, so this exercises `relay/src` verbatim rather than a stub.
+
+Or, since `relay/.gitignore` already anticipates it [C relay/.gitignore:3],
+create `relay/.dev.vars` (wrangler loads it automatically, and it is
+git-ignored so the token never gets committed):
+
+```
+RELAY_CREATE_TOKEN=dev-token
+```
+
+then just `npm run dev`. Prefer `.dev.vars` if you want a value that persists
+across `npm run dev` invocations without retyping it; use `--var` for a
+one-off or scripted run. Either way, `dev-token` is only a local convenience —
+never reuse it as a real deploy's secret.
 
 ---
 
@@ -129,6 +175,31 @@ running around the clock does not.
 
 `GET /` and `GET /health` also touch a Durable Object (the per-IP rate limiter),
 so do not point an uptime monitor at `/health` every 10 seconds.
+
+### Knowing when it is down, without spending budget to find out
+
+A `/health` poll competes with the same 100k/day account-wide limit described
+above, so the check itself should stay a rounding error next to the
+~1,500 calls/day/member figure already budgeted. **Every 5 minutes is a safe
+cadence**: 288 requests/day
+(`24 * 60 / 5 = 288`), 0.29% of the 100k daily limit and negligible
+next to a single active member's own traffic. Remember that each poll is *two*
+metered items, not one — `GET /health` runs the per-IP rate limiter before it
+answers [C relay/src/worker.js:70-73] — so it is 288 Worker requests against
+the 100k, plus 288 Durable Object requests metered separately. At a
+10-second cadence the same sum is 8,640 a day, which is why the line above
+says not to do that.
+
+Polling is not the only possible option, but it is the only one this README
+can vouch for. Look for a **Notifications** section in your Cloudflare dashboard; whether
+it offers a Workers usage or quota alert on your plan, and at what threshold
+such an alert would fire, is Cloudflare's to define and can change without
+warning — this repo has no way to verify it, so check your own dashboard
+rather than trusting a claim from here. If your account does offer one it
+costs no requests and would warn you *approaching* the cliff, where a
+`/health` poll only tells you *after* requests have already started failing.
+Worth the ten seconds it takes to look; not something to rely on until you
+have seen it there yourself.
 
 ---
 
@@ -281,6 +352,36 @@ old secret dies the moment the new one is minted, so a rebind is also the right
 answer to a sub-token that leaked from one machine.
 
 ---
+
+## Multiple Cloudflare accounts
+
+`wrangler.toml` has no `account_id`, and `deploy-relay` does not prompt for
+one. If your login belongs to more than one Cloudflare account/org, the two
+paths behave differently, and the automated one is the worse of them:
+
+- **By hand** (`npx wrangler login` / `npx wrangler deploy` in your terminal):
+  stdin and stdout are your terminal, so if wrangler wants the account
+  disambiguated you can see the question and answer it.
+- **Through `handshake deploy-relay`: you cannot.** The deploy step spawns
+  wrangler with captured stdio and no TTY on stdin
+  [C lib/deploy.js:72-92, :232-247] — only `wrangler login` inherits stdio, and
+  only so the browser flow reaches you [C lib/deploy.js:194]. An interactive
+  account picker has nowhere to appear and no way to be answered. What you
+  actually see, after a silent wait, is one of two single lines: a
+  generic `wrangler deploy failed (<first line of wrangler's output>)`, since
+  the failure classifier has no branch for an ambiguous account
+  [C lib/deploy.js:452-465], or `wrangler deploy timed out` once the 300-second
+  deploy timeout expires [C lib/deploy.js:48].
+
+Either way the fix is the same, and on the `deploy-relay` path it is the *only*
+fix: set `CLOUDFLARE_ACCOUNT_ID` in your shell environment before you start. It
+reaches wrangler untouched, on every step — whoami, login, deploy and
+`secret put` all go through one runner that spawns with
+`Object.assign({}, process.env, ...)` [C lib/deploy.js:81], i.e. a full copy of
+your environment plus a couple of non-interactive flags, so anything you
+already export is passed straight through with nothing to configure on the
+relay's side. Find the id on the Cloudflare dashboard's Workers & Pages
+overview page for the account you want to deploy to.
 
 ## Configuration
 

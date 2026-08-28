@@ -53,6 +53,13 @@ async function main() {
   H.line(H.C.dim + '  node ' + process.version + ' · ' + process.platform + ' · repo ' + H.REPO_ROOT + H.C.off);
   H.line(H.C.dim + '  zero model tokens; real relay under wrangler dev; real adapter against a mock ntfy' + H.C.off);
 
+  h.deviation('PLAN section 5 (task table, M12 row) says the CI leg isolates the two simulated Claude ' +
+    'sessions with "separate `CLAUDE_CONFIG_DIR`". The harness isolates them with HANDSHAKE_STATE_DIR per ' +
+    'member instead (e2e/lib/members.js env()). Both are real: lib/state.js stateRoot() honors ' +
+    'HANDSHAKE_STATE_DIR first and CLAUDE_CONFIG_DIR/handshake second, so this is the higher-precedence, ' +
+    'narrower override of the same state root - it isolates exactly what the config dir would have ' +
+    'isolated here, and nothing else. CLAUDE_CONFIG_DIR is left unset/inherited for both members.');
+
   try {
     const root = h.tempDir('handshake-e2e-');
     H.line(H.C.dim + '  temp root ' + root + H.C.off);

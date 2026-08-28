@@ -22,11 +22,16 @@ if (!version || !/^\d+\.\d+\.\d+$/.test(version)) {
   process.exit(2);
 }
 
-// The plugin distribution — mirrors package.json "files". NOT test/, e2e/,
-// spike/, node_modules, .git, .wrangler.
-// NOTE: marketplace.json is deliberately NOT in the archive. It carries this
-// zip's own sha256, so including it would make the hash depend on itself.
-// (claude-tier's release format excludes it for the same reason.)
+// The plugin distribution. This list and package.json "files" name the SAME
+// set — test/build-plugin-zip.test.js asserts it, so npm and the zip cannot
+// drift apart. NOT test/, e2e/, spike/, node_modules, .git, .wrangler.
+// NOTE: both spell out '.claude-plugin/plugin.json' rather than naming the
+// '.claude-plugin' directory, because marketplace.json sits beside it and must
+// stay out: it carries this zip's own sha256 in plugins[].source.sha256, so
+// shipping it would make the hash depend on itself. (claude-tier's release
+// format excludes it for the same reason.) Nothing is lost by omitting it —
+// the catalog is fetched from the repo over raw.githubusercontent.com, never
+// from the archive [C docs/INSTALL.md:131].
 const INCLUDE = [
   '.claude-plugin/plugin.json',
   'LICENSE', 'README.md',

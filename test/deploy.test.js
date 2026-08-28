@@ -1,5 +1,5 @@
 'use strict';
-// M9: the wrapped relay deploy (`handshake deploy-relay`).
+// The wrapped relay deploy (`handshake deploy-relay`).
 //
 // NO real Cloudflare and NO network anywhere in this file. Two mocking layers:
 //

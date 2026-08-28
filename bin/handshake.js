@@ -34,7 +34,7 @@ const T = require('../lib/transport');
 const deployLib = require('../lib/deploy');
 const { FilterViolation } = require('../lib/outbound');
 
-const CLIENT = 'claude-handshake/0.0.1';
+const CLIENT = 'claude-handshake/0.1.4';
 const INJECT_CAP = 5;                 // PROTOCOL section 6.2
 
 // ------------------------------------------------------------------ argv ----
@@ -864,12 +864,19 @@ async function cmdPost(args) {
       process.exitCode = 2; return;
     }
     const key = subject.subjectKey(subj), peerKey = subject.subjectKey(peerSubject);
-    // An explicit --jaccard is accepted (SKILL.md 8) but never trusted past
-    // the floor: the computed value governs, because section 5.2 makes the
-    // >= 50 check a MUST on the emitter.
-    const computed = subject.jaccardPercent(key, peerKey);
-    const claimed = args.flags.jaccard !== undefined ? Number(args.flags.jaccard) : computed;
-    const pct = Number.isInteger(claimed) && claimed >= 50 && claimed <= 100 ? Math.min(claimed, 100) : computed;
+    // The computed value governs, always. SKILL.md 3.3 is unconditional -
+    // below 50 there is no warning, no note, no mention - so a claimed number
+    // must not be able to carry an emission past the floor. And `jaccard` on
+    // the wire (PROTOCOL 3) is a measurement of these two keys, so it has to
+    // BE the measurement: sending a model's assertion under that name labels a
+    // guess as a fact for the peer who reads it.
+    //
+    // An explicit --jaccard is still accepted, so the SKILL.md 8 command form
+    // keeps working unchanged - it is ignored, not honoured. The model's
+    // judgement is already expressed by choosing to run this command at all;
+    // the percentage is not the place to express it. (This used to let any
+    // integer 50..100 win, which is how a computed 20 could go out as an 80.)
+    const pct = subject.jaccardPercent(key, peerKey);
     if (pct < 50) { err('handshake: jaccard is ' + pct + '% - below the 50% floor, no warning emitted (PROTOCOL 5.2)'); return; }
     body = { subject: subj, subject_key: key, peer_member: peer, peer_subject: peerSubject, peer_subject_key: peerKey, jaccard: pct };
   } else if (type === 'task.change') {
@@ -1229,7 +1236,7 @@ async function cmdStatus(args) {
   if (report.local_switches.muted) out('MUTED (local): peer chatter is not injected. Outbound posting is unaffected.');
   if (report.local_switches.resting) out('RESTING: broadcasting stopped this session; listening continues; claims left to expire on TTL.');
   // section 8: a host without monitors MUST say so.
-  if (!monitors) out('monitors unavailable, heartbeating on turn boundaries');
+  if (!monitors) out('monitors unavailable, heartbeating on turn boundaries: the Stop hook beats at the transport cadence (at most once per ' + (ctx.cfg.transport === 'relay' ? 60 : 600) + 's), not once per turn');
   // Honest framing: section 7.1's safe fallback classifies HOOK-driven
   // sessions. A typed CLI command is an explicit human action, so only a
   // proven child (CLAUDE_CODE_CHILD_SESSION=1) is refused - the fallback is
@@ -1306,6 +1313,110 @@ async function cmdLeave(args) {
 
 // ================================================================ doctor ====
 
+// The plugin-load verdict, split out from the spawn that produces it so it can
+// be exercised without a host CLI. The classification is where this check has
+// actually broken: at a 20s timeout `claude plugin list` timed out 3/10 on
+// Windows and a healthy, enabled plugin was reported as "not installed" (see
+// the spawnSync comment below). No test could catch that, because every test
+// forces the whole check off with HANDSHAKE_SKIP_HOST_CHECKS=1.
+//
+// Pure by construction: it reads only the fields of the spawnSync result
+// (stdout, stderr, error, signal) and touches nothing else, so the table in
+// test/doctor-classifier.test.js can hand it result objects directly.
+function classifyPluginList(r) {
+  const text = String((r.stdout || '') + (r.stderr || ''));
+  // Checked FIRST and on its own: a timed-out probe was killed before it could
+  // answer, so whatever little it printed is not evidence of anything. This
+  // must never fall through to the "not installed" wording below.
+  const timedOut = Boolean(r.error && (r.signal === 'SIGTERM' || /ETIMEDOUT/i.test(String(r.error.code || r.error.message))));
+  if (timedOut) {
+    return { level: 'warn', message: '`claude plugin list` did not answer within 60s - UNKNOWN, not a verdict. Run it yourself to check.' };
+  }
+  if (r.error || !text.includes('claude-handshake')) {
+    return { level: 'warn', message: 'could not read `claude plugin list` (not installed as a plugin, or the CLI is unavailable)' };
+  }
+
+  // Read OUR entry and stop. The record shape is the one that
+  // installers/install.sh read_plugin_state() parses, and that parser was
+  // written against real `claude plugin list` output:
+  //
+  //     <name>@<marketplace>          <- entry header
+  //       Status: enabled | disabled | failed to load
+  //       Error:  Failed to load plugin <id>: ...
+  //                                   <- a blank line ends the entry
+  //
+  // Two rules are load-bearing, both taken from that parser:
+  //   1. A field line is a FIELD, never a header. The CLI renders
+  //      "Error: Failed to load plugin <id>: ..." - which CONTAINS our id, so
+  //      an id-first rule treats the most informative line in the output as
+  //      the start of a new entry and loses it.
+  //   2. The entry ends at the blank line. Reading past it charged a DIFFERENT
+  //      plugin's failure to us - the bug this rewrite fixes.
+  const FIELD = /^\s*(Status|Error|Version|Scope|Note):/;
+  // install.sh matches the QUALIFIED id (name@marketplace), which is what keeps
+  // another plugin's prose - "conflicts with claude-handshake somehow" - from
+  // being read as our entry header. Mirror that, and fall back to the bare name
+  // only when this listing carries no qualified form at all.
+  const qualified = text.includes('claude-handshake@');
+  // In the unqualified fallback a header must also start at column 0: fields
+  // are indented in every rendering we have seen, so this is what stops an
+  // indented "Error: ... claude-handshake ..." from posing as our entry.
+  const isHeader = (line) => (qualified
+    ? line.includes('claude-handshake@')
+    : (!/^\s/.test(line) && line.includes('claude-handshake')));
+  const fields = [];
+  let inEntry = false;
+  let listed = false;
+  for (const line of text.split(/\r?\n/)) {
+    const isField = inEntry && FIELD.test(line);
+    // The header line is KEPT, not skipped: some renderings put the state on
+    // the same row ("claude-handshake@0.1.4  Status: enabled") while the shape
+    // install.sh parses puts it on an indented line below. Keeping the header
+    // makes both readable without having to know which one this host prints.
+    if (!isField && isHeader(line)) { inEntry = true; listed = true; fields.push(line); continue; }
+    if (!inEntry) continue;
+    if (/^\s*$/.test(line)) { inEntry = false; continue; }
+    fields.push(line);
+  }
+  // The name occurred, but never as an entry header - e.g. only inside another
+  // plugin's Error: text. That is not evidence that we are installed.
+  if (!listed) {
+    return { level: 'warn', message: 'could not read `claude plugin list` (not installed as a plugin, or the CLI is unavailable)' };
+  }
+
+  const body = fields.join('\n');
+  const errLine = /Error:\s*(.+)/.exec(body);
+  const cause = errLine ? ' ' + errLine[1].trim() : '';
+  const status = (fields.find((l) => /Status:/i.test(l)) || '').toLowerCase();
+
+  // Word forms first: they are what the CLI actually prints, tested in the same
+  // order install.sh tests them. The symbol form stays as belt-and-braces for a
+  // renderer that marks the row instead of spelling the state out.
+  if (/failed/.test(status) || /status:\s*[x\u00d7]/.test(status) || /failed to load/i.test(body)) {
+    return {
+      level: 'fail',
+      message: 'the plugin is installed but FAILED TO LOAD - no hook fires, so nothing coordinates.' + cause,
+    };
+  }
+  // Disabled is neither broken nor working: every hook is off, so nothing
+  // coordinates, but one command undoes it. install.sh has always separated
+  // this from enabled; this classifier used to report it AS enabled.
+  if (/disabled/.test(status)) {
+    return {
+      level: 'fail',
+      message: 'the plugin is installed but DISABLED - no hook fires, so nothing coordinates. Re-enable it in the plugin host.',
+    };
+  }
+  if (/enabled/.test(status)) {
+    return { level: 'pass', message: 'claude plugin list reports it enabled' };
+  }
+  // Listed, but with no Status line we understand. Not a verdict either way.
+  return {
+    level: 'warn',
+    message: 'listed by `claude plugin list`, but its Status line could not be read - UNKNOWN, not a verdict. Run it yourself to check.' + cause,
+  };
+}
+
 // Three-valued self-check: pass | warn | fail. Nothing here guesses; an
 // unknown is reported as unknown.
 async function cmdDoctor(args) {
@@ -1335,22 +1446,8 @@ async function cmdDoctor(args) {
       // enabled plugin as "not installed". A slow CLI must never read as a
       // missing one.
       { encoding: 'utf8', timeout: 60000, shell: false });
-    const out = String((r.stdout || '') + (r.stderr || ''));
-    const timedOut = Boolean(r.error && (r.signal === 'SIGTERM' || /ETIMEDOUT/i.test(String(r.error.code || r.error.message))));
-    if (timedOut) {
-      add('plugin loaded', 'warn', '`claude plugin list` did not answer within 60s - UNKNOWN, not a verdict. Run it yourself to check.');
-    } else if (r.error || !out.includes('claude-handshake')) {
-      add('plugin loaded', 'warn', 'could not read `claude plugin list` (not installed as a plugin, or the CLI is unavailable)');
-    } else {
-      const block = out.slice(out.indexOf('claude-handshake'));
-      const errLine = /Error:\s*(.+)/.exec(block);
-      if (/Status:\s*[x×]|failed to load/i.test(block)) {
-        add('plugin loaded', 'fail', 'the plugin is installed but FAILED TO LOAD - no hook fires, so nothing coordinates.' +
-          (errLine ? ' ' + errLine[1].trim() : ''));
-      } else {
-        add('plugin loaded', 'pass', 'claude plugin list reports it enabled');
-      }
-    }
+    const verdict = classifyPluginList(r);
+    add('plugin loaded', verdict.level, verdict.message);
   } catch (e) {
     add('plugin loaded', 'warn', 'plugin-load check skipped: ' + String(e && e.message).slice(0, 80));
   }
@@ -2054,4 +2151,4 @@ if (require.main === module) {
   main(process.argv.slice(2)).then(() => { if (process.stdin.isTTY === false) process.stdin.pause(); });
 }
 
-module.exports = { main, parseArgs, USAGE, COMMANDS };
+module.exports = { main, parseArgs, USAGE, COMMANDS, classifyPluginList };
