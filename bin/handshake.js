@@ -62,26 +62,53 @@ function json(value) { process.stdout.write(JSON.stringify(value, null, 2) + '\n
 
 // ---------------------------------------------------------------- prompts --
 
+// Piped stdin arrives in chunks that need not align with lines: one read can
+// carry BOTH answers a command asks for. Whatever follows the newline this
+// ask() consumed is kept here for the next ask() - otherwise it dies with the
+// paused stream and the second prompt hangs on an empty stdin. `join` is the
+// path that needs this: section 9.1 forbids --yes, so it asks twice
+// (confirmation, then member name) and --as only sidesteps the second.
+let pipedRest = '';
+let pipedEnded = false;
+
+function takePipedLine() {
+  const nl = pipedRest.indexOf('\n');
+  if (nl < 0) return null;
+  const line = pipedRest.slice(0, nl).replace(/\r$/, '');
+  pipedRest = pipedRest.slice(nl + 1);
+  return line;
+}
+
 // Credentials NEVER come from argv. Echo is suppressed on a TTY; on a pipe the
 // value is read as one line so CI and tests can drive it.
 function ask(promptText, opts) {
   const o = opts || {};
   return new Promise((resolve) => {
     if (!process.stdin.isTTY) {
-      let buf = '';
-      process.stdin.setEncoding('utf8');
-      const onData = (chunk) => {
-        buf += chunk;
-        const nl = buf.indexOf('\n');
-        if (nl >= 0) {
-          process.stdin.off('data', onData);
-          process.stdin.pause();
-          resolve(buf.slice(0, nl).replace(/\r$/, ''));
-        }
-      };
       process.stderr.write(promptText);
+      const buffered = takePipedLine();
+      if (buffered !== null) { resolve(buffered); return; }
+      // Stdin already ended: answer from what is left rather than waiting for
+      // an 'end' that will never fire again.
+      if (pipedEnded) { const rest = pipedRest; pipedRest = ''; resolve(rest.replace(/\r?\n$/, '')); return; }
+      process.stdin.setEncoding('utf8');
+      const cleanup = () => { process.stdin.off('data', onData); process.stdin.off('end', onEnd); };
+      const onData = (chunk) => {
+        pipedRest += chunk;
+        const line = takePipedLine();
+        if (line === null) return;
+        cleanup();
+        process.stdin.pause();
+        resolve(line);
+      };
+      const onEnd = () => {
+        cleanup();
+        pipedEnded = true;
+        const rest = pipedRest; pipedRest = '';
+        resolve(rest.replace(/\r?\n$/, ''));
+      };
       process.stdin.on('data', onData);
-      process.stdin.on('end', () => resolve(buf.replace(/\r?\n$/, '')));
+      process.stdin.on('end', onEnd);
       process.stdin.resume();
       return;
     }
@@ -864,12 +891,19 @@ async function cmdPost(args) {
       process.exitCode = 2; return;
     }
     const key = subject.subjectKey(subj), peerKey = subject.subjectKey(peerSubject);
-    // The computed value governs, always. SKILL.md 3.3 is unconditional -
-    // below 50 there is no warning, no note, no mention - so a claimed number
-    // must not be able to carry an emission past the floor. And `jaccard` on
-    // the wire (PROTOCOL 3) is a measurement of these two keys, so it has to
-    // BE the measurement: sending a model's assertion under that name labels a
-    // guess as a fact for the peer who reads it.
+    // The computed value governs, always. The floor is PROTOCOL 5.2's and it
+    // governs the WARNING only: `warn.overlap.jaccard` is reported as
+    // round(100 x J) and MUST be >= 50, and PROTOCOL 3.2 defines that field as
+    // a measurement of these two subject keys. So it has to BE the measurement:
+    // a claimed number must not be able to carry an emission past the floor,
+    // and sending a model's assertion under that name labels a guess as a fact
+    // for the peer who reads it.
+    //
+    // SKILL.md 3.3 now permits a NOTE below the floor (`note.*` carries no
+    // score field and no threshold), so refusing here is not silence: the
+    // sub-floor case - genuine overlap worded differently - goes out as one
+    // `note.info` naming both subjects. That is the route to point at, and the
+    // refusal line below names it.
     //
     // An explicit --jaccard is still accepted, so the SKILL.md 8 command form
     // keeps working unchanged - it is ignored, not honoured. The model's
@@ -877,7 +911,12 @@ async function cmdPost(args) {
     // the percentage is not the place to express it. (This used to let any
     // integer 50..100 win, which is how a computed 20 could go out as an 80.)
     const pct = subject.jaccardPercent(key, peerKey);
-    if (pct < 50) { err('handshake: jaccard is ' + pct + '% - below the 50% floor, no warning emitted (PROTOCOL 5.2)'); return; }
+    if (pct < 50) {
+      err('handshake: jaccard is ' + pct + '% - below the 50% floor, no warning emitted (PROTOCOL 5.2).');
+      err('           If you judge these to be the same work anyway, that goes out as ONE note, not a');
+      err('           warning: `handshake note info "<why they are one job>" --subject "' + subj + '"` (SKILL.md 3.3).');
+      return;
+    }
     body = { subject: subj, subject_key: key, peer_member: peer, peer_subject: peerSubject, peer_subject_key: peerKey, jaccard: pct };
   } else if (type === 'task.change') {
     const subj = typeof args.flags.subject === 'string' ? args.flags.subject : null;
@@ -1804,8 +1843,9 @@ async function cmdRest(args) {
 // write the new config"), SECURITY.md §3. ONE wrapped command so a founder
 // deploys their own Cloudflare relay without ever typing `wrangler`: the
 // mechanics live in lib/deploy.js (all via `npx --yes wrangler@<pinned major>`,
-// shell:false, Windows-safe); this function is the wiring, the workspace
-// persistence (identical to `init`'s config format) and the credential print.
+// shell:false, Windows-safe); this function is the wiring, the founder's own
+// enrolment, the workspace persistence (identical to `init`'s config format)
+// and the credential print.
 async function cmdDeployRelay(args) {
   // (a) a child NEVER deploys - it would provision a relay and mint credentials
   // beside its parent's (PROTOCOL 7.2 rule 1).
@@ -1833,8 +1873,9 @@ async function cmdDeployRelay(args) {
     out('  work dir:     ' + workDir);
     out('  wrangler:     npx --yes ' + deployLib.wranglerSpecFrom(relayDir).spec + ' (nothing installed globally)');
     out('  workspace:    ' + name);
-    out('  steps:        check wrangler -> whoami/login -> deploy -> /health -> put RELAY_CREATE_TOKEN (stdin) -> POST /ws -> save config + invite');
-    out('  credentials:  the create token is piped to `wrangler secret put` over stdin, never argv;');
+    out('  steps:        check wrangler -> whoami/login -> deploy -> /health -> put RELAY_CREATE_TOKEN (stdin) -> POST /ws -> join as founder -> save config + invite');
+    out('  credentials:  the create token is piped to `wrangler secret put` over stdin, never argv, then');
+    out('                shown ONCE (you need it to create a second workspace) and never persisted;');
     out('                the recovery key is shown ONCE and never written to the repo (SECURITY.md §3).');
     return;
   }
@@ -1847,13 +1888,13 @@ async function cmdDeployRelay(args) {
   }
 
   out('deploying team relay...');
+  // fetchImpl is left to lib/deploy -> transport-relay's default (the one
+  // network chokepoint); the CLI never names fetch itself. `args.hooks` is a
+  // test-only injection seam (a mock wrangler runner + mock fetch); parseArgs
+  // never populates it, so production always takes the real defaults.
+  const hooks = args.hooks || {};
   let prov;
   try {
-    // fetchImpl is left to lib/deploy -> transport-relay's default (the one
-    // network chokepoint); the CLI never names fetch itself. `args.hooks` is a
-    // test-only injection seam (a mock wrangler runner + mock fetch); parseArgs
-    // never populates it, so production always takes the real defaults.
-    const hooks = args.hooks || {};
     prov = await deployLib.provisionRelay({
       relayDir, workDir, name, out, err, runner: hooks.runner, fetchImpl: hooks.fetchImpl,
     });
@@ -1869,6 +1910,29 @@ async function cmdDeployRelay(args) {
   // (PROTOCOL §1); it is minted locally, exactly as `init` does.
   const secret = envelope.newSecret();
 
+  // (g) the founder is a MEMBER of the workspace they just deployed - the same
+  // enrolment `init` does, for the same reason: without a member id and a
+  // sub-token every later relay call sends an undefined bearer token and gets
+  // 401, and the monitor runs with stdio ignored so no human ever sees it.
+  const founderName = typeof args.flags.as === 'string' && args.flags.as.trim()
+    ? args.flags.as.trim()
+    : defaultMemberName();
+  let founderMember = founderName;
+  let founderToken = null;
+  try {
+    const joined = await relay.joinWorkspace({
+      origin, ws: created.ws, enrollmentToken: created.enrollment_token,
+      member: founderName, fetchImpl: hooks.fetchImpl,
+    });
+    founderMember = joined.member_id || founderName;
+    founderToken = joined.token;
+  } catch (e) {
+    // Not fatal: the workspace exists and the invite still works. Say so
+    // plainly rather than leaving a half-state the user cannot diagnose.
+    err('handshake: workspace created, but enrolling you as a member failed (' +
+      (e && e.code ? e.code : 'unknown') + '). Run `handshake join <invite>` to finish.');
+  }
+
   // (h) persist the workspace in the guarded local state, in the SAME config
   // shape `init` writes - not a second format.
   const state = stateLib.openState(created.ws);
@@ -1879,6 +1943,9 @@ async function cmdDeployRelay(args) {
     s.secret = secret.toString('base64url');
     s.enrollment_token = created.enrollment_token;
     s.recovery_key = created.recovery_key;
+    s.member = founderMember; s.member_name = founderName;
+    if (founderToken) s.member_token = founderToken;
+    s.joined_at = Date.now();
     s.created_at = Date.now();
     s.project_dir = process.cwd();
     return s;
@@ -1891,6 +1958,7 @@ async function cmdDeployRelay(args) {
   out('  id:        ' + created.ws);
   out('  transport: relay');
   out('  endpoint:  ' + origin);
+  out('  member:    ' + (founderToken ? founderMember : founderMember + '  (NOT enrolled - see the message above)'));
   out('  state:     ' + state.dir);
   if (process.platform === 'win32') out('  note:      ' + stateLib.WINDOWS_ACL_NOTE);
 
@@ -1922,9 +1990,16 @@ async function cmdDeployRelay(args) {
   out('  These are shown ONCE and are never retrievable again:');
   out('    enrollment token: ' + created.enrollment_token);
   out('    recovery key:     ' + created.recovery_key);
+  out('    create token:     ' + prov.createToken + '   (RELAY_CREATE_TOKEN)');
   out('  Store the recovery key OUT OF BAND - a password manager, NOT the repo, not chat, not a');
   out('  commit. It is immutable in v1 (SECURITY.md §3): lose it and the workspace must be');
   out('  recreated, and anyone who holds it can rotate, purge or destroy the workspace.');
+  out('  The create token is what `handshake init --relay ' + origin + '` and');
+  out('  `handshake upgrade --relay ...` prompt for, so keep it if you ever want a SECOND workspace');
+  out('  on this relay. Store it the same way, out of band. It lives in your Cloudflare Worker as a');
+  out('  `wrangler secret` (SECURITY.md §3) and is deliberately NOT written to local state or the');
+  out('  repo, so this print is the only copy you get - replace a lost one with');
+  out('  `npx wrangler secret put RELAY_CREATE_TOKEN` in ' + prov.workDir + '.');
   out('');
   out('  relay URL: ' + origin);
   out('');
@@ -1948,6 +2023,15 @@ async function cmdUpgrade(args) {
   }
   let origin = typeof args.flags.relay === 'string' ? args.flags.relay.replace(/\/+$/, '') : null;
   let createToken = null;
+  // Set ONLY when this run deployed the relay itself. It gates the create-token
+  // print at the end: a founder who passed --relay typed the token in from their
+  // own store, and echoing it back would put a credential they already hold into
+  // the transcript for nothing.
+  let deployedHere = null;
+  // Test-only injection seam, same contract as cmdDeployRelay's: a mock wrangler
+  // runner and a mock fetch. parseArgs never populates `hooks`, so production
+  // always takes lib/deploy -> transport-relay's real defaults.
+  const hooks = args.hooks || {};
 
   if (!origin) {
     // No --relay: offer to deploy one in place (PROTOCOL §9.4 step 1). The
@@ -1973,10 +2057,11 @@ async function cmdUpgrade(args) {
       // the migrated ntfy secret across.
       const prov = await deployLib.provisionRelay({
         relayDir, workDir, name: ctx.cfg.name,
-        out, err, createWorkspace: false,
+        out, err, createWorkspace: false, runner: hooks.runner, fetchImpl: hooks.fetchImpl,
       });
       origin = prov.origin;
       createToken = prov.createToken;
+      deployedHere = { workDir: prov.workDir || workDir };
     } catch (e) {
       if (e instanceof deployLib.DeployError) { err('handshake: ' + e.guidance); process.exitCode = 1; return; }
       err('handshake: deploy failed (' + (e && e.message ? e.message : String(e)) + ')');
@@ -1992,10 +2077,10 @@ async function cmdUpgrade(args) {
 
   let created, joined;
   try {
-    created = await deployLib.createWorkspaceWithRetry({ origin, createToken, name: ctx.cfg.name });
+    created = await deployLib.createWorkspaceWithRetry({ origin, createToken, name: ctx.cfg.name, fetchImpl: hooks.fetchImpl });
     joined = await relay.joinWorkspace({
       origin, ws: created.ws, enrollmentToken: created.enrollment_token,
-      member: ctx.cfg.member_name || ctx.cfg.member,
+      member: ctx.cfg.member_name || ctx.cfg.member, fetchImpl: hooks.fetchImpl,
     });
   } catch (e) {
     err('handshake: relay refused the migration (' + (e && e.code) + ')');
@@ -2082,6 +2167,25 @@ async function cmdUpgrade(args) {
   out('  These are shown ONCE:');
   out('    enrollment token: ' + created.enrollment_token);
   out('    recovery key:     ' + created.recovery_key);
+  // Seam 2, the upgrade half. When THIS run deployed the relay, `upgrade` minted
+  // the create token, piped it to `wrangler secret put` and spent it on one
+  // workspace - so without this print the founder owns a relay they can never
+  // create a second workspace on, exactly the gap `deploy-relay` was fixed for.
+  // Printed only on that branch: with --relay the founder supplied the token
+  // themselves and it is not ours to echo back.
+  if (deployedHere) {
+    out('    create token:     ' + createToken + '   (RELAY_CREATE_TOKEN)');
+  }
+  out('  Store the recovery key OUT OF BAND - a password manager, NOT the repo, not chat, not a');
+  out('  commit. It is immutable in v1 (SECURITY.md §3).');
+  if (deployedHere) {
+    out('  The create token is what `handshake init --relay ' + origin + '` and');
+    out('  `handshake upgrade --relay ...` prompt for, so keep it if you ever want a SECOND workspace');
+    out('  on this relay. Store it the same way, out of band. It lives in your Cloudflare Worker as a');
+    out('  `wrangler secret` (SECURITY.md §3) and is deliberately NOT written to local state or the');
+    out('  repo, so this print is the only copy you get - replace a lost one with');
+    out('  `npx wrangler secret put RELAY_CREATE_TOKEN` in ' + deployedHere.workDir + '.');
+  }
   out('');
   out('  Re-invite peers with `handshake invite`. Members never seen on the new');
   out('  transport before the dual-read window closes must be re-invited out of band.');
@@ -2123,7 +2227,7 @@ const USAGE = [
   '  mute      [on|off]        stop injecting peer chatter (LOCAL only)',
   '  unmute                    alias for `mute off`',
   '  rest      [--summary "..."]  stop broadcasting this session; keep listening',
-  '  deploy-relay [--name <n>] [--work-dir <path>] [--yes] [--print-only]  deploy your own Cloudflare relay (one command)',
+  '  deploy-relay [--name <n>] [--as <member name>] [--work-dir <path>] [--yes] [--print-only]  deploy your own Cloudflare relay (one command)',
   '  upgrade   [--relay <origin>] [--yes]  migrate zero-setup -> team relay (PROTOCOL 9.4)',
   '  doctor    [--json]',
   '',

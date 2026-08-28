@@ -32,6 +32,13 @@ buildable as written". Every blocker and major finding is integrated below.
 **Two review-driven wording amendments (need Fenil's nod):**
 - "instant mode" → **"zero-setup mode"** — delivery latency is the peer's next
   turn boundary; "instant" promises what check-when-awake can't.
+  **Correction (Fenil, 2026-08-28):** as built, the delivery point is not the
+  turn boundary — the Stop hook is outbound/push-only and runs no inbound
+  sync `[C hooks/stop.js]`. Inbound refresh actually happens at SessionStart
+  and on roughly every 5th PostToolUse tick `[C hooks/session-start.js:19]
+  [C hooks/post-tool-use.js:95-116]`, i.e. the next prompt after one of those
+  has landed, not the turn boundary itself. See §6 Acceptance criteria for
+  the as-built statement of this same point.
 - "one-command install" → **"one paste, guided"** — the marketplace flow has an
   interactive scope prompt and sometimes `/reload-plugins`; the beginner invite
   is still a single paste, but the self-check must be three-valued
@@ -56,7 +63,7 @@ from cwd to `.handshake/workspace.json`, cached)
 | UserPromptSubmit | **sync, local-cache-only, timeout 3s, zero network** | ALWAYS injects the standing block (~600 chars: peer roster + live claims + standing rules) + new-items digest when present; waits ≤500ms on the pending marker, else injects one honest "peer sync in progress" line |
 | PreToolUse (Edit\|Write\|NotebookEdit) | sync, fast | overlap gate: target path vs peers' cached claim globs → warn/block BEFORE the write (the only moment an overlap warning is useful) |
 | PostToolUse (Edit\|Write\|Bash matcher) | async | "what am I touching" updates (progressive files[] on my claim); opportunistic sync every ~5th tick; mtime-sentinel checked before Node spawns |
-| Stop | async | sync-and-write-digest (the real turn boundary — this is what makes LD1's "check-when-awake" true within a session); debounced presence update |
+| Stop | async | **outbound only, as built**: the presence heartbeat's fallback when no monitor is running — folds the turn's touched files, pushes the delta, renews presence, at most once per transport keepalive (60s relay / 600s ntfy) and skipped entirely for a child session, after `rest`, or once posting has stopped `[C hooks/stop.js]`. It runs **no** inbound sync and writes **no** digest — the digest cache is written by SessionStart and by PostToolUse's every-5th-tick refresh `[C hooks/session-start.js:19]` `[C hooks/post-tool-use.js:95-116]`. *Design intent, not yet built:* make the turn boundary itself a sync point, so LD1's "check-when-awake" is true within a session on the turn clock rather than on the tool clock |
 | SessionEnd | async, best-effort | **parting note** (Fenil, 2026-08-14): post "signing off — what was done" to the relay (ws.leave + final task state) AND write it to the local task shard so it lands in the next commit — a closed Claude always leaves its record in both the live and durable layers |
 
 **No hook ever asserts `idle`** — readers derive idle/quiet/stale from
@@ -260,8 +267,13 @@ Scenario (relay leg, then zero-setup leg with documented advisory semantics):
 A: "implement feature X"; B: "fix the API issue", separate accounts/machines.
 - A's first turn: standing block present (empty roster OK), A claims "feature X"
   semantically; claim visible to B before B edits (PreToolUse gate live).
-- B discovers the response-shape dependency → note; A's Claude surfaces it at
-  its next turn boundary WITHIN the same session and adjusts.
+- B discovers the response-shape dependency → note; A's Claude surfaces it
+  WITHIN the same session and adjusts. As built the delivery point is the
+  first prompt after an inbound refresh has landed — SessionStart, or a
+  PostToolUse tick `[C hooks/post-tool-use.js:95-116]` — not the turn boundary
+  itself; the Stop hook does not sync (see the hook table above). So the
+  criterion is met by A doing tool work, and a turn spent only talking can
+  still miss it.
 - Claims released on done; task shard written and included in the next
   user-requested commit; no coordination-only commits.
 - No command typed to *cause* coordination; read-only views permitted.

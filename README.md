@@ -125,11 +125,25 @@ claude plugin install claude-handshake@claude-handshake
 Then, inside a project: `/handshake init` to create a workspace, or
 `/handshake join <invite>` to join one a teammate already created.
 
+Every verb is reached through `/handshake` — neither this route nor the
+one-line installers put a `handshake` executable on your `PATH`. If you want
+one anyway, install the package itself with npm from a clone; its `bin` map is
+the only thing that creates the shim:
+
+```sh
+git clone https://github.com/thephenyl02-creator/claude-handshake
+npm install -g ./claude-handshake      # now `handshake doctor` works in any shell
+```
+
+That is a convenience for people who like a terminal, not a second install
+route: the plugin — hooks, monitor, `/handshake` — still has to be installed
+by one of the routes above for coordination to run at all.
+
 ## Quickstart
 
 1. **Founder**, inside the shared project's repo: `/handshake init` (creates a
-   workspace; add `--claude-md` — or re-run `handshake init --claude-md` from a
-   terminal — to leave a short, human-addressed note in `CLAUDE.md` telling
+   workspace; add `--claude-md` — or re-run `/handshake init --claude-md`
+   later — to leave a short, human-addressed note in `CLAUDE.md` telling
    teammates this project uses claude-handshake).
 2. **Founder**: `/handshake invite` — prints a one-line invite. It's a
    credential; send it the way you'd send a password.
@@ -146,7 +160,11 @@ No command exists to *cause* coordination beyond that — read-only views like
 
 **Moving to a team relay (optional, for real work).** The zero-setup transport
 is public and disposable; for a private, authenticated live layer, deploy your
-own free Cloudflare Worker with **one command** — you never type `wrangler`:
+own free Cloudflare Worker with **one command once you're signed in to
+Cloudflare** — you never type `wrangler` yourself. The first run needs that
+sign-in done in a real terminal first (`deploy-relay` checks stdin and refuses
+before spawning anything if it isn't one): run `npx --yes wrangler@4 login`
+there, finish the browser step, then come back here:
 
 ```
 /handshake deploy-relay
@@ -198,7 +216,7 @@ decision tree and worked examples:
 ## Requirements
 
 - **Node.js 18+ (20+ recommended)** — the CLI and every hook shell out to
-  `node`. `handshake doctor` checks this and reports honestly instead of
+  `node`. `/handshake doctor` checks this and reports honestly instead of
   guessing; the installers refuse to finish without a working `node --version`.
 - **macOS, Linux, or Windows**, with Claude Code installed (the installer
   fetches it for you if it's missing).
@@ -231,8 +249,8 @@ truncation order, and rendered examples:
 
 ## Troubleshooting
 
-- **Is it actually running?** `/handshake doctor` (or `handshake doctor` from a
-  terminal) runs a pass/warn/fail check: Node version, workspace resolution,
+- **Is it actually running?** `/handshake doctor` runs a pass/warn/fail
+  check: Node version, workspace resolution,
   state-dir permissions, relay reachability, credentials, git working tree,
   the private-repo guard, tracked-secret and git-history scans, and
   child-mode detection. Nothing in it guesses — an unknown reads as unknown,

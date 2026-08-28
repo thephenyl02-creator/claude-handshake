@@ -10,28 +10,71 @@ status honesty all live there.
 **No arguments → `status`.** Unknown first word → print the verb list, run
 nothing. A verb with a missing required argument → ask for it, never guess.
 
+## Running the CLI
+
+Every row below is one process. The path is written absolute on purpose: you
+run these from the **human's project directory**, not from the plugin, so a
+project-relative `bin/handshake.js` resolves inside their repo, where it does
+not exist.
+
+`CLAUDE_PLUGIN_ROOT` is what the host sets for plugin-loaded files — the same
+variable the hook manifest is written against `[C hooks/hooks.json]`. The
+one-line installers' fallback route does not depend on it at all: at install
+time they rewrite that placeholder throughout this very file into an absolute
+directory before copying it into place
+`[C installers/install.sh:836-858,889]` `[C installers/install.ps1:813-845]`
+— so the paths in the table may already read as a literal directory, and that
+is correct, not corruption. (PowerShell spells the variable
+`$env:CLAUDE_PLUGIN_ROOT`.)
+
+**If it expands to nothing**, resolve the CLI once and reuse that answer for
+the rest of the session. Do not assume it is populated: the Bash tool's
+environment is not guaranteed to carry the host's plugin variables — its
+sibling `CLAUDE_PLUGIN_DATA` is known not to reach it, which is why local
+state is anchored elsewhere `[C lib/state.js:47-57]`. The snippet below spells
+the variable with a `:-` default so the installers' rewrite pass leaves it
+alone; that is deliberate, since a rewritten fallback recipe could not act as
+a fallback.
+
+```sh
+# prints the CLI, or nothing at all
+for c in "${CLAUDE_PLUGIN_ROOT:-/nonexistent}/bin/handshake.js" \
+         "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"/handshake-plugin/*/bin/handshake.js; do
+  [ -f "$c" ] && printf 'node %s\n' "$c" && break
+done
+command -v handshake
+```
+
+The loop covers the plugin root and the installers' fallback copy at
+`~/.claude/handshake-plugin/<version>/` `[C installers/install.sh:57,750]`.
+`command -v handshake` finds a PATH shim, which exists **only** where the
+package was installed with npm (the `bin` map, `[C package.json]`) — neither
+the plugin marketplace route nor either one-line installer creates one. If all
+three come back empty, say the CLI could not be located and stop. Never invent
+a path, and never fall back to `bin/handshake.js` relative to the project.
+
 | Verb | Command | Confirm first? |
 |---|---|---|
-| `status` | `node bin/handshake.js status` | no — read-only |
-| `init` | `node bin/handshake.js init [--relay <origin> \| --ntfy <base-url>] [--name <name>] [--as <name>] [--no-repo] [--claude-md]` | **yes** |
-| `join <blob>` | `node bin/handshake.js join <blob>` | **yes — always, see below** |
-| `invite` | `node bin/handshake.js invite` | **yes** — output may be a credential |
-| `claim <subject>` | `node bin/handshake.js claim "<subject>"` | no |
-| `release` | `node bin/handshake.js release "<subject>" --reason manual` | no |
-| `done` | `node bin/handshake.js done "<subject>" --summary "<…>"` | no |
-| `mute` | `node bin/handshake.js mute [on\|off]` | no — local only |
-| `unmute` | `node bin/handshake.js unmute` | no — local only, alias for `mute off` |
-| `rest` | `node bin/handshake.js rest` | no |
-| `sync` | `node bin/handshake.js sync [--limit <n>] [--json] [--inject-digest] [--guard-refresh]` | no — read-only unless `--inject-digest` is given, which only advances the local watermark |
-| `cursor` | `node bin/handshake.js cursor [--commit]` | no — read-only unless `--commit`, which just records where the last read left off |
-| `tasks` | `node bin/handshake.js tasks [--json] [--limit <n>]` | no — read-only projection over `.handshake/tasks/*.md` |
-| `guard` | `node bin/handshake.js guard [--refresh] [--json] [--ack-rotated]` | no — read-only; `--ack-rotated` records a local acknowledgment only, see below |
-| `post` | `node bin/handshake.js post <note.discovery\|note.error\|note.fix\|note.blocker\|note.info\|warn.overlap\|task.change> <flags>` — **the flags differ per type, see below**; `--paths` is `note.*`-only, and `--text` is required there but optional on `task.change` | no |
-| `doctor` | `node bin/handshake.js doctor` | no — read-only |
-| `deploy-relay` | `node bin/handshake.js deploy-relay` | **yes** — deploys a Worker to their Cloudflare account |
-| `upgrade` | `node bin/handshake.js upgrade` | **yes** |
+| `status` | `node "$CLAUDE_PLUGIN_ROOT/bin/handshake.js" status` | no — read-only |
+| `init` | `node "$CLAUDE_PLUGIN_ROOT/bin/handshake.js" init [--relay <origin> \| --ntfy <base-url>] [--name <name>] [--as <name>] [--no-repo] [--claude-md]` | **yes** |
+| `join <blob>` | `node "$CLAUDE_PLUGIN_ROOT/bin/handshake.js" join <blob>` | **yes — always, see below** |
+| `invite` | `node "$CLAUDE_PLUGIN_ROOT/bin/handshake.js" invite` | **yes** — output may be a credential |
+| `claim <subject>` | `node "$CLAUDE_PLUGIN_ROOT/bin/handshake.js" claim "<subject>"` | no |
+| `release` | `node "$CLAUDE_PLUGIN_ROOT/bin/handshake.js" release "<subject>" --reason manual` | no |
+| `done` | `node "$CLAUDE_PLUGIN_ROOT/bin/handshake.js" done "<subject>" --summary "<…>"` | no |
+| `mute` | `node "$CLAUDE_PLUGIN_ROOT/bin/handshake.js" mute [on\|off]` | no — local only |
+| `unmute` | `node "$CLAUDE_PLUGIN_ROOT/bin/handshake.js" unmute` | no — local only, alias for `mute off` |
+| `rest` | `node "$CLAUDE_PLUGIN_ROOT/bin/handshake.js" rest` | no |
+| `sync` | `node "$CLAUDE_PLUGIN_ROOT/bin/handshake.js" sync [--limit <n>] [--json] [--inject-digest] [--guard-refresh]` | no — read-only unless `--inject-digest` is given, which only advances the local watermark |
+| `cursor` | `node "$CLAUDE_PLUGIN_ROOT/bin/handshake.js" cursor [--commit]` | no — read-only unless `--commit`, which just records where the last read left off |
+| `tasks` | `node "$CLAUDE_PLUGIN_ROOT/bin/handshake.js" tasks [--json] [--limit <n>]` | no — read-only projection over `.handshake/tasks/*.md` |
+| `guard` | `node "$CLAUDE_PLUGIN_ROOT/bin/handshake.js" guard [--refresh] [--json] [--ack-rotated]` | no — read-only; `--ack-rotated` records a local acknowledgment only, see below |
+| `post` | `node "$CLAUDE_PLUGIN_ROOT/bin/handshake.js" post <note.discovery\|note.error\|note.fix\|note.blocker\|note.info\|warn.overlap\|task.change> <flags>` — **the flags differ per type, see below**; `--paths` is `note.*`-only, and `--text` is required there but optional on `task.change` | no |
+| `doctor` | `node "$CLAUDE_PLUGIN_ROOT/bin/handshake.js" doctor` | no — read-only |
+| `deploy-relay` | `node "$CLAUDE_PLUGIN_ROOT/bin/handshake.js" deploy-relay` | **yes** — deploys a Worker to their Cloudflare account |
+| `upgrade` | `node "$CLAUDE_PLUGIN_ROOT/bin/handshake.js" upgrade` | **yes** |
 
-Also routed: `rotate` → `node bin/handshake.js rotate [--grace <seconds>]`,
+Also routed: `rotate` → `node "$CLAUDE_PLUGIN_ROOT/bin/handshake.js" rotate [--grace <seconds>]`,
 **yes** — requires the recovery key and is an offboarding action; never run it
 on your own initiative. The flag is `--grace`, taking 0..86400 seconds; a
 hostile departure is `rotate --grace 0` (SECURITY §7.1 step 3 - §7.2 is the

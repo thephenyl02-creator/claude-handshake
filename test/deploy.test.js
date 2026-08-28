@@ -158,9 +158,52 @@ test('whoami parses logged-in vs not-authenticated from the text, not the exit c
   assert.equal(deployLib.whoami({ runner: makeFakeRunner({ loggedIn: false }), spec: 'wrangler@4' }).loggedIn, false);
 });
 
+test('whoami separates "wrangler said you are not logged in" from "wrangler said nothing"', () => {
+  // A timeout or a crash also yields loggedIn:false. Without `answered`, the
+  // guidance printed after it would assert a fact wrangler never stated.
+  const silent = () => ({ ok: false, status: 1, stdout: '', stderr: '', error: null, timedOut: true, missing: false });
+  const dead = deployLib.whoami({ runner: silent, spec: 'wrangler@4' });
+  assert.equal(dead.loggedIn, false);
+  assert.equal(dead.answered, false);
+  assert.equal(deployLib.whoami({ runner: makeFakeRunner({ loggedIn: true }), spec: 'wrangler@4' }).answered, true);
+  assert.equal(deployLib.whoami({ runner: makeFakeRunner({ loggedIn: false }), spec: 'wrangler@4' }).answered, true);
+});
+
+test('login refuses in ~no time when stdin is not a terminal, instead of hanging out the login timeout', () => {
+  const runner = makeFakeRunner({ loggedIn: false });
+  assert.throws(() => deployLib.login({ runner, spec: 'wrangler@4', interactive: false }), (e) => {
+    assert.equal(e.name, 'DeployError');
+    assert.equal(e.code, 'login-needs-terminal');
+    // The guidance must name the command that works where they can run it, and
+    // how to come back - not just report the refusal.
+    assert.match(e.guidance, /npx --yes wrangler@4 login/);
+    assert.match(e.guidance, /own terminal/i);
+    assert.match(e.guidance, /re-run `handshake deploy-relay`/);
+    // And it must say what the wait would have cost, since that silence is the
+    // whole bug being fixed.
+    assert.match(e.guidance, new RegExp(String(Math.round(deployLib.TIMEOUTS.login / 60000)) + ' minutes'));
+    return true;
+  });
+  assert.equal(runner.calls.length, 0, 'nothing may be spawned: the point is to fail before the wait');
+});
+
+test('the terminal check defaults to this process\'s own stdin', (t) => {
+  // Under `node --test` stdin is a pipe - the same shape a Claude Code Bash
+  // call has - so the DEFAULT (no `interactive` passed, exactly how bin/ calls
+  // it) must refuse. This is the seam the whole finding turns on.
+  if (process.stdin.isTTY) return t.skip('this test process has a real terminal on stdin');
+  assert.equal(deployLib.stdinIsTerminal({}), false);
+  assert.equal(deployLib.stdinIsTerminal({ interactive: true }), true, 'an explicit caller still wins');
+  const runner = makeFakeRunner({ loggedIn: false });
+  assert.throws(() => deployLib.login({ runner, spec: 'wrangler@4' }), (e) => e.code === 'login-needs-terminal');
+});
+
+// `interactive: true` stands in for the founder's real terminal: under
+// `node --test` this process's stdin is a pipe, and login now refuses that
+// outright (see the login-needs-terminal tests below).
 test('login declares success only after a follow-up whoami confirms it', () => {
   const runner = makeFakeRunner({ loggedIn: false });
-  const res = deployLib.login({ runner, spec: 'wrangler@4' });
+  const res = deployLib.login({ runner, spec: 'wrangler@4', interactive: true });
   assert.equal(res.loggedIn, true);
   const subs = runner.calls.map((c) => c.argv.join(' '));
   assert.ok(subs.some((s) => /\blogin\b/.test(s)), 'must have called login');
@@ -203,7 +246,7 @@ test('provisionRelay runs the whole flow: login path, create token never on argv
   const out = [];
   const prov = await deployLib.provisionRelay({
     relayDir: REPO_RELAY, workDir: path.join(tmp('prov'), 'relay'),
-    name: 'demo', runner, fetchImpl, out: (l) => out.push(l), err: () => {},
+    name: 'demo', runner, fetchImpl, interactive: true, out: (l) => out.push(l), err: () => {},
   });
 
   assert.equal(prov.origin, FAKE_URL);
@@ -233,6 +276,42 @@ test('provisionRelay runs the whole flow: login path, create token never on argv
   // The deploy ran IN the writable work dir (wrangler writes .wrangler there).
   const deployCall = runner.calls.find((c) => c.argv.join(' ').includes(' deploy'));
   assert.ok(deployCall.cwd && deployCall.cwd.endsWith('relay'), 'deploy runs in the work dir');
+});
+
+test('provisionRelay with no terminal fails fast with guidance, before promising a browser', async () => {
+  // `handshake deploy-relay` typed inside Claude Code: no TTY on stdin, and the
+  // founder is not signed in yet. The old code announced the browser and then
+  // sat on wrangler's dead prompt for the full login timeout.
+  const runner = makeFakeRunner({ loggedIn: false });
+  const out = [];
+  await assert.rejects(deployLib.provisionRelay({
+    relayDir: REPO_RELAY, workDir: path.join(tmp('provtty'), 'relay'),
+    name: 'demo', runner, fetchImpl: makeFakeFetch(), interactive: false,
+    out: (l) => out.push(l), err: () => {},
+  }), (e) => {
+    assert.equal(e.code, 'login-needs-terminal');
+    assert.match(e.guidance, /npx --yes wrangler@4 login/);
+    return true;
+  });
+  assert.equal(out.some((l) => /opening your browser/i.test(l)), false, 'no browser may be promised');
+  const subs = runner.calls.map((c) => c.argv.join(' '));
+  assert.equal(subs.some((s) => /\blogin\b/.test(s)), false, 'the interactive login must not be spawned');
+  assert.equal(subs.some((s) => /\bdeploy\b/.test(s)), false, 'and nothing is deployed half-way');
+});
+
+test('an already-signed-in founder deploys with no terminal at all: whoami gates the interactive path', async () => {
+  // The counterpart of the test above, and the reason deploy-relay is still a
+  // one-command flow from inside Claude Code once the login is saved.
+  const runner = makeFakeRunner({ loggedIn: true });
+  const prov = await deployLib.provisionRelay({
+    relayDir: REPO_RELAY, workDir: path.join(tmp('provsaved'), 'relay'),
+    name: 'demo', runner, fetchImpl: makeFakeFetch(), interactive: false,
+    out: () => {}, err: () => {},
+  });
+  assert.equal(prov.origin, FAKE_URL);
+  assert.equal(prov.created.ws, WS_ID);
+  assert.equal(runner.calls.some((c) => /\blogin\b/.test(c.argv.join(' '))), false,
+    'a saved login must never reach the interactive path');
 });
 
 test('provisionRelay with createWorkspace:false stops after setting the secret (the upgrade caller)', async () => {
@@ -375,7 +454,9 @@ test('REAL spawn: the fake npx on PATH drives availability -> login -> deploy ->
 
     // not logged in yet -> login writes the marker -> whoami confirms.
     assert.equal(deployLib.whoami({ spec }).loggedIn, false);
-    const after = deployLib.login({ spec });
+    // interactive:true stands in for the terminal a founder actually runs this
+    // in; the real spawn is still defaultRunner's cmd.exe/npx path.
+    const after = deployLib.login({ spec, interactive: true });
     assert.equal(after.loggedIn, true);
     assert.equal(after.email, 'dev@example.com');
 

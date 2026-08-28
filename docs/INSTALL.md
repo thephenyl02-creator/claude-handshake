@@ -12,6 +12,7 @@ should check before trusting a run.
 - [The installers](#the-installers)
 - [The primary route: marketplace + plugin](#the-primary-route-marketplace--plugin)
 - [The fallback route: direct copy + hook registration](#the-fallback-route-direct-copy--hook-registration)
+- [Invoking the CLI outside Claude Code](#invoking-the-cli-outside-claude-code)
 - [The self-check](#the-three-valued-self-check)
 - [Upgrading](#upgrading)
 - [Uninstalling](#uninstalling)
@@ -22,12 +23,12 @@ should check before trusting a run.
 
 | | |
 |---|---|
-| **Node.js** | 18+ required, **20+ recommended**. `handshake doctor` grades this itself: 20+ is `pass` (global `fetch`, `hkdfSync`, `node:test` all available), 18–19 is `warn` (works, but `node --test` is thin before 20), below 18 is `fail`. The CLI (`bin/handshake.js`) and every hook shell out to `node` — there is no code path that works without it. |
+| **Node.js** | 18+ required, **20+ recommended**. `/handshake doctor` grades this itself: 20+ is `pass` (global `fetch`, `hkdfSync`, `node:test` all available), 18–19 is `warn` (works, but `node --test` is thin before 20), below 18 is `fail`. The CLI (`bin/handshake.js`) and every hook shell out to `node` — there is no code path that works without it. |
 | **Claude Code CLI** | Any version that supports plugins. The installers fetch and install it via the official installer (`https://claude.ai/install.sh` / `https://claude.ai/install.ps1`) if it's missing. |
 | **macOS / Linux** | Supported natively via `installers/install.sh`. |
 | **Windows** | Supported natively via `installers/install.ps1` (PowerShell 5.1+ or pwsh). |
 | **WSL** | Works, with a caveat: Claude Code plugins are currently known **not to load hooks or monitors inside WSL**. `install.sh` detects WSL (`$WSL_DISTRO_NAME`, `$WSL_INTEROP`, or `microsoft` in `/proc/version`) and installs the fallback copy unconditionally there, regardless of what the plugin route itself reports. |
-| **Team relay** (optional) | A free Cloudflare account and one browser login, needed only by whoever deploys the relay. `/handshake deploy-relay` (or `handshake deploy-relay` from a terminal) deploys it in **one command** — it fetches `wrangler` through `npx`, so nothing is installed globally and you never type `wrangler` yourself — see [`relay/README.md`](../relay/README.md). Members joining an already-deployed relay need nothing extra. |
+| **Team relay** (optional) | A free Cloudflare account and one browser login, needed only by whoever deploys the relay. `/handshake deploy-relay` deploys it in **one command once you're signed in to Cloudflare** — it fetches `wrangler` through `npx`, so nothing is installed globally and you never type `wrangler` yourself. The first run needs that sign-in done in a real terminal first: `deploy-relay` checks stdin and refuses before it ever opens a browser or waits on a login, telling you to run `npx --yes wrangler@4 login` there — see [`relay/README.md`](../relay/README.md). Members joining an already-deployed relay need nothing extra. |
 
 ## The installers
 
@@ -173,8 +174,13 @@ is downloaded directly from GitHub.
    a hook, the CLI, the skill/command files and `deploy-relay` read: `bin/`,
    `lib/`, `hooks/`, `monitors/`, `skills/`, `commands/`, `.claude-plugin/`,
    `relay/{src,wrangler.toml,package.json}`, `package.json`, `LICENSE`,
-   `README.md`. The prune is followed by a completeness check, and the pruned
-   copy is verified runnable (`handshake doctor` runs from it).
+   `README.md`. The prune is followed by a completeness check — the installer
+   aborts unless `bin/handshake.js`, `hooks/` and `lib/` all survived it
+   ([`install.sh:818-821`](../installers/install.sh),
+   [`install.ps1:808-812`](../installers/install.ps1)). That check is
+   presence, not execution: neither installer runs the CLI against the pruned
+   copy, so a file that is present but broken is still caught only later, by
+   `/handshake doctor`.
 2. A **marker file** (`.installed-by-claude-handshake-installer`) is written
    at the root of that versioned copy. On every future run, only a directory
    carrying this marker is ever replaced or cleaned up automatically — a
@@ -267,6 +273,57 @@ Leaving the orphans behind was a real defect (fixed): the upgrade deleted the
 directory while the user-level `skills/…/SKILL.md` still contained absolute
 paths into it, and `/handshake` plus the skill then loaded twice — once from
 the orphans, once from the plugin.
+
+## Invoking the CLI outside Claude Code
+
+Everything the product does is reached through `/handshake` inside a session.
+Neither install route above puts a `handshake` executable on your `PATH`:
+their `PATH` work targets the `claude` binary and says so
+([`install.sh:500-524`](../installers/install.sh)), and the plugin system
+executes files by absolute path, never by name
+([`hooks/hooks.json`](../hooks/hooks.json)).
+
+A few things do work from a terminal today:
+
+1. **Direct, literal path** — the form to use outside a Claude Code session,
+   in a plain terminal. `$CLAUDE_PLUGIN_ROOT` is a variable Claude Code's
+   plugin host sets for hooks and commands it runs; a plain terminal has no
+   reason to carry it. For the fallback copy the installers rewrite the
+   shipped `/handshake` command file's placeholder to an absolute directory,
+   so that copy has a fixed, known path to call directly:
+
+   ```sh
+   node ~/.claude/handshake-plugin/<version>/bin/handshake.js doctor
+   ```
+
+   For the marketplace/plugin route, find that absolute path under Claude
+   Code's plugin install directory for this plugin and version, then call it
+   the same way.
+
+2. **`$CLAUDE_PLUGIN_ROOT`** — the form the shipped `/handshake` command file
+   itself uses, valid only inside a Claude Code session where the plugin host
+   has set it:
+
+   ```sh
+   node "$CLAUDE_PLUGIN_ROOT/bin/handshake.js" doctor
+   ```
+
+   If the variable is empty (i.e. you're not in a session that set it), it
+   expands to nothing and the `node` call fails — use form 1 instead.
+
+3. **A `PATH` shim**, only if you install the npm package rather than the
+   plugin. `bin/handshake.js` carries a `#!/usr/bin/env node` shebang and
+   `package.json` maps it as `handshake`, so npm creates the shim; nothing
+   else does:
+
+   ```sh
+   git clone https://github.com/thephenyl02-creator/claude-handshake
+   npm install -g ./claude-handshake
+   handshake doctor
+   ```
+
+   This installs the CLI, **not** the plugin: no hooks, no monitor, no
+   `/handshake`. Coordination still needs one of the two routes above.
 
 <a id="the-three-valued-self-check"></a>
 
@@ -483,7 +540,7 @@ Full key-material inventory, holder sets, and offboarding runbooks:
 | Everything installed, hooks still never fire (fallback route) | Check the `"command"` strings you merged into `settings.json`: they must point at an **absolute** node binary. Hooks fail soft, so a `node: command not found` is invisible. Re-run the installer and copy the snippet again — it pins the interpreter for you. |
 | `/handshake` or the skill appears twice after upgrading to the plugin route | An older installer left the user-level command/skill behind. Re-run the installer once: it now removes its own superseded copies (and backs up anything it did not write). |
 | Hooks not firing on WSL | Expected until you've merged the printed `settings.json` snippet by hand — the fallback route never edits it for you. |
-| `handshake doctor` reports `fail` on `node` | You're on Node < 18; upgrade — `node --test` and the CLI's use of global `fetch`/`hkdfSync` need 18+, and doctor recommends 20+. |
+| `/handshake doctor` reports `fail` on `node` | You're on Node < 18; upgrade — `node --test` and the CLI's use of global `fetch`/`hkdfSync` need 18+, and doctor recommends 20+. |
 | Unsure if you're on the plugin route or the fallback route | `claude plugin list` shows the plugin if the primary route is active; `Test-Path ~/.claude/handshake-plugin` (or `ls ~/.claude/handshake-plugin`) shows a fallback copy. Both can coexist briefly during a transition — the installer cleans up a superseded fallback copy automatically once the plugin route is confirmed working. |
 
 For anything not covered here: `/handshake doctor` and this file's

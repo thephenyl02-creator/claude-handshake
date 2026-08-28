@@ -127,7 +127,7 @@ State these plainly; do not let product copy erode them.
 | **Relay enrollment token** | `hsk_<64 hex>_<8 hex>` `[C tokens.js]` | same guard | §3.1 | Yes — `POST /ws/:id/rotate`, grace 0–86400 s `[R5]` | Rotate with `grace_seconds: 0` |
 | **Member sub-token** | `hsm_<16 hex id>_<64 hex>` `[C tokens.js]` | local state only, `0600`, one machine, never in the repo `[P§2]` | that one install | Reissued via rebind (PROTOCOL Appendix B A3) `[D7]` | `POST /ws/:id/members/:member/remove` — instant, and releases that member's claims `[C workspace.js]` |
 | **Recovery key** | `hsr_<64 hex>_<8 hex>` `[C tokens.js]` | founder only, **out of band, never the repo** | the founder | **No — immutable in v1** `[D11]` | **Destroy the workspace and recreate it** `[D11]`. There is no other path |
-| **`RELAY_CREATE_TOKEN`** | deployer-chosen | `wrangler secret`, never `[vars]` `[C relay/README.md]` | whoever can deploy that Worker | Yes — `wrangler secret put` | Re-put the secret; existing workspaces are unaffected |
+| **`RELAY_CREATE_TOKEN`** | `hsc_<43 base64url>` when minted by `deploy-relay` / `upgrade` `[C lib/deploy.js]`; any opaque string for a hand-deployed relay. **Printed once** by those two commands and never persisted locally | `wrangler secret`, never `[vars]` `[C relay/README.md]` | whoever can deploy that Worker | Yes — `wrangler secret put` | Re-put the secret; existing workspaces are unaffected |
 
 The relay stores **only SHA-256 digests** of credentials and compares them in
 constant time `[C workspace.js]`. A lost recovery key is therefore
@@ -157,7 +157,8 @@ holder of every workspace credential in that repo; and a repo that goes public
 (§6) exposes all of them at once.
 
 Credential formats are deliberately greppable — `hsk_` / `hsr_` / `hsm_`
-prefixes with a checksum `[C tokens.js]` `[P§3]` — so GitHub push protection
+prefixes with a checksum `[C tokens.js]`, plus `hsi1_` invites and `hsc_`
+create tokens `[C lib/secret-shapes.js]` `[P§3]` — so GitHub push protection
 and third-party secret scanners can catch a leak, and so `doctor` can tell a
 credential from a workspace id at a glance. Teams that hit push protection MUST
 be told to fix the leak, not to allowlist it; the allowlisting procedure is

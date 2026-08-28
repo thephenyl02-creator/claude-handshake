@@ -144,8 +144,8 @@ live claim means you lost at the source.
 
 **If you lose, in this order:**
 
-1. `node bin/handshake.js change "<subject>" --change tiebreak_loss`
-2. `node bin/handshake.js release "<subject>" --reason tiebreak_loss`
+1. `node "$CLAUDE_PLUGIN_ROOT/bin/handshake.js" change "<subject>" --change tiebreak_loss`
+2. `node "$CLAUDE_PLUGIN_ROOT/bin/handshake.js" release "<subject>" --reason tiebreak_loss`
 3. Stop work on that subject and tell your user **one line**: what the peer is
    already doing, and what you propose instead. This is the one moment
    surfacing to the human is correct — do not expand it into a discussion.
@@ -164,7 +164,7 @@ The transport never judges meaning (PROTOCOL §5.2); neither does a score. Pick:
 | Different work that merely shares vocabulary | Proceed. No warning. |
 
 Emit `warn.overlap` only after judging genuine overlap, never on the raw score:
-`node bin/handshake.js warn overlap --subject "<yours>" --peer <member>
+`node "$CLAUDE_PLUGIN_ROOT/bin/handshake.js" warn overlap --subject "<yours>" --peer <member>
 --peer-subject "<theirs>"`.
 
 Do not compute a score to pass in. The CLI measures it from the two subjects
@@ -174,11 +174,48 @@ accepted so the older command form does not break; it is ignored.) The judgement
 above is still entirely yours — what you decide is *whether* to run this
 command, not what number it carries.
 
-### 3.3 Jaccard < 50 → nothing. No warning, no note, no mention.
+### 3.3 Jaccard < 50 → no warning. A judged overlap is still worth one note.
 
-The CLI enforces this floor too: below 50 it prints a refusal and sends
-nothing, whatever you pass it. Treat that as the rule confirming itself, not as
-something to work around.
+The floor governs the **warning**. `warn.overlap` carries a `jaccard`
+percentage that PROTOCOL §3.2 defines as a measurement of the two subject keys,
+and §5.2 forbids sending one below 50 — so the CLI computes the value and
+refuses under the floor whatever you pass it. Do not try to route a semantic
+judgement through that number: a fabricated measurement is worse than no
+warning, because the peer reads it as something they can check.
+
+The floor does not govern notes. `note.*` is `{text, paths?, subject?,
+subject_key?}` (PROTOCOL §3.2) — no score field, no threshold, nothing tying a
+note to Jaccard at all. So the case worth the most, genuine overlap worded
+completely differently, goes out as a note.
+
+| Reality | Action |
+|---|---|
+| Different work that merely shares a word, or shares none | Silence. Still the default. |
+| Same work, different vocabulary — you can see it, the tokens cannot | Claim your subject, then **one** `note.info` naming both subjects and proposing who takes which half. |
+
+**Warning and note are different speech acts — keep them apart.** A
+`warn.overlap` says *the tokens overlap, and here is the measured number*; the
+peer can recompute it from the two keys and get the same integer. A note says
+*a peer's Claude judged these to be the same work*: attributed to you,
+arguable, carrying no number that pretends to have been measured. Never dress
+the second up as the first.
+
+**Worked example.** Your user says "rework auth" — subject `auth rework` (§2:
+area first, not the imperative). A peer's live claim reads `login flow
+overhaul`. The keys share no token: 0 of 5, Jaccard **0**. `warn overlap`
+refuses that, correctly. It is still one job, so:
+
+```
+node "$CLAUDE_PLUGIN_ROOT/bin/handshake.js" note info "I take session/token, you keep the login screen: your login flow overhaul and my auth rework read as one job to me. No warning fired - the keys share no tokens." --subject "auth rework"
+```
+
+§4 still applies: this fires on ownership, and it is **one** note, not a
+negotiation. **Lead with the proposal** — the peer reads this in their standing
+block, whose first text truncation ellipsises a digest item at 120 characters
+`[C hooks/render.js:255]`, so anything past that may never reach their model;
+here the split lands by char 115 and only the arithmetic is at risk. If the
+peer's Claude agrees and releases, §3.1's tiebreak never runs — there was never
+a shared key for it to settle.
 
 ### 3.4 PreToolUse path warning → stop, check, decide
 
@@ -320,9 +357,9 @@ At any wrap-up moment — "that's it", "thanks, done for today", goodbye, or the
 end of the work the session was for:
 
 1. Close finished claims:
-   `node bin/handshake.js done "<subject>" --summary "<what changed, ≤280>"`
+   `node "$CLAUDE_PLUGIN_ROOT/bin/handshake.js" done "<subject>" --summary "<what changed, ≤280>"`
 2. Leave with a summary you wrote, covering done and unfinished work:
-   `node bin/handshake.js leave --reason signoff --summary "<…>"`
+   `node "$CLAUDE_PLUGIN_ROOT/bin/handshake.js" leave --reason signoff --summary "<…>"`
 
 The SessionEnd hook posts a best-effort `ws.leave`, but a hook cannot write the
 summary — it does not know what the work was. The summary lands in both layers:
@@ -335,22 +372,28 @@ lie about ownership.
 
 ## 8. CLI map
 
-Invoke as `node bin/handshake.js <subcommand>` from the plugin root — or the
-PATH-injected `handshake <subcommand>`, or `node
-"$CLAUDE_PLUGIN_ROOT/bin/handshake.js" <subcommand>` from anywhere. Never write
-to `.handshake/` by hand: those files are a projection of claims (PROTOCOL §5).
+Invoke as `node "$CLAUDE_PLUGIN_ROOT/bin/handshake.js" <subcommand>` — the form
+`/handshake` uses, because you run these from the **human's project directory**,
+where a project-relative `bin/handshake.js` resolves inside their repo and does
+not exist. A bare `handshake <subcommand>` is **not** a route you may assume:
+the shim comes only from the npm `bin` map `[C package.json]`, and neither the
+plugin marketplace route nor either one-line installer creates one — use it only
+if `command -v handshake` actually found it. If `CLAUDE_PLUGIN_ROOT` expands to
+nothing, resolve the CLI once with the recipe in `commands/handshake.md` and
+reuse that absolute path for the session. Never write to `.handshake/` by hand:
+those files are a projection of claims (PROTOCOL §5).
 
 | Intent | Command |
 |---|---|
-| Claim a subject | `node bin/handshake.js claim "<subject>" [--files a,b] [--ttl 7200]` |
-| Add touched files / change scope | `node bin/handshake.js change "<subject>" --change files\|scope\|ttl\|tiebreak_loss [--files …] [--note "…"]` |
-| Release | `node bin/handshake.js release "<subject>" --reason done\|superseded\|tiebreak_loss\|manual` |
-| Finish | `node bin/handshake.js done "<subject>" --summary "…"` |
-| Note | `node bin/handshake.js note discovery\|error\|fix\|blocker\|info "<text>" [--paths a,b] [--subject "<claim>"]` |
-| Overlap warning | `node bin/handshake.js warn overlap --subject "…" --peer <member> --peer-subject "…"` (the score is measured for you; refused under 50) |
-| Presence at the edges | `node bin/handshake.js presence working\|waiting\|blocked\|tooling_broken [--note "…"]` |
-| Status | `node bin/handshake.js status [--json]` |
-| Sign off | `node bin/handshake.js leave --reason signoff\|session_end\|error --summary "…"` |
+| Claim a subject | `node "$CLAUDE_PLUGIN_ROOT/bin/handshake.js" claim "<subject>" [--files a,b] [--ttl 7200]` |
+| Add touched files / change scope | `node "$CLAUDE_PLUGIN_ROOT/bin/handshake.js" change "<subject>" --change files\|scope\|ttl\|tiebreak_loss [--files …] [--note "…"]` |
+| Release | `node "$CLAUDE_PLUGIN_ROOT/bin/handshake.js" release "<subject>" --reason done\|superseded\|tiebreak_loss\|manual` |
+| Finish | `node "$CLAUDE_PLUGIN_ROOT/bin/handshake.js" done "<subject>" --summary "…"` |
+| Note | `node "$CLAUDE_PLUGIN_ROOT/bin/handshake.js" note discovery\|error\|fix\|blocker\|info "<text>" [--paths a,b] [--subject "<claim>"]` |
+| Overlap warning | `node "$CLAUDE_PLUGIN_ROOT/bin/handshake.js" warn overlap --subject "…" --peer <member> --peer-subject "…"` (measured for you; refused under 50 — a sub-floor overlap you judged goes out as a note, §3.3) |
+| Presence at the edges | `node "$CLAUDE_PLUGIN_ROOT/bin/handshake.js" presence working\|waiting\|blocked\|tooling_broken [--note "…"]` |
+| Status | `node "$CLAUDE_PLUGIN_ROOT/bin/handshake.js" status [--json]` |
+| Sign off | `node "$CLAUDE_PLUGIN_ROOT/bin/handshake.js" leave --reason signoff\|session_end\|error --summary "…"` |
 | Setup / membership | `init` · `join <blob>` · `invite` · `doctor` · `upgrade` · `rotate` (see `/handshake`) |
 | Local switches | `mute [on\|off]` (stop injecting peer chatter) · `rest` (stop broadcasting this session) |
 
