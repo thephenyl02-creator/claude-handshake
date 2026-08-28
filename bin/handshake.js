@@ -1621,10 +1621,12 @@ async function cmdNote(args) {
   return cmdPost({ _: ['note.' + kind], flags: Object.assign({}, args.flags, { text }) });
 }
 
-// warn overlap --subject "..." --peer <member> --peer-subject "..." [--jaccard 50-100]
+// warn overlap --subject "..." --peer <member> --peer-subject "..."
+// (--jaccard is still accepted for compatibility and ignored: the score is
+// computed from the two subject keys, see cmdPost warn.overlap)
 async function cmdWarn(args) {
   if (args._[0] !== 'overlap') {
-    err('usage: handshake warn overlap --subject "..." --peer <member> --peer-subject "..." [--jaccard 50-100]');
+    err('usage: handshake warn overlap --subject "..." --peer <member> --peer-subject "..."');
     process.exitCode = 2; return;
   }
   return cmdPost({ _: ['warn.overlap'], flags: args.flags });
@@ -2108,7 +2110,7 @@ const USAGE = [
   '  release   "<subject>" [--reason done|superseded|tiebreak_loss|manual|expired]',
   '  done      "<subject>" [--summary "..."] [--files a,b]',
   '  note      discovery|error|fix|blocker|info "<text>" [--paths a,b] [--subject "..."]',
-  '  warn      overlap --subject "..." --peer <member> --peer-subject "..." [--jaccard 50-100]',
+  '  warn      overlap --subject "..." --peer <member> --peer-subject "..."',
   '  presence  working|waiting|blocked|tooling_broken [--note "..."] [--branch <b>] [--agents <n>]',
   '  post      <note.*|warn.overlap|task.change> --text "..." [--paths a,b]',
   '  sync      [--limit <n>] [--json] [--inject-digest] [--guard-refresh]',

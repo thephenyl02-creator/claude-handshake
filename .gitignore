@@ -5,3 +5,8 @@ node_modules/
 .DS_Store
 CLAUDE.local.md
 dist/
+
+# Scratch workspace from the live relay run (M12). Holds a REAL .handshake/
+# secret.json and a wrangler account cache - this repo is public, so it is
+# ignored here rather than kept loose outside the project.
+live-test/

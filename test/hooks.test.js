@@ -733,7 +733,7 @@ test('a truncated or absent stdin payload still exits 0 within the backstop', ()
 test('hooks.json matches the section 8 cadence contract exactly', () => {
   const cfg = JSON.parse(fs.readFileSync(path.join(HOOKS, 'hooks.json'), 'utf8'));
   const events = Object.keys(cfg.hooks);
-  assert.deepStrictEqual(events.sort(), ['PostToolUse', 'PreToolUse', 'SessionEnd', 'SessionStart', 'UserPromptSubmit']);
+  assert.deepStrictEqual(events.sort(), ['PostToolUse', 'PreToolUse', 'SessionEnd', 'SessionStart', 'Stop', 'UserPromptSubmit']);
 
   const one = (evt) => cfg.hooks[evt][0].hooks[0];
   assert.strictEqual(one('SessionStart').async, true);
@@ -741,6 +741,12 @@ test('hooks.json matches the section 8 cadence contract exactly', () => {
   assert.strictEqual(one('PreToolUse').async, false);
   assert.strictEqual(one('PostToolUse').async, true);
   assert.strictEqual(one('SessionEnd').async, false);
+  // Stop is the no-monitor heartbeat fallback (PROTOCOL 8, section 7.2). Async
+  // because it fires at the moment the human is waiting for the turn to end
+  // and nothing downstream consumes its result.
+  assert.strictEqual(one('Stop').async, true);
+  assert.ok(!('matcher' in cfg.hooks.Stop[0]), 'Stop takes no matcher');
+  assert.ok(!('SubagentStop' in cfg.hooks), 'SubagentStop is deliberately not registered');
 
   assert.strictEqual(cfg.hooks.PreToolUse[0].matcher, 'Edit|Write|NotebookEdit');
   assert.strictEqual(cfg.hooks.PostToolUse[0].matcher, 'Edit|Write|NotebookEdit|Bash');
@@ -783,7 +789,16 @@ test('no hook writes to stdout except the designed injections', () => {
   const code = (file) => fs.readFileSync(file, 'utf8')
     .replace(/\/\*[\s\S]*?\*\//g, '')
     .split('\n').map((l) => l.replace(/\/\/.*$/, '')).join('\n');
-  for (const f of ['session-start.js', 'post-tool-use.js', 'session-end.js']) {
+  // Enumerated from disk, not hard-coded: this list was already stale when
+  // stop.js landed, and a hook that printed would simply not have been checked.
+  // render.js/sync.js/common.js are libraries, not hooks; the two injectors are
+  // asserted separately below.
+  const INJECTORS = ['user-prompt-submit.js', 'pre-tool-use.js'];
+  const LIBS = ['common.js', 'render.js', 'sync.js'];
+  const silent = fs.readdirSync(HOOKS)
+    .filter((f) => f.endsWith('.js') && !LIBS.includes(f) && !INJECTORS.includes(f));
+  assert.ok(silent.includes('stop.js'), 'the enumeration really sees every hook');
+  for (const f of silent) {
     assert.ok(!/process\.stdout\.write|console\.log/.test(code(path.join(HOOKS, f))),
       f + ' must not write to stdout');
   }

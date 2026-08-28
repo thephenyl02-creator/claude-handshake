@@ -690,6 +690,7 @@ Normative restatement:
 | heartbeat cadence | 60 s on relay; state-change + 600 s keepalive on ntfy | `[D budgets]` `[P§1]` |
 | heartbeat clock | the monitor's own clock, never tool cadence (PostToolUse gaps p50 0.4 s / p90 3.1 s in agent workloads, and go silent entirely during long builds) | `[S7]` `[P§1]` |
 | monitor lifetime | == session lifetime; hard-killed at session end with no signal and no exit event | `[S5]` |
+| Stop (no-monitor fallback) | async, no matcher; runs only when no monitor is alive, and beats on the SAME cadence as the monitor - 60 s on relay, state-change + 600 s on ntfy - never once per turn `[C hooks/stop.js]` | `[F]` §7.2 |
 | graceful shutdown | rides SessionEnd (observed 20/21 sessions), best-effort | `[S4]` `[S5]` |
 | mid-session disarm | sentinel-file polling only | `[S5]` |
 | out-of-workspace cost | every hook is a sub-10 ms no-op outside a handshake workspace, resolved by walking up from cwd to `.handshake/workspace.json`, cached | `[P§1]` |

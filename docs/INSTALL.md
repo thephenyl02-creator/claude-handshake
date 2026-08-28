@@ -237,8 +237,10 @@ is downloaded directly from GitHub.
    handled condition, not a defect: claude-handshake already falls back to
    "heartbeating on turn boundaries" whenever monitors are unavailable
    ([PROTOCOL.md §8](PROTOCOL.md)), so coordination still works — just at
-   reduced liveness precision (state updates ride your own turns instead of a
-   60s/10min clock).
+   reduced liveness precision. The same 60s/10min cadence still applies; the
+   Stop hook simply samples it at your turn boundaries, so a beat lands on the
+   first turn that ends after a window elapses rather than on the tick itself.
+   A burst of quick turns does not produce a burst of messages.
 
 When the primary route *does* succeed on a later run, the installer removes the
 superseded fallback install automatically. That means **all three** things the
