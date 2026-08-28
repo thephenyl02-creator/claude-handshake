@@ -1,0 +1,19 @@
+# Line endings are normalized to LF in the working tree on every platform.
+#
+# Why this is not optional here: several tests PARSE SOURCE FILES with regexes
+# anchored on \n - the INCLUDE array in scripts/build-plugin-zip.js, the
+# require.main guards in monitors/heartbeat.js and bin/handshake.js, the hook
+# stdout enumeration. Windows CI checks out with core.autocrlf=true, so those
+# regexes miss and the suite goes red on a tree that is byte-identical to a
+# green one. It cost a full CI run to find; this is the root fix, and it also
+# ends the "LF will be replaced by CRLF" warning on every git command here.
+#
+# The shell installer must stay LF regardless: CRLF breaks the shebang line.
+* text=auto eol=lf
+
+# One rule, deliberately. A per-extension exception is another thing to get
+# wrong, and nothing here needs CRLF: the PowerShell installer is only ever
+# parsed by PowerShell's own parser, which does not care.
+*.png binary
+*.jpg binary
+*.zip binary
