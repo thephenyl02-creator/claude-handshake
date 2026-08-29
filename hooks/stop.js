@@ -6,7 +6,7 @@
 // implementation: "Monitors do not start in headless or subagent sessions
 // [S5]; a host without monitors MUST fall back to heartbeating on the Stop
 // hook and MUST say so in `/handshake status` (section 10.2)." The saying-so
-// half shipped [C bin/handshake.js:1239]; this file is the beating half.
+// half shipped [C bin/handshake.js:1293]; this file is the beating half.
 //
 // The same section says the heartbeat rides the MONITOR's clock, never tool
 // cadence [S7]. That is not in tension with this hook, it is the reason for
@@ -57,12 +57,28 @@ async function run(f) {
   if (!sessionLib) return C.done();
   if (sessionLib.monitorAlive(C.sentinel(state, 'monitorAlive'))) return C.done();
 
-  // ---- 2. the disarm sentinel --------------------------------------------
+  const stateLib = C.lib('state.js');
+  const mine = C.sessionIdentities(f);
+
+  // ---- 2. the disarm sentinel, THIS session's --------------------------------
   // `handshake rest` stops broadcasting for the session, and the sentinel file
   // is the ONLY mid-session disarm the monitor contract allows [S5]. A
   // fallback that kept posting through `rest` would make the command a lie in
   // exactly the sessions that have no monitor to obey it.
-  if (C.ageMs(C.sentinel(state, 'monitorDisarm')) !== null) return C.done();
+  //
+  // But the sentinel is a FILE, and nothing on the posting path removes it -
+  // SessionEnd sweeps it [C hooks/session-end.js], and SessionEnd is
+  // best-effort (20 of 21 [S4]), so the scoping has to hold on its own. The
+  // monitor reads it under the same ownership rule for the same reason, with a
+  // start-time fallback a per-turn process cannot have
+  // [C monitors/heartbeat.js disarmedHere]. A bare existence check turned
+  // one `rest` into a permanent disarm of every future session - silently,
+  // with `status` still promising a beat [C bin/handshake.js:1293]. `rest`
+  // already stamps the sentinel with the session that wrote it
+  // [C bin/handshake.js:1842], so the fix is to read it: another session's
+  // disarm is not this session's, and is treated as absent.
+  const disarm = C.sentinel(state, 'monitorDisarm');
+  if (C.ownsRecord(C.readRecord(disarm), mine)) return C.done();
 
   // ---- 3. section 7.2 rule 1: a child never posts --------------------------
   // Same verdict every other hook uses. It matters more here than anywhere
@@ -75,14 +91,22 @@ async function run(f) {
   const transport = C.transportOf(found, cfg);
   const K = C.keepaliveSeconds(transport) * 1000;    // 60 s relay / 600 s ntfy
 
-  // ---- 4. section 10.2: the posting_stopped latch --------------------------
-  // Once posting has stopped on this transport for the session it stays
+  // ---- 4. section 10.2: the posting_stopped latch, THIS session's -----------
+  // Once posting has stopped on this transport FOR THE SESSION it stays
   // stopped. Spawning the CLI to be refused every turn is the retry loop that
   // rule forbids.
-  const stateLib = C.lib('state.js');
+  //
+  // "for the session" is the whole rule, and session.json says whose: the file
+  // is rewritten from scratch whenever the id differs [C lib/state.js:434], so
+  // the `session` field on it is the session that latched. Reading the latch
+  // without reading that field let a previous session's auth failure silence
+  // the fallback in a new one, which is the same defect as the sentinel above.
+  // The CLI re-derives its own session flags on the next spawn, so an ignored
+  // stale latch costs at most one beat, and it re-latches (and reports once) if
+  // posting really is still refused.
   if (stateLib) {
     const s = stateLib.readJsonFile(state.files.session, null);
-    if (s && s.posting_stopped && s.posting_stopped[transport]) return C.done();
+    if (C.ownsRecord(s, mine) && s.posting_stopped && s.posting_stopped[transport]) return C.done();
   }
 
   // ---- 5. the cadence gate, the monitor's own `due` -----------------------
@@ -116,6 +140,52 @@ async function run(f) {
   } catch (_) { /* never fail the turn this hook observes */ }
   C.done();
 }
+
+// ------------------------------------------------------- session identity ---
+//
+// `sessionIdentities` and `ownsRecord` used to live here as this file's own
+// copy; they moved to hooks/common.js when the monitor and the injected roster
+// note turned out to need the identical rule [C hooks/common.js session
+// ownership]. Three readers, one implementation - a second copy would drift on
+// exactly the question ("whose record is this?") that has already been got
+// wrong once.
+//
+// KNOWN DEGRADATION, on a host that exports NONE of HANDSHAKE_SESSION_ID /
+// CLAUDE_SESSION_ID / CLAUDE_CODE_SESSION_ID.
+//
+// This hook still has an identity there - the host hands it `session_id` in
+// the payload [C hooks/common.js fields()] - but the CLI has none: its
+// sessionId() falls back to the constant 'cli' [C bin/handshake.js:135], so
+// `rest` stamps the sentinel, and a failing post stamps the latch, with a
+// hash of 'cli' that this hook must not admit (admitting a machine-wide
+// constant would re-open the permanent disarm outright). The gates above then
+// find no owner they recognise and BOTH OPEN:
+//
+//   - `handshake rest` no longer stops the Stop-hook fallback, in the very
+//     session that ran it. The fallback keeps beating at the transport's
+//     keepalive (60 s relay / 600 s ntfy) until the session ends.
+//   - the section 10.2 latch is ignored, so the fallback spawns the CLI once
+//     per keepalive to be refused again.
+//
+// So it degrades toward BEATING, never toward silence: the failure is visible
+// in `handshake status` and ends with the session, where the defect this
+// scoping replaced was silent and outlived every session in the workspace.
+// That is the direction to fail in, but it is still a failure.
+//
+// It is NOT closed by having the hooks tell the CLI which session they are
+// running for (an env var on C.runCli), which is the obvious fix and was
+// tried on paper first. The blocker is that the fix cannot be complete:
+// monitors/heartbeat.js spawns the same CLI [C monitors/heartbeat.js beat()]
+// and is launched as a bare command with no payload [C monitors/monitors.json],
+// so it has nothing to pass. session.json is ONE file whose `session` field is
+// rewritten from scratch whenever the id differs [C lib/state.js:434], so
+// hook-spawned runs stamping a payload id while monitor-spawned runs stamp
+// 'cli' would reset `reported`, `posting_stopped` and `counts` on every
+// alternation - breaking section 10.2's report-ONCE-per-session guarantee and
+// re-arming the refused-post retry on hosts where both paths run. A partial
+// fix here buys scoping by trading away the latch it is scoping. Closing this
+// properly needs the CLI to learn the session from state rather than from the
+// environment, which is bin/handshake.js's and lib/state.js's call to make.
 
 // The presence state the last beat asserted, or null when the marker is absent
 // or unreadable. Only ntfy's state-change clause consumes it, and an

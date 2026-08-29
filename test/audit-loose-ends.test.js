@@ -264,7 +264,7 @@ test('upgrade that deploys the relay in place shows the create token it minted, 
   assert.equal(r.raw.includes(token), false, 'the create token must never land in local state');
   assert.equal(r.cfg.create_token, undefined);
   for (const c of r.runner.calls) {
-    assert.equal(c.argv.join(' ').includes(token), false, 'credentials never go on argv');
+    assert.equal(c.argv.join('\x00').includes(token), false, 'credentials never go on argv');
   }
 
   // and the migration itself still happened.

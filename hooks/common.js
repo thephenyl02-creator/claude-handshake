@@ -196,11 +196,14 @@ function touch(file, body) {
   } catch (_) { return false; }
 }
 
+function mtimeMs(file) {
+  try { return fs.statSync(file).mtimeMs; } catch (_) { return null; }
+}
+
 function ageMs(file, now) {
-  try {
-    const st = fs.statSync(file);
-    return (Number.isInteger(now) ? now : Date.now()) - st.mtimeMs;
-  } catch (_) { return null; }               // absent == infinitely old
+  const m = mtimeMs(file);
+  if (m === null) return null;               // absent == infinitely old
+  return (Number.isInteger(now) ? now : Date.now()) - m;
 }
 
 function isFresh(file, windowMs, now) {
@@ -209,6 +212,86 @@ function isFresh(file, windowMs, now) {
 }
 
 function remove(file) { try { fs.unlinkSync(file); return true; } catch (_) { return false; } }
+
+// ------------------------------------------------------ session ownership ---
+
+// Two records in the state dir belong to ONE session and outlive it:
+// `handshake rest`'s monitor.disarm sentinel [C bin/handshake.js:1841] and
+// session.json's section 10.2 posting_stopped latch [C lib/state.js:434].
+// Nothing on the writing path removes either, and every session in a project
+// shares one state dir - so a reader that asks "does this file exist?" instead
+// of "is this file MINE?" turns one `rest`, or one auth failure, into a
+// permanent state for every future session in the workspace.
+//
+// FOUR readers need that answer and must not give four of them: the primary
+// heartbeat [monitors/heartbeat.js tick()], the Stop-hook fallback
+// [hooks/stop.js], SessionEnd's sweep [hooks/session-end.js] and the injected
+// roster note [buildView() below]. It lives here because hooks/common.js is
+// the one module all four already require - the monitor included
+// [C monitors/heartbeat.js:22] - and because the two halves of the rule (which
+// ids am I, and does this record name one of them) only make sense together.
+
+// Every id THIS process can legitimately answer to.
+//
+// Both records are written by the CLI, which derives its id from the
+// ENVIRONMENT and hashes it [C bin/handshake.js:135, C lib/state.js:256]; a
+// hook is handed the host's raw id in its payload instead [C fields() above].
+// Both forms of both sources are admitted so the comparison holds whichever
+// side wrote the record.
+//
+// `f` is optional: monitors/heartbeat.js is launched as a bare command with no
+// stdin payload [C monitors/monitors.json], so it has no `session_id` field to
+// offer and passes null - the environment is its only source, exactly as it is
+// the CLI's.
+//
+// The CLI's `|| 'cli'` fallback is deliberately NOT mirrored: with no session
+// variable in the environment that constant is the same for every session on
+// the machine, so admitting it would re-open exactly the permanent disarm this
+// scoping exists to close. See hooks/stop.js for how that degrades on a host
+// exporting none of the three variables.
+function sessionIdentities(f, env) {
+  const e = env || process.env;
+  const stateLib = lib('state.js');
+  const ids = new Set();
+  const add = (v) => {
+    if (!v) return;
+    ids.add(String(v));
+    try { if (stateLib && stateLib.State) ids.add(stateLib.State.sessionId(String(v))); } catch (_) { /* raw form only */ }
+  };
+  add(f && f.sessionId);
+  add(e.HANDSHAKE_SESSION_ID || e.CLAUDE_SESSION_ID || e.CLAUDE_CODE_SESSION_ID || null);
+  return ids;
+}
+
+// Does a per-session record belong to this session? Only if it says so.
+//
+// A record with no readable `session` is treated as SOMEONE ELSE'S, i.e. as
+// absent, and that is the conservative direction here even though it is the
+// noisier one. Both writers always stamp the field [C bin/handshake.js:1842, C
+// lib/state.js:434], so an unattributed record is a leftover from an older
+// client or a torn write - indistinguishable from the permanent, unattributable
+// file this whole gate exists to stop honouring. Ignoring it costs one session
+// of beating at the transport's own keepalive, which is visible and
+// recoverable; honouring it is silent and forever.
+function ownsRecord(rec, ids) {
+  if (!rec || typeof rec !== 'object') return false;
+  const owner = typeof rec.session === 'string' && rec.session ? rec.session : null;
+  return owner !== null && Boolean(ids) && ids.has(owner);
+}
+
+// The `session` a record names, or null when it names nobody. Split out because
+// the monitor needs to tell "someone else's" from "nobody's" - it has a start
+// time to fall back on and the hooks do not.
+function recordOwner(rec) {
+  if (!rec || typeof rec !== 'object') return null;
+  return typeof rec.session === 'string' && rec.session ? rec.session : null;
+}
+
+function readRecord(file) {
+  const stateLib = lib('state.js');
+  if (stateLib && typeof stateLib.readJsonFile === 'function') return stateLib.readJsonFile(file, null);
+  try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch (_) { return null; }
+}
 
 // ------------------------------------------------------------- child mode ---
 
@@ -534,10 +617,26 @@ function buildView(state, found, opts) {
   // session.json is read READ-ONLY here: state.session() rewrites the file
   // when the session id differs, and a synchronous injection hook must not
   // fight the CLI over per-session flags.
+  //
+  // And it is read WITH ITS OWNER. " · posting stopped (auth)" [C
+  // hooks/render.js:68] is the one place a user actually SEES this latch, and
+  // the latch is per-session by definition (section 10.2: "for the rest of the
+  // session"). Taken bare, a previous session's auth failure printed a false
+  // status line into every later session's standing block, forever - the same
+  // defect as the disarm sentinel, in the one spot where it is visible.
+  //
+  // The identity comes from `opts.sessionId` when the caller has a payload, and
+  // otherwise from the environment. The current caller
+  // [C hooks/user-prompt-submit.js:43] passes neither, so on a host that
+  // exports none of the three session variables no record is ever owned here
+  // and the note is simply never shown. That drops a true line rather than
+  // printing a false one, which is the right direction for an injected claim
+  // about the user's own session.
   let stopped = false;
   if (stateLib) {
     const s = stateLib.readJsonFile(state.files.session, null);
-    stopped = Boolean(s && s.posting_stopped && s.posting_stopped[transport]);
+    stopped = ownsRecord(s, sessionIdentities(o, o.env)) &&
+      Boolean(s.posting_stopped && s.posting_stopped[transport]);
   }
 
   // Repo posture, read from STATE only - no git, no subprocess. The injection
@@ -592,7 +691,8 @@ module.exports = {
   buildView, sleepSync,
   armSafety, done, readPayload, fields, lib,
   resolveWorkspace, openState, transportOf, keepaliveSeconds, overlapGate,
-  sentinel, touch, ageMs, isFresh, remove,
+  sentinel, touch, mtimeMs, ageMs, isFresh, remove,
+  sessionIdentities, ownsRecord, recordOwner, readRecord,
   childMode, provenChild, parentSessionId, recordRole, roleOf, isChild,
   runCli, parseJsonStdout, repoRelative, pathMatches, globToRegExp,
 };

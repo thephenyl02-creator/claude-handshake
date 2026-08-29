@@ -33,6 +33,23 @@ async function run(f) {
   const child = C.isChild(state, f);
   if (child.child) return C.done();
 
+  // The disarm sentinel is a per-SESSION switch: `rest` prints "broadcasting
+  // stopped for this session" [C bin/handshake.js:1849]. Nothing ever removed
+  // it, so it outlived the session that meant it and silenced the Stop-hook
+  // fallback in every later one [C hooks/stop.js]. It dies here with the
+  // session that armed it, for the same reason monitor.alive does above.
+  //
+  // Two deliberate narrowings. It is removed AFTER the child check, never
+  // before: monitor.alive is self-healing (the monitor re-touches it every
+  // poll) and this file is not, so a subagent's SessionEnd must not re-arm its
+  // parent's heartbeat. And it is removed only when it is THIS session's, or
+  // when nobody can be shown to own it - two parent sessions in one project
+  // share this state dir, and deleting the other one's disarm would start
+  // beating for a session that deliberately stopped.
+  const disarm = C.sentinel(state, 'monitorDisarm');
+  const owner = C.recordOwner(C.readRecord(disarm));
+  if (owner === null || C.sessionIdentities(f).has(owner)) C.remove(disarm);
+
   // `ws.leave` with reason session_end (section 3.2). The CLI owns signing,
   // the offline queue (a queued parting note is kept up to 24 h) and the local
   // task-shard record; this hook only starts it and bounds the wait.
@@ -41,3 +58,15 @@ async function run(f) {
   });
   C.done();
 }
+
+// The ids this session answers to and the reader for the record above live in
+// hooks/common.js: the sweep here and the DECISION in hooks/stop.js and
+// monitors/heartbeat.js must be the same rule, or the sweep would remove a
+// sentinel the readers still honour, or leave one they already ignore
+// [C hooks/common.js session ownership].
+//
+// One deliberate difference from the readers. They treat an unattributable
+// record as SOMEONE ELSE'S; the sweep treats it as sweepable. Both choices push
+// the same way - toward heartbeating - because a record nobody can be shown to
+// own is one no reader will ever honour again, so leaving it on disk buys
+// nothing and removing it is how it stops accumulating.

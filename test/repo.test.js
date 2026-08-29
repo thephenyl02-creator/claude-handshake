@@ -16,6 +16,7 @@ const { spawnSync } = require('node:child_process');
 
 const repo = require('../lib/repo');
 const stateLib = require('../lib/state');
+const { HANDSHAKE_CREDENTIAL_SHAPES: SHAPES } = require('../lib/secret-shapes');
 
 let n = 0;
 function tmpDir(tag) {
@@ -333,6 +334,63 @@ test('doctor check: token-in-history finds a credential that was committed and t
   const clean = repo.tokenInHistory(gitRepo().dir);
   assert.equal(clean.ok, true);
   assert.deepEqual(clean.hits, []);
+});
+
+// The two properties the history scan was rewritten to have, neither of which
+// had a test - so reverting either was silent. `checked` is the needle list the
+// scan actually ran [C lib/repo.js:328], which makes both observable from here
+// without reading the source.
+test('the history needles are DERIVED from the shared shape list, so a new shape is picked up', () => {
+  // Independently stated rule: every prefixed credential family in the shared
+  // list (`hs*_...`) is a pickaxe needle, and the JSON-field shapes are not -
+  // those match their own pattern definitions and every doc showing an example
+  // record, which is the 24-false-positive class the comment above names
+  // [C lib/repo.js:305-313].
+  const prefixed = SHAPES.filter((s) => /^hs[a-z0-9]*_/.test(s.re.source));
+  const fieldShapes = SHAPES.filter((s) => !/^hs[a-z0-9]*_/.test(s.re.source));
+  assert.ok(prefixed.length >= 5, 'the shared list still has prefixed families, got ' + prefixed.length);
+  assert.ok(fieldShapes.length >= 1, 'and still has JSON-field shapes to exclude');
+
+  const scan = repo.tokenInHistory(gitRepo().dir);
+  assert.equal(scan.ok, true);
+  // Every prefixed shape, by its OWN source - not a hand-copied variant that
+  // could drift from the filter's.
+  assert.deepEqual([...scan.checked].sort(), prefixed.map((s) => s.re.source).sort(),
+    'the needle list must be exactly the prefixed shapes, derived not restated');
+  for (const s of fieldShapes) {
+    assert.equal(scan.checked.includes(s.re.source), false, s.id + ' must stay out of the pickaxe');
+  }
+
+  // Named explicitly as well: hsc_ is the NEWEST family (lib/secret-shapes.js
+  // gained it when deploy-relay/upgrade began printing the create token), and
+  // it is the one the pre-rewrite hardcoded list did not know about.
+  const newest = SHAPES.find((s) => s.id === 'relay-create-token');
+  assert.ok(newest, 'lib/secret-shapes.js still defines the relay create token');
+  assert.ok(scan.checked.includes(newest.re.source),
+    'a shape added to secret-shapes.js must reach the history scan on its own');
+});
+
+test('the history scan is case-insensitive, so an uppercased credential cannot hide in history', () => {
+  // The shapes carry /i, but the flag does not survive into a git pickaxe
+  // pattern - the scan passes -i instead [C lib/repo.js:323]. Uppercase hex
+  // matches NOTHING in `hsk_[0-9a-f]{16,}_[0-9a-f]{4,}` without it, and the red
+  // team evaded the original lowercase-only patterns exactly this way
+  // [C lib/secret-shapes.js, the case-insensitivity note].
+  const box = gitRepo();
+  const file = path.join(box.dir, 'config.txt');
+  const upper = 'HSK_' + 'B'.repeat(64) + '_CAFEBABE';
+  assert.equal(/hsk_[0-9a-f]{16,}_[0-9a-f]{4,}/.test(upper), false, 'the fixture only matches case-insensitively');
+  assert.equal(/hsk_[0-9a-f]{16,}_[0-9a-f]{4,}/i.test(upper), true, 'and it does match with /i');
+
+  fs.writeFileSync(file, 'token = ' + upper + '\n');
+  commit(box, 'leak an uppercased token');
+  fs.writeFileSync(file, 'token = (rotated)\n');
+  commit(box, 'remove it');
+
+  const hist = repo.tokenInHistory(box.dir);
+  assert.equal(hist.ok, true);
+  assert.ok(hist.hits.length >= 1, 'an uppercased credential is still a leak and must be found');
+  assert.ok(hist.hits.some((h) => h.needle.startsWith('hsk_')), 'the enrollment-token shape matched it');
 });
 
 test('a history scan that cannot run is reported as unknown, never as clean', () => {

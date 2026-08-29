@@ -319,6 +319,154 @@ test('renewLocal never throws, and renews every held claim', () => {
   for (let i = 0; i < after.length; i++) assert.ok(after[i] >= before[i]);
 });
 
+// ================================================================= disarm ====
+//
+// `handshake rest` writes monitor.disarm and NOTHING on the posting path ever
+// removes it, so the monitor's read of that file decides whether one `rest`
+// disarms one session or every session the workspace will ever have. It read it
+// with a bare existence check, which made it the latter - and because this is
+// the PRIMARY heartbeat, that took presence down outright rather than only the
+// Stop-hook fallback [C hooks/stop.js]. The two rules below are the fix, in the
+// order the monitor applies them.
+
+const OWNER = St.State.sessionId('sess-hb-disarm');
+
+function disarmFile(body, ageMs) {
+  const dir = tmpDir('hs-hb-disarm-');
+  const file = path.join(dir, 'monitor.disarm');
+  fs.writeFileSync(file, body);
+  if (ageMs) { const t = new Date(Date.now() - ageMs); fs.utimesSync(file, t, t); }
+  return file;
+}
+
+test('rule 1: the monitor obeys its OWN disarm and ignores another session\'s', () => {
+  const mine = new Set(['sess-hb-disarm', OWNER]);
+  const startedAt = Date.now() - 60000;
+
+  assert.equal(H.disarmedHere(path.join(tmpDir('hs-hb-none-'), 'nope'), mine, startedAt), false,
+    'an absent sentinel is nothing to obey');
+
+  const own = disarmFile(JSON.stringify({ session: OWNER, at: Date.now() }));
+  assert.equal(H.disarmedHere(own, mine, startedAt), true, '`rest` still stops the session that ran it');
+
+  // The whole defect, as one assertion: a sentinel left behind by a session
+  // that is over, sitting in the shared state dir, mtime irrelevant.
+  const theirs = disarmFile(JSON.stringify({ session: 's-1111111111111111', at: Date.now() }));
+  assert.equal(H.disarmedHere(theirs, mine, startedAt), false,
+    'another session\'s disarm is not this session\'s, however recently it was written');
+});
+
+test('rule 2: with no identity to compare, the monitor\'s own start time decides', () => {
+  // A host that exports none of the three session variables gives the monitor
+  // an EMPTY identity set - it has no payload to fall back on, unlike a hook
+  // [C monitors/monitors.json]. Ownership cannot answer, so lifetime does: a
+  // monitor's lifetime is its session's lifetime [S5].
+  const none = new Set();
+  const startedAt = Date.now() - 60000;
+
+  const old = disarmFile('not json, no session, no owner\n', 120000);
+  assert.equal(H.disarmedHere(old, none, startedAt), false,
+    'written before this monitor existed, so it belongs to a session that is over');
+
+  const fresh = disarmFile('not json, no session, no owner\n');
+  assert.equal(H.disarmedHere(fresh, none, startedAt), true,
+    'written while this monitor was running, so `rest` still means rest');
+
+  // Same fallback when the record names an owner but this process has no
+  // identity at all to weigh it against.
+  const stamped = disarmFile(JSON.stringify({ session: 's-1111111111111111', at: Date.now() }), 120000);
+  assert.equal(H.disarmedHere(stamped, none, startedAt), false);
+
+  // And an unreadable record does NOT get the ownership branch even when the
+  // monitor does have an identity: nobody owns it, so lifetime decides.
+  assert.equal(H.disarmedHere(old, new Set(['sess-hb-disarm', OWNER]), startedAt), false);
+});
+
+// ================================================= the section 10.2 latch ====
+//
+// The monitor's OTHER unscoped read of a per-session record: session.json's
+// posting_stopped. Taken bare, a previous session's auth failure kept the
+// primary heartbeat silent in every later session - the same shape as the
+// disarm above, minus the disarm's permanence (the CLI relatches per session).
+//
+// "Did it beat?" is answered by a file on disk, not a mock: the endpoint is the
+// discard port, so a beat that happens lands in the OFFLINE queue with no
+// network anywhere [C test/stop-hook.test.js, same device].
+
+const CLI = path.join(ROOT, 'bin', 'handshake.js');
+const DEAD_ENDPOINT = 'http://127.0.0.1:9';         // discard port: always refused
+const BEATER = 'sess-hb-beat';
+
+function joinedNtfy() {
+  const root = tmpDir('hs-hb-ntfy-');
+  const box = { project: path.join(root, 'project'), data: path.join(root, 'data') };
+  fs.mkdirSync(box.project, { recursive: true });
+  const run = (args, stdin) => spawnSync(process.execPath, [CLI].concat(args), {
+    cwd: box.project, input: stdin === undefined ? '' : stdin, encoding: 'utf8', timeout: 30000,
+    env: baseEnv({ HANDSHAKE_STATE_DIR: box.data, HANDSHAKE_SKIP_HOST_CHECKS: '1', HANDSHAKE_SESSION_ID: BEATER }),
+  });
+  run(['init', '--ntfy', DEAD_ENDPOINT, '--name', 'acme app']);
+  const blob = run(['invite', '--inline']).stdout.trim().split('\n').pop().trim();
+  assert.match(blob, /^hsi1_/, 'the fixture needs a real invite blob');
+  run(['join', blob, '--as', 'tester'], 'y\n');
+  box.ws = JSON.parse(run(['status', '--json']).stdout).workspace.ws;
+  box.state = St.openState(box.ws, { env: { HANDSHAKE_STATE_DIR: box.data } });
+  return box;
+}
+
+function queuedPresence(box) {
+  try {
+    const q = JSON.parse(fs.readFileSync(path.join(box.data, box.ws, 'queue.json'), 'utf8'));
+    return (q.entries || []).filter((e) => e.envelope && e.envelope.type === 'presence.update').length;
+  } catch (_) { return 0; }
+}
+
+function latch(box, session) {
+  fs.writeFileSync(box.state.files.session, JSON.stringify({
+    session, reported: {}, posting_stopped: { ntfy: { code: 'auth', at: Date.now() } },
+    counts: {}, at: Date.now(),
+  }));
+}
+
+async function runMonitorOnce(box, waitFor) {
+  const child = spawn(process.execPath, [MONITOR], {
+    cwd: box.project, stdio: 'ignore',
+    env: baseEnv({ HANDSHAKE_STATE_DIR: box.data, HANDSHAKE_SESSION_ID: BEATER }),
+  });
+  try {
+    let waited = 0;
+    while (waited < waitFor) { if (queuedPresence(box) > 0) break; await sleep(200); waited += 200; }
+  } finally {
+    try { child.kill(); } catch (_) { /* already gone */ }
+    await sleep(200);
+  }
+}
+
+test('a PREVIOUS session\'s posting_stopped latch does not silence the monitor', async () => {
+  const box = joinedNtfy();
+  // session.json is rewritten whole whenever the id differs [C lib/state.js:434],
+  // so `session` on it names the session that latched. A latch from a session
+  // that is over is not "posting has stopped for the rest of the session".
+  latch(box, St.State.sessionId('sess-hb-earlier'));
+  assert.equal(queuedPresence(box), 0, 'the fixture starts with nothing on the wire');
+
+  await runMonitorOnce(box, 20000);
+  assert.ok(queuedPresence(box) > 0,
+    'the primary heartbeat beats: a stale latch is not this session\'s latch');
+});
+
+test('this session\'s own posting_stopped latch does silence the monitor', async () => {
+  const box = joinedNtfy();
+  latch(box, St.State.sessionId(BEATER));
+
+  // The beat rides the FIRST tick, which runs immediately [C monitors/heartbeat.js
+  // main()] - the positive case above lands inside two seconds. A full poll
+  // window of silence is the negative, without paying for three of them.
+  await runMonitorOnce(box, H.POLL_MS);
+  assert.equal(queuedPresence(box), 0,
+    'section 10.2: once posting has stopped for THIS session it stays stopped');
+});
+
 // ========================================================= module hygiene ====
 
 test('requiring the monitor starts nothing and installs no process handlers', () => {

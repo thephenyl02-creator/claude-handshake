@@ -429,9 +429,14 @@ async function cmdInit(args) {
   // tells them to do - claim, note, presence - dies with "from.member is
   // required - join the workspace first". Nobody should have to join their own
   // workspace with their own invite.
-  const founderName = typeof args.flags.as === 'string' && args.flags.as.trim()
-    ? args.flags.as.trim()
-    : defaultMemberName();
+  const asFlag = typeof args.flags.as === 'string' && args.flags.as.trim() ? args.flags.as.trim() : null;
+  const founderName = asFlag || defaultMemberName();
+  // SECURITY.md 9 is about what the protocol carries. When --as is absent the
+  // name IS this machine's login name [C bin/handshake.js:391], and it goes on
+  // the wire in ws.join and in every later `from.member_name`. Deriving it is
+  // fine; deriving it silently is not - so the derivation is announced before
+  // the relay enrolment below sends it anywhere.
+  if (!asFlag) out('member name: ' + founderName + '  (from this machine\'s username - `--as <name>` to choose your own)');
   let founderMember = founderName;
   let founderToken = null;
   if (transport === 'relay') {
@@ -494,7 +499,17 @@ async function cmdInit(args) {
     layer = writeRepoLayer(ws, state.read(), { detected, state, filterOpts: { projectDir: process.cwd() } });
     printRepoLayer(layer);
     const email = repoLib.localGitEmail(detected.root);
-    if (email) state.update((s) => { s.git_email = email; return s; });
+    if (email) {
+      state.update((s) => { s.git_email = email; return s; });
+      // SECURITY.md 5.4: the non-member-commit check compares a shard's last
+      // committer against the member emails RECORDED AT JOIN. The founder never
+      // joins - `init` is their join - so without this line their own member id
+      // has no recorded email and every shard they write comes back
+      // `no_recorded_email_for_member` [C lib/workspace-files.js:428], i.e. the
+      // check is inert for the one member who is always there. Same two lines
+      // `join` runs [C bin/handshake.js:682-686].
+      wsFiles.recordMemberEmail(state, founderMember, email);
+    }
   } else if (!args.flags['no-repo']) {
     out('');
     out('  no git working tree here - no durable layer was written. `.handshake/` only');
@@ -1914,9 +1929,12 @@ async function cmdDeployRelay(args) {
   // enrolment `init` does, for the same reason: without a member id and a
   // sub-token every later relay call sends an undefined bearer token and gets
   // 401, and the monitor runs with stdio ignored so no human ever sees it.
-  const founderName = typeof args.flags.as === 'string' && args.flags.as.trim()
-    ? args.flags.as.trim()
-    : defaultMemberName();
+  const asFlag = typeof args.flags.as === 'string' && args.flags.as.trim() ? args.flags.as.trim() : null;
+  const founderName = asFlag || defaultMemberName();
+  // Same reason as `init`: an --as-less name is this machine's login name
+  // [C bin/handshake.js:391] and it goes on the wire, so it is announced
+  // before the enrolment below carries it there.
+  if (!asFlag) out('member name: ' + founderName + '  (from this machine\'s username - `--as <name>` to choose your own)');
   let founderMember = founderName;
   let founderToken = null;
   try {
@@ -1968,7 +1986,13 @@ async function cmdDeployRelay(args) {
     const layer = writeRepoLayer(created.ws, state.read(), { detected, state, filterOpts: { projectDir: process.cwd() } });
     printRepoLayer(layer);
     const email = repoLib.localGitEmail(detected.root);
-    if (email) state.update((s) => { s.git_email = email; return s; });
+    if (email) {
+      state.update((s) => { s.git_email = email; return s; });
+      // The founder's own shard-authorship record, exactly as `init` and `join`
+      // write it - without it SECURITY.md 5.4's check has nothing to compare
+      // the founder's shards against [C lib/workspace-files.js:428].
+      wsFiles.recordMemberEmail(state, founderMember, email);
+    }
   }
 
   // Mint the inline invite (relay: carries the secret AND the enrollment token).
@@ -2206,7 +2230,7 @@ const COMMANDS = {
 const USAGE = [
   'handshake <command> [options]',
   '',
-  '  init      [--relay <origin> | --ntfy <base-url>] [--name <name>] [--no-repo] [--claude-md]',
+  '  init      [--relay <origin> | --ntfy <base-url>] [--name <name>] [--as <member name>] [--no-repo] [--claude-md]',
   '  invite    [--inline | --repo] [--json]',
   '  join      <hsi1_...> [--as <member name>] [--claude-md]',
   '  claim     "<subject>" [--ttl <seconds>] [--files a,b]',
@@ -2215,7 +2239,7 @@ const USAGE = [
   '  done      "<subject>" [--summary "..."] [--files a,b]',
   '  note      discovery|error|fix|blocker|info "<text>" [--paths a,b] [--subject "..."]',
   '  warn      overlap --subject "..." --peer <member> --peer-subject "..."',
-  '  presence  working|waiting|blocked|tooling_broken [--note "..."] [--branch <b>] [--agents <n>]',
+  '  presence  working|waiting|blocked|tooling_broken [--note "..."] [--branch <b>] [--agents <n>] [--reason <why>: tooling_broken only]',
   '  post      <note.*|warn.overlap|task.change> --text "..." [--paths a,b]',
   '  sync      [--limit <n>] [--json] [--inject-digest] [--guard-refresh]',
   '  cursor    [--commit]',

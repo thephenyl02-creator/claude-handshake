@@ -5,7 +5,7 @@
 // do not start in headless or subagent sessions [S5]; a host without monitors
 // MUST fall back to heartbeating on the Stop hook and MUST say so in
 // `/handshake status` (section 10.2)." `handshake status` said so from v0.1.0
-// [C bin/handshake.js:1239] while hooks/hooks.json registered no Stop hook at
+// [C bin/handshake.js:1293] while hooks/hooks.json registered no Stop hook at
 // all, so the sentence was true about a beat that did not exist. This file
 // exists to keep that from happening again in either direction: it proves the
 // hook beats, and - the larger half - that it does NOT beat in the five cases
@@ -116,10 +116,13 @@ function beParent(box, sessionId) {
   });
 }
 
-function cli(box, args, stdin) {
+// `envExtra` exists for one reason: the CLI derives its session id from the
+// ENVIRONMENT [C bin/handshake.js:133-137], so a test that wants `rest` to
+// stamp its sentinel with a known session has to say which one.
+function cli(box, args, stdin, envExtra) {
   const r = spawnSync(process.execPath, [CLI].concat(args), {
     cwd: box.project, input: stdin === undefined ? '' : stdin, encoding: 'utf8', timeout: 30000,
-    env: baseEnv({ HANDSHAKE_STATE_DIR: box.data, HANDSHAKE_SKIP_HOST_CHECKS: '1' }),
+    env: baseEnv(Object.assign({ HANDSHAKE_STATE_DIR: box.data, HANDSHAKE_SKIP_HOST_CHECKS: '1' }, envExtra || {})),
   });
   return { code: r.status, out: r.stdout || '', err: r.stderr || '' };
 }
@@ -320,6 +323,212 @@ test('section 10.2: the posting_stopped latch is honored per transport', () => {
   }));
   stop(box);
   assert.equal(queued(box, 'presence.update').length, before + 1);
+});
+
+// ================================================ per-session, not forever ===
+//
+// Both switches above are per-SESSION by contract - `rest` says "broadcasting
+// stopped for this session" [C bin/handshake.js:1849] and section 10.2 says
+// "for the rest of the session" - and both are read out of files that outlive
+// the session that wrote them. The monitor could ignore that, because it is one
+// process per session that quits anyway [C monitors/heartbeat.js:60]; this hook
+// is a fresh process every turn, forever, so an unscoped read of either file
+// meant ONE `rest` (or one previous session's auth failure) silenced the
+// fallback in every session that machine would ever run - while `status` went
+// on promising a beat [C bin/handshake.js:1293].
+
+test('a PREVIOUS session\'s disarm sentinel does not silence this one', () => {
+  const box = joinedNtfy();
+  const before = queued(box, 'presence.update').length;
+  // The shape `rest` writes [C bin/handshake.js:1842], stamped with somebody
+  // else's session. Nothing on disk distinguishes "left by a session that
+  // ended" from "written a second ago" except this field.
+  fs.writeFileSync(path.join(box.state.dir, 'monitor.disarm'),
+    JSON.stringify({ session: 's-0000000000000000', at: Date.now() }) + '\n');
+
+  stop(box);
+  assert.equal(queued(box, 'presence.update').length, before + 1,
+    'another session\'s rest is not this session\'s rest');
+  assert.equal(markerBody(box), 'waiting');
+});
+
+test('a disarm sentinel nobody owns is not honoured either', () => {
+  const box = joinedNtfy();
+  const before = queued(box, 'presence.update').length;
+  // The deliberate direction of the unattributable case. Ignoring it costs one
+  // session of beating at the transport's own keepalive, which is visible and
+  // recoverable; honouring it is silent and permanent, which is the defect.
+  fs.writeFileSync(path.join(box.state.dir, 'monitor.disarm'), 'not json, no session, no owner\n');
+
+  stop(box);
+  assert.equal(queued(box, 'presence.update').length, before + 1);
+});
+
+test('a PREVIOUS session\'s posting_stopped latch does not silence this one', () => {
+  const box = joinedNtfy();
+  const before = queued(box, 'presence.update').length;
+  // session.json is rewritten whole whenever the id differs [C lib/state.js:434],
+  // so `session` on it names the session that latched. A latch from a session
+  // that is over is not "posting has stopped for the rest of the session".
+  fs.writeFileSync(box.state.files.session, JSON.stringify({
+    session: 's-1111111111111111', reported: {}, posting_stopped: { ntfy: true }, counts: {}, at: Date.now(),
+  }));
+
+  stop(box);
+  assert.equal(queued(box, 'presence.update').length, before + 1, 'a stale latch is not this session\'s latch');
+});
+
+test('`handshake rest` disarms the session that ran it - and no session after it', () => {
+  const box = joinedNtfy();
+
+  // The REAL command, run as this session: `rest` writes both switches at once
+  // - the disarm sentinel and the section 10.2 latch [C bin/handshake.js:1841-1846]
+  // - so this one call exercises both gates through the code that ships.
+  const r = cli(box, ['rest'], '', { HANDSHAKE_SESSION_ID: SESSION });
+  assert.equal(r.code, 0, r.err);
+  const sentinel = path.join(box.state.dir, 'monitor.disarm');
+  assert.equal(JSON.parse(fs.readFileSync(sentinel, 'utf8')).session,
+    stateLib.State.sessionId(SESSION), 'rest stamps the sentinel with the session that rested');
+
+  const rested = queued(box, 'presence.update').length;
+  stop(box);
+  assert.equal(queued(box, 'presence.update').length, rested, 'resting means resting, in the session that rested');
+  assert.equal(markerBody(box), null);
+
+  // A NEW session in the same project, sharing the same state dir. Both files
+  // are still there - nothing removes them mid-session - and both belong to a
+  // session that is over.
+  const NEXT = 'sess-stop-next';
+  beParent(box, NEXT);
+  stop(box, { payload: { sessionId: NEXT } });
+  assert.equal(queued(box, 'presence.update').length, rested + 1,
+    'the next session gets its heartbeat back');
+  assert.ok(fs.existsSync(sentinel), 'and the Stop hook never deletes the sentinel to get it');
+});
+
+// ---------------------------------------------------------- and it is swept --
+
+// The belt to the Stop hook's braces. `rest` is a per-session switch, so the
+// sentinel dies with the session that armed it, exactly like monitor.alive
+// [C hooks/session-end.js:30]. SessionEnd is best-effort (20 of 21 [S4]), which
+// is why the scoping above still has to hold on its own.
+
+function sessionEnd(box, opts) {
+  const o = opts || {};
+  const r = spawnSync(process.execPath, [path.join(HOOKS, 'session-end.js'), 'SessionEnd'], {
+    input: JSON.stringify(Object.assign({
+      hookEventName: 'SessionEnd', sessionId: SESSION, workingDirectory: box.project, reason: 'clear',
+    }, o.payload || {})),
+    encoding: 'utf8', cwd: box.project, timeout: 30000,
+    env: baseEnv(Object.assign({ HANDSHAKE_STATE_DIR: box.data }, o.env || {})),
+  });
+  assert.equal(r.status, 0, 'a hook exits 0 always; stderr: ' + r.stderr);
+  return r;
+}
+
+test('SessionEnd sweeps THIS session\'s disarm sentinel, and only this session\'s', () => {
+  const box = joinedNtfy();
+  const sentinel = path.join(box.state.dir, 'monitor.disarm');
+
+  // A subagent's SessionEnd must not re-arm its parent's heartbeat: unlike
+  // monitor.alive, this file is not self-healing, so the sweep sits after the
+  // child check [C hooks/session-end.js].
+  fs.writeFileSync(sentinel, JSON.stringify({ session: SESSION, at: Date.now() }) + '\n');
+  sessionEnd(box, { payload: { agent_id: 'agent-1', agent_type: 'general-purpose' } });
+  assert.equal(fs.existsSync(sentinel), true, 'a child sweeps nothing');
+
+  // Another parent session in the same project shares this state dir; deleting
+  // its disarm would start beating for a session that deliberately stopped.
+  fs.writeFileSync(sentinel, JSON.stringify({ session: 's-2222222222222222', at: Date.now() }) + '\n');
+  sessionEnd(box);
+  assert.equal(fs.existsSync(sentinel), true, 'another session\'s rest survives this session\'s end');
+
+  fs.writeFileSync(sentinel, JSON.stringify({ session: SESSION, at: Date.now() }) + '\n');
+  sessionEnd(box);
+  assert.equal(fs.existsSync(sentinel), false, 'this session\'s rest ends with this session');
+});
+
+// =========================================== the founder is a member too =====
+
+// SECURITY.md 5.4's non-member-commit check compares a shard's last committer
+// against the member emails RECORDED AT JOIN. The founder never joins - `init`
+// is their join - so a founder whose email is never recorded makes the check
+// inert for the one member who is always present: every shard they write comes
+// back `no_recorded_email_for_member` [C lib/workspace-files.js:428].
+
+function gitProject() {
+  const root = fs.realpathSync.native(tmpDir('hs-stop-git-' + (n++) + '-'));
+  const box = { project: path.join(root, 'project'), data: path.join(root, 'data') };
+  fs.mkdirSync(box.project, { recursive: true });
+  const g = (...a) => spawnSync('git', ['-C', box.project].concat(a), { encoding: 'utf8', windowsHide: true });
+  g('init', '-q');
+  g('config', 'user.email', 'founder@example.com');
+  g('config', 'user.name', 'Founder');
+  g('config', 'commit.gpgsign', 'false');
+  // No remote: with no GitHub slug the private-repo guard never shells out to
+  // `gh`, which keeps this hermetic [C test/cli.test.js gitSandbox].
+  return box;
+}
+
+test('init records the founder\'s own git email, the way join records a joiner\'s', () => {
+  const box = gitProject();
+  const r = cli(box, ['init', '--ntfy', DEAD_ENDPOINT, '--name', 'acme app', '--as', 'alice']);
+  assert.equal(r.code, 0, r.err);
+  const ws = JSON.parse(cli(box, ['status', '--json']).out).workspace.ws;
+  const cfg = JSON.parse(fs.readFileSync(path.join(box.data, ws, 'state.json'), 'utf8'));
+
+  assert.equal(cfg.git_email, 'founder@example.com', 'the local git identity is read at init');
+  assert.deepEqual(cfg.member_emails, { alice: 'founder@example.com' },
+    'and it is recorded AGAINST THE MEMBER ID - the only form checkShardAuthors reads');
+});
+
+test('both founder sites do what join does: announce the derived name, record the email', () => {
+  // `init` is driven end to end above and below; `deploy-relay` reaches the same
+  // two lines only behind a mock wrangler runner and a mock fetch that live in
+  // test/deploy.test.js, so the second site is held to the invariant instead of
+  // re-staged here: wherever the founder's name is DERIVED it is announced, and
+  // wherever the founder's git email is READ it is recorded.
+  const src = fs.readFileSync(CLI, 'utf8').split('\n');
+  // A window, not adjacency: each site carries its own citation comment.
+  const near = (i, needle) => src.slice(i, i + 14).some((l) => l.includes(needle));
+
+  const derives = src.map((l, i) => [l, i]).filter(([l]) => /=\s*asFlag\s*\|\|\s*defaultMemberName\(\)/.test(l));
+  assert.equal(derives.length, 2, 'exactly two founder sites derive a name: init and deploy-relay');
+  for (const [, i] of derives) {
+    assert.ok(near(i, "out('member name: "), 'a derived member name is announced at line ' + (i + 1));
+  }
+
+  const reads = src.map((l, i) => [l, i]).filter(([l]) => l.includes('repoLib.localGitEmail('));
+  assert.equal(reads.length, 3, 'three sites read the local git email: init, join, deploy-relay');
+  for (const [, i] of reads) {
+    assert.ok(near(i, 'wsFiles.recordMemberEmail('),
+      'a git email that is read is recorded against the member at line ' + (i + 1));
+  }
+});
+
+// ============================================ the name that goes on the wire ==
+
+test('init announces a member name derived from the machine username, and only then', () => {
+  // docs/SECURITY.md 9 is about what the PROTOCOL carries; with --as absent the
+  // member name is os.userInfo().username [C bin/handshake.js:389-394] and it
+  // goes out in ws.join and every later from.member_name. Deriving it is fine.
+  // Deriving it silently is what made the doc read as a promise it could not keep.
+  const a = tmpDir('hs-stop-name-a-' + (n++) + '-');
+  const boxA = { project: path.join(a, 'project'), data: path.join(a, 'data') };
+  fs.mkdirSync(boxA.project, { recursive: true });
+  const r = cli(boxA, ['init', '--ntfy', DEAD_ENDPOINT, '--name', 'acme app', '--no-repo']);
+  assert.equal(r.code, 0, r.err);
+  assert.match(r.out, /^member name: \S.*machine's username/m, 'the derived name is shown before anything is sent');
+  const shown = (r.out.match(/^member name: (.+?)\s\s/m) || [])[1];
+  const cfgWs = JSON.parse(cli(boxA, ['status', '--json']).out).workspace;
+  assert.equal(shown, cfgWs.member_name, 'and it is the name that was actually taken');
+
+  const b = tmpDir('hs-stop-name-b-' + (n++) + '-');
+  const boxB = { project: path.join(b, 'project'), data: path.join(b, 'data') };
+  fs.mkdirSync(boxB.project, { recursive: true });
+  const named = cli(boxB, ['init', '--ntfy', DEAD_ENDPOINT, '--name', 'acme app', '--no-repo', '--as', 'alice']);
+  assert.equal(named.code, 0, named.err);
+  assert.equal(/member name:/.test(named.out), false, 'nothing was derived, so there is nothing to announce');
 });
 
 // ============================================================== the wiring ===

@@ -25,6 +25,10 @@ const POLL_MS = 5000;                    // disarm responsiveness, not heartbeat
 const MAX_FILES = 64;                    // PROTOCOL section 2.5
 
 function main() {
+  // The monitor's own start. A monitor's lifetime IS its session's lifetime
+  // (section 8), so this is the only clock that tells "written during my
+  // session" from "left behind by an earlier one" - see disarmedHere().
+  const startedAt = Date.now();
   const cwd = process.env.CLAUDE_PROJECT_DIR || process.cwd();
   const found = C.resolveWorkspace(cwd);
   if (!found) return quit();                          // not a handshake workspace: exit immediately
@@ -39,6 +43,15 @@ function main() {
   const disarm = C.sentinel(state, 'monitorDisarm');
   const activity = C.sentinel(state, 'activity');
   const stateLib = C.lib('state.js');
+
+  // Every id this monitor answers to. Unlike a hook it is launched as a bare
+  // command with no stdin payload [C monitors/monitors.json], so it has no
+  // `session_id` field to offer: the environment is its only source - which is
+  // also the CLI's only source [C bin/handshake.js:135], so the two agree
+  // wherever the host exports one of the three variables. Where it exports
+  // none, this set is EMPTY, and disarmedHere() below is what keeps `rest`
+  // working anyway.
+  const mine = C.sessionIdentities(null);
 
   let lastBeat = 0;
   let lastState = null;
@@ -56,8 +69,12 @@ function main() {
 
   const tick = async () => {
     // Sentinel-file disarm: `handshake rest` writes it, and it is the ONLY
-    // mid-session disarm the monitor contract allows [S5].
-    if (C.ageMs(disarm) !== null) { cleanup(); return quit(); }
+    // mid-session disarm the monitor contract allows [S5]. THIS session's,
+    // though - a bare existence check here was the worst instance of the
+    // unscoped read, because this is the PRIMARY heartbeat: nothing on any
+    // path removes the sentinel while a session runs, so one `rest` made every
+    // future monitor in the workspace quit on its first poll, permanently.
+    if (disarmedHere(disarm, mine, startedAt)) { cleanup(); return quit(); }
     C.touch(alive);
     if (busy) return;
 
@@ -73,12 +90,21 @@ function main() {
       : (lastBeat === 0 || stateChanged || Date.now() - lastBeat >= K);
     if (!due) return;
 
-    // section 10.2: once posting has stopped on this transport for the
-    // session, it stays stopped. Spawning the CLI to be refused every minute
-    // would be a rate-limit amplifier.
+    // section 10.2: once posting has stopped on this transport FOR THE SESSION
+    // it stays stopped. Spawning the CLI to be refused every minute would be a
+    // rate-limit amplifier.
+    //
+    // "for the session" is the whole rule, and session.json names whose: the
+    // file is rewritten from scratch whenever the id differs
+    // [C lib/state.js:434]. Unlike the disarm above there is no time fallback
+    // here, and deliberately so: this latch is an OPTIMISATION (it saves a
+    // spawn that would be refused), so ignoring a latch we cannot attribute
+    // costs one CLI spawn per keepalive - the transport's own sanctioned
+    // cadence, not an amplification of it - and the CLI re-derives its own
+    // flags on that spawn and re-latches if posting really is still refused.
     if (stateLib) {
       const s = stateLib.readJsonFile(state.files.session, null);
-      if (s && s.posting_stopped && s.posting_stopped[transport]) return;
+      if (C.ownsRecord(s, mine) && s.posting_stopped && s.posting_stopped[transport]) return;
     }
 
     busy = true;
@@ -96,6 +122,39 @@ function main() {
   const timer = setInterval(() => { tick().catch(() => {}); }, POLL_MS);
   if (timer.unref) { /* deliberately NOT unref'd: the interval IS the process */ }
   tick().catch(() => {});
+}
+
+// Is this disarm sentinel THIS session's? Two answers, in order.
+//
+// 1. OWNERSHIP, the shared rule every other reader of this file uses
+//    [C hooks/common.js ownsRecord]. `rest` stamps the sentinel with the
+//    session that wrote it [C bin/handshake.js:1842], and another session's
+//    disarm is not this session's.
+//
+// 2. START TIME, when ownership cannot decide - the record names nobody (an
+//    older client, or a torn write), or this process has no identity at all
+//    because the host exports none of the three session variables. A hook
+//    cannot do this: it is a fresh process every turn with no idea when its
+//    session began, which is why hooks/stop.js stops at rule 1 and treats an
+//    unattributable record as someone else's. A monitor can: its lifetime is
+//    its session's lifetime (section 8, [S5]), so a sentinel whose mtime is
+//    newer than this process's start was necessarily written after this
+//    session began, and a sentinel older than that was necessarily left behind
+//    by a session that is over.
+//
+// Rule 2 is not decoration. Without it, an env-less host would trade the
+// permanent disarm for a `rest` that no longer stops the monitor at all - the
+// user's own command silently ignored, which is a worse failure than the one
+// being fixed. It errs toward stopping (a second parent session in the same
+// project resting would stop this monitor too, on such a host); stopping is
+// visible in `status` and recoverable by restarting the session, and it is the
+// direction that keeps `rest` honest.
+function disarmedHere(file, mine, startedAt) {
+  const mtime = C.mtimeMs(file);
+  if (mtime === null) return false;                   // absent: nothing to obey
+  const owner = C.recordOwner(C.readRecord(file));
+  if (owner !== null && mine && mine.size) return mine.has(owner);
+  return mtime >= startedAt;
 }
 
 // One heartbeat: carry the whole agent tree's file footprint, then renew.
@@ -205,4 +264,4 @@ if (require.main === module) {
 // MUST take the same beat, not a second implementation of one - a duplicate
 // would drift on the fold, the push delta or the local renewal and only be
 // caught in production.
-module.exports = { beat, fold, pendingPush, markPushed, renewLocal, MAX_FILES, POLL_MS };
+module.exports = { beat, fold, pendingPush, markPushed, renewLocal, disarmedHere, MAX_FILES, POLL_MS };

@@ -40,7 +40,12 @@ function run(f) {
   const syncPending = C.isFresh(pending, 15000);
 
   const now = Date.now();
-  const view = C.buildView(state, found, { now, syncPending });
+  // sessionId: buildView scopes the ' · posting stopped (auth)' note to the
+  // session that latched it [C hooks/common.js ownsRecord]. Without an identity
+  // here it falls back to the environment, and on a host exporting none of the
+  // session variables the note is dropped rather than shown - a true line lost.
+  // The payload always carries it, so pass it.
+  const view = C.buildView(state, found, { now, syncPending, sessionId: f.sessionId });
   const { block, plan } = R.renderWithPlan(view);
   process.stdout.write(block + '\n');
 

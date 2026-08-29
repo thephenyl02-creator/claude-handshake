@@ -295,8 +295,35 @@ a targeted sanitizer (PROTOCOL §Deferred).
 - **`.handshake/*` files read from disk are untrusted data**, escaped exactly
   like transport content. Without this, the git path bypasses transport
   escaping entirely `[P§3]`.
-- The digest MUST carry a warning when tasks files were **last modified by a
-  non-member commit** `[P§3]`.
+- The digest MUST carry a warning when a tasks shard's **last commit came from
+  an email other than the one recorded for that shard's own member** `[P§3]`.
+  The check is per shard, not a membership lookup: each
+  `.handshake/tasks/<member>.md` is compared against the email recorded for
+  *that* member, and only a difference is the warning
+  `[C lib/workspace-files.js:427-432,435,439]`. Its reach is exactly what the
+  client can prove, and no more: `member_emails` is written only by
+  `recordMemberEmail` `[C lib/workspace-files.js:459-469]`, which the CLI calls
+  for the LOCAL member only — the founder at `init` or `deploy-relay`, everyone
+  else at `join` `[C bin/handshake.js:511,685,1994]` — and a peer's email is
+  learned on *their* machine, never inferred from a shard's self-declared
+  header, a field an attacker writes too. So on any one machine only that
+  member's own shard can reach `mismatch`; every peer's shard has no recorded
+  email here and lands in `unknown`, along with any shard whose last commit
+  could not be read at all `[C lib/workspace-files.js:424,428,442]`.
+- **One flag, and the mismatch takes precedence.** Both lists are always
+  computed and persisted `[C lib/workspace-files.js:437-443,452-453]`, but the
+  digest carries a single `flag`: `non_member_commit` if any mismatch exists,
+  otherwise `unverified_shard_authors` if anything is unknown, otherwise
+  nothing `[C lib/workspace-files.js:442]`. Both renderers select one branch
+  off it `[C lib/workspace-files.js:524-533]` `[C bin/handshake.js:1284-1289]`,
+  so the MUST is exactly this: when there is **no** mismatch, an unknown shard
+  MUST be reported as `unverified` — a note, never an alarm. When there **is**
+  a mismatch, the louder warning is what gets shown and the unverified shards
+  are not reported alongside it; they remain in local state under
+  `repo_warnings.unverified` and are absent even from `status --json`, whose
+  repo block carries only the flag and the mismatches
+  `[C bin/handshake.js:1246-1247]`. The guarantee is therefore that a shard is
+  never silently reported as clean, not that both signals are shown at once.
 - Per-workspace `inject: on|off`; `/handshake mute` is purely local state
   `[P§3]`.
 - **The invite chain is human-gated**: `join` always prints relay host,
@@ -315,6 +342,10 @@ a targeted sanitizer (PROTOCOL §Deferred).
   the plugin route fails skips it entirely: it fetches the moving `main`
   archive over HTTPS and verifies no digest. Pinning the fallback to a tagged
   asset, and the manifest to a tag, is open work — not a shipped guarantee.
+  That the recorded digest is the released archive's own is held by a release
+  gate, not by CI: it is rebuilt and diffed by hand at tag time (PLAN.md §8),
+  because the hash describes the previous release's artifact and any
+  per-commit assertion on it would fail on the next commit.
   Invites are documented as credentials `[P§3]` (PROTOCOL §9.1).
 
 ### 5.5 Unsigned fields are never acted on
@@ -469,7 +500,20 @@ endpoint or token change, reporting the dropped count (PROTOCOL §10.3).
 - **Machine pseudonyms, never hostnames.** `machine` is a random per-install
   value `[P§2]`, format `m-<8 hex>` (PROTOCOL §1). `session` is a hash of the
   host session id, not a path `[F]`. Nothing in the protocol carries a
-  username, hostname, absolute path, IP address or working directory.
+  hostname, absolute path, IP address or working directory.
+- **The member id is the one field that can carry your local username.** `init`
+  and `deploy-relay` have to work unattended, so when `--as` is absent they
+  DERIVE the member id from `os.userInfo().username` — non-printable characters
+  stripped, whitespace folded to `-`, truncated to 48 chars, `founder` if
+  nothing survives — with no prompt `[C bin/handshake.js:389-394]`
+  `[C bin/handshake.js:432-433]` `[C bin/handshake.js:1932-1933]`. That id is
+  what the relay stores and what peers see in every envelope, and it is
+  injected into their model context (§5.3), so both commands print the derived
+  name before enrolling anything `[C bin/handshake.js:439,1937]`. `--as <name>`
+  on either command replaces it outright, and `join` never derives at all: it
+  takes `--as`, or asks the human for a member name
+  `[C bin/handshake.js:618-620]`. Pick the id you want peers to read — a
+  derived name is a default, not a guarantee of anonymity.
 - **Observability off by default** `[R6]`: `[observability] enabled = false` in
   `wrangler.toml`, because platform invocation logs record request URLs and a
   URL here contains the workspace id `[C relay/README.md]`.

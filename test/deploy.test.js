@@ -264,7 +264,7 @@ test('provisionRelay runs the whole flow: login path, create token never on argv
   const token = prov.createToken;
   assert.ok(token && token.length >= 40);
   for (const c of runner.calls) {
-    assert.equal(c.argv.join(' ').includes(token), false, 'the create token must never be an argv token');
+    assert.equal(c.argv.join('\x00').includes(token), false, 'the create token must never be an argv token');
   }
   const secretCall = runner.calls.find((c) => c.argv.join(' ').includes('secret put'));
   assert.ok(secretCall, 'secret put must have been called');

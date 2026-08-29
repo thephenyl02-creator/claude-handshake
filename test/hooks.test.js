@@ -20,7 +20,9 @@ const assert = require('node:assert');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { spawnSync } = require('child_process');
+const { spawn, spawnSync } = require('child_process');
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const ROOT = path.join(__dirname, '..');
 const HOOKS = path.join(ROOT, 'hooks');
@@ -389,17 +391,54 @@ test('PostToolUse mtime sentinel gates the second firing of a burst', () => {
   assert.deepStrictEqual(w.state.getOwnClaims()[0].files, ['src/a.ts', 'src/b.ts'], 'capped union, never a replace');
 });
 
-test('the monitor disarm sentinel is what stops the clock, and nothing else', () => {
+// This test used to hand the monitor a sentinel stamped `s-x` - a session it
+// demonstrably is not - and assert that the monitor quit. It did, and that WAS
+// the defect: nothing on the posting path removes monitor.disarm, so one
+// `handshake rest` made every future monitor in the workspace quit on its first
+// poll, forever. Because the monitor is the PRIMARY heartbeat, that killed
+// presence outright rather than only the Stop-hook fallback. The case is kept,
+// with the verdict it should always have had.
+test('the disarm sentinel stops the clock only for the session that armed it', async () => {
   const w = mkWorkspace();
+  const SESSION = 'sess-disarm-1';
+  const alive = path.join(w.state.dir, 'monitor.alive');
   const disarm = path.join(w.state.dir, 'monitor.disarm');
+
+  // Section 10.2's latch, owned by THIS session. It is a real monitor state,
+  // and it is what lets the whole clock run - poll, disarm check, presence
+  // decision - with no CLI spawn and no network [C test/heartbeat.test.js,
+  // same device].
+  fs.writeFileSync(w.state.files.session, JSON.stringify({
+    session: stateLib.State.sessionId(SESSION), reported: {},
+    posting_stopped: { relay: { code: 'auth', at: Date.now() } }, counts: {}, at: Date.now(),
+  }));
+  // A leftover from a session that is over, stamped the way `rest` stamps it
+  // [C bin/handshake.js:1842].
   fs.writeFileSync(disarm, JSON.stringify({ session: 's-x', at: Date.now() }));
-  const res = spawnSync(process.execPath, [path.join(ROOT, 'monitors', 'heartbeat.js')], {
-    cwd: w.proj, encoding: 'utf8', timeout: 20000,
-    env: baseEnv({ HANDSHAKE_STATE_DIR: w.data, CLAUDE_PROJECT_DIR: w.proj }),
+
+  const child = spawn(process.execPath, [path.join(ROOT, 'monitors', 'heartbeat.js')], {
+    cwd: w.proj, stdio: 'ignore',
+    env: baseEnv({ HANDSHAKE_STATE_DIR: w.data, CLAUDE_PROJECT_DIR: w.proj, HANDSHAKE_SESSION_ID: SESSION }),
   });
-  assert.strictEqual(res.status, 0, 'the monitor self-exits on the sentinel');
-  assert.strictEqual(res.stdout, '', 'a monitor NEVER writes to stdout [S5]');
-  assert.ok(!fs.existsSync(path.join(w.state.dir, 'monitor.alive')), 'the liveness sentinel is cleaned up');
+  let code = null;
+  child.on('exit', (c) => { code = c; });
+  const H = require(path.join(ROOT, 'monitors', 'heartbeat.js'));
+  try {
+    // The first tick runs immediately, so a full poll past it is a clock that
+    // has evaluated the sentinel at least twice and kept going.
+    await sleep(H.POLL_MS + 1500);
+    assert.strictEqual(code, null, 'another session\'s disarm must not stop the primary heartbeat');
+    assert.ok(fs.existsSync(alive), 'and the liveness sentinel is still being touched');
+
+    // The same file, now stamped with the session actually running.
+    fs.writeFileSync(disarm, JSON.stringify({ session: stateLib.State.sessionId(SESSION), at: Date.now() }));
+    let waited = 0;
+    while (code === null && waited < 3 * H.POLL_MS) { await sleep(100); waited += 100; }
+    assert.strictEqual(code, 0, 'the monitor self-exits on its OWN sentinel');
+    assert.ok(!fs.existsSync(alive), 'the liveness sentinel is cleaned up');
+  } finally {
+    try { child.kill(); } catch (_) { /* already gone */ }
+  }
 });
 
 test('the monitor exits immediately when no workspace resolves', () => {
@@ -508,6 +547,63 @@ test('the documented agent_type marker forces a child verdict', () => {
   assert.strictEqual(C.childMode(null, 'startup', { env }).child, false);
   // And with no marker at all, the safe fallback says child.
   assert.strictEqual(C.childMode(null, null, { env }).child, true);
+});
+
+// ================================================== the posting-stopped note ==
+
+// " · posting stopped (auth)" [C hooks/render.js:68] is the one place a user
+// SEES section 10.2's latch, and the latch is per-session by definition ("for
+// the rest of the session"). buildView() derived it from a bare read of
+// session.json, so a previous session's auth failure printed the line into
+// every later session's standing block - a status claim about the user's own
+// session that was simply false. These two cases are the same gate the Stop
+// hook and the monitor apply to their own reads of the same file.
+
+function viewFixture() {
+  const w = mkWorkspace({ transport: 'relay' });
+  w.found = { ws: WS, root: w.proj, public: { ws: WS, name: 'acme-api', transport: 'relay' } };
+  return w;
+}
+
+function latch(w, session) {
+  fs.writeFileSync(w.state.files.session, JSON.stringify({
+    session, reported: {}, posting_stopped: { relay: { code: 'auth', at: Date.now() } },
+    counts: {}, at: Date.now(),
+  }));
+}
+
+test('the injected note reports THIS session\'s posting_stopped latch', () => {
+  const C = require(path.join(HOOKS, 'common.js'));
+  const w = viewFixture();
+  const SESSION = 'sess-note-1';
+
+  // The CLI stamps the hashed form [C bin/handshake.js:135, lib/state.js:256];
+  // the hook is handed the raw host id in its payload. The gate has to hold
+  // across that boundary, so the record is written the way the CLI writes it
+  // and the reader is given the id the way a hook receives it.
+  latch(w, stateLib.State.sessionId(SESSION));
+  const mine = C.buildView(w.state, w.found, { now: Date.now(), sessionId: SESSION, env: {} });
+  assert.strictEqual(mine.notes.posting_stopped, true,
+    'the session that latched must still be told its posting has stopped');
+});
+
+test('a PREVIOUS session\'s posting_stopped latch is not this session\'s note', () => {
+  const C = require(path.join(HOOKS, 'common.js'));
+  const w = viewFixture();
+
+  latch(w, stateLib.State.sessionId('sess-note-earlier'));
+  const view = C.buildView(w.state, w.found, { now: Date.now(), sessionId: 'sess-note-2', env: {} });
+  assert.strictEqual(view.notes.posting_stopped, false,
+    'a latch belonging to a session that is over must not appear in this one\'s block');
+
+  // An unattributable record is treated as someone else's, the same
+  // conservative direction the other two readers take [C hooks/common.js
+  // ownsRecord]: dropping a true line beats printing a false one.
+  fs.writeFileSync(w.state.files.session, JSON.stringify({
+    reported: {}, posting_stopped: { relay: true }, counts: {}, at: Date.now(),
+  }));
+  const orphan = C.buildView(w.state, w.found, { now: Date.now(), sessionId: 'sess-note-2', env: {} });
+  assert.strictEqual(orphan.notes.posting_stopped, false, 'no owner, no note');
 });
 
 // ============================================================ overlap gate ===

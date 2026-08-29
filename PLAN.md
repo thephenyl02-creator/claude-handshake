@@ -169,8 +169,15 @@ loud user-visible state, not silent degradation.
   plugin changes, installs, scope expansion, disabling mute/filter, or outbound
   posts. `.handshake/*` files read from disk get the identical untrusted-data
   treatment (the git path bypasses transport escaping otherwise), plus a digest
-  warning when tasks files were last modified by a non-member commit.
-  Per-workspace `inject: on|off`; `/handshake mute` is purely local state.
+  warning when a tasks shard's last commit came from an email other than the
+  one recorded for that shard's own member — per shard, not a membership
+  lookup [C lib/workspace-files.js:427-432]. Emails are recorded only for the
+  LOCAL member — founder at init/deploy-relay, everyone else at join
+  [C bin/handshake.js:511,685,1994] — so this machine can only ever raise the
+  warning on its own shard; peers' shards carry no recorded email here and are
+  reported `unverified` — a note, not a warning
+  [C lib/workspace-files.js:428,442]. Per-workspace `inject: on|off`;
+  `/handshake mute` is purely local state.
 - **Secret filter**: built BEFORE any send path exists, as the single
   chokepoint `filteredSend()` — a test greps the tree for direct adapter calls.
   Every outbound field is filter input (presence.note, branch, files[], claim
@@ -294,3 +301,23 @@ A: "implement feature X"; B: "fix the API issue", separate accounts/machines.
 - Per-turn context cost of the standing block → measured in M7/M11, published
   in README (the plugin panel shows it anyway).
 - Two-model tiebreak politeness → not relied on: deterministic rule in code.
+
+## 8. Release gate (M14 — run at tag time, not in CI)
+
+One rule, because it is the one thing no per-commit test can hold:
+
+- **Rebuild the archive at tag time and diff its sha256 against
+  `.claude-plugin/marketplace.json` before publishing.** Run
+  `node scripts/build-plugin-zip.js <x.y.z>` on the exact tagged tree, take the
+  `sha256:` line it prints [C scripts/build-plugin-zip.js:101-105], and confirm
+  it equals `plugins[0].source.sha256` in `.claude-plugin/marketplace.json`.
+  Differ → update the manifest and re-tag; never upload the zip first. The
+  build is byte-reproducible, so the same tree always yields the same hash
+  [C test/build-plugin-zip.test.js:242-256].
+
+Why this is a runbook line and NOT a test: the recorded hash describes the
+RELEASED artifact of the previous tag, so a per-commit assertion would go red
+on the first commit after every release. CI can only check the parts that do
+not depend on the artifact — that the URL carries the entry's version and that
+a 64-hex sha is present at all [C test/version.test.js:56-67]. Whether that hex
+is the *right* hash is decided here, by hand, once per tag.

@@ -94,8 +94,12 @@ function runtimeSet() {
 
   // The CLI is reached the other way round: the shipped command file and skill
   // are what tell the model to run it [C commands/handshake.md, the verb table;
-  // C skills/handshake-coordination/SKILL.md:329].
+  // C skills/handshake-coordination/SKILL.md:329]. Those markdown files are
+  // themselves runtime files — the host reads commands/*.md to offer the slash
+  // command and skills/*/SKILL.md to load the skill, so a zip without them
+  // installs and does nothing. Add each one, not just the bin/ paths inside it.
   for (const md of markdownUnder(['commands', 'skills'])) {
+    found.add(md);
     for (const m of read(md).matchAll(/(?:\$\{?CLAUDE_PLUGIN_ROOT\}?\/)?(bin\/[A-Za-z0-9._-]+\.js)/g)) addJs(m[1]);
   }
 
@@ -202,7 +206,10 @@ test('every file the plugin loads at runtime is in the archive', () => {
   assert.ok(runtime.length >= 25, 'derived runtime set is non-trivial, got ' + runtime.length);
   for (const rel of ['bin/handshake.js', 'monitors/heartbeat.js', 'monitors/monitors.json',
     'hooks/common.js', 'hooks/render.js', 'hooks/sync.js', 'lib/state.js',
-    'lib/secret-shapes.js', 'lib/outbound.js', 'relay/src/worker.js']) {
+    'lib/secret-shapes.js', 'lib/outbound.js', 'relay/src/worker.js',
+    // The two entry points a user actually touches: without them the plugin
+    // installs and offers nothing.
+    'commands/handshake.md', 'skills/handshake-coordination/SKILL.md']) {
     assert.ok(runtime.includes(rel), 'derivation reached ' + rel);
   }
   for (const rel of runtime) {

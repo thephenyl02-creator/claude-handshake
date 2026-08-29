@@ -14,26 +14,51 @@ const path = require('node:path');
 const ROOT = path.join(__dirname, '..');
 const LIB = path.join(ROOT, 'lib');
 const BIN = path.join(ROOT, 'bin');
+// SECURITY.md section 4 and PLAN.md say the test greps "the tree", not just the
+// library: hooks/ and monitors/ post too (hooks/stop.js is the heartbeat
+// fallback [C hooks/stop.js:3], monitors/heartbeat.js is the beat itself
+// [C hooks/stop.js:38]), so the chokepoint has to hold there as well.
+const HOOKS = path.join(ROOT, 'hooks');
+const MONITORS = path.join(ROOT, 'monitors');
 
 // The only files allowed to touch the network. Everything else must go through
 // an adapter, and every adapter gates before it publishes.
-const NETWORK_FILES = new Set(['transport.js', 'transport-relay.js', 'transport-ntfy.js']);
+//
+// Keyed on the REPO-RELATIVE PATH, not the basename. The scan covers four
+// roots now, and a basename-keyed allowlist exempts the name in every one of
+// them: a `hooks/transport.js` would have inherited lib/transport.js's licence
+// to call fetch and never been scanned at all. The exemption has to name the
+// one file it means.
+const NETWORK_FILES = new Set([
+  'lib/transport.js', 'lib/transport-relay.js', 'lib/transport-ntfy.js',
+]);
 
 function sourceFiles(dir) {
   return fs.readdirSync(dir).filter((f) => f.endsWith('.js')).map((f) => ({
-    name: f, file: path.join(dir, f), text: fs.readFileSync(path.join(dir, f), 'utf8'),
+    name: f,
+    rel: path.relative(ROOT, path.join(dir, f)).split(path.sep).join('/'),
+    file: path.join(dir, f),
+    text: fs.readFileSync(path.join(dir, f), 'utf8'),
   }));
 }
 
 test('only the transport adapters may reach the network', () => {
-  for (const f of sourceFiles(LIB).concat(sourceFiles(BIN))) {
-    if (NETWORK_FILES.has(f.name)) continue;
+  const scanned = [LIB, BIN, HOOKS, MONITORS].reduce((acc, d) => acc.concat(sourceFiles(d)), []);
+  assert.ok(scanned.some((f) => f.name === 'stop.js'), 'the hooks/ posting path must be in scope');
+  assert.ok(scanned.some((f) => f.name === 'heartbeat.js'), 'the monitors/ posting path must be in scope');
+  // Every allowlisted path must still exist, or the exemption is silently
+  // protecting nothing while its name drifts.
+  for (const rel of NETWORK_FILES) {
+    assert.ok(scanned.some((f) => f.rel === rel), 'the allowlist names ' + rel + ', which is not in the scan');
+  }
+  for (const f of scanned) {
+    if (NETWORK_FILES.has(f.rel)) continue;
     const hits = f.text.split('\n')
       .map((line, i) => ({ line, i }))
       // Ignore comments; we are looking at code, not prose about code.
       .filter(({ line }) => !/^\s*(\/\/|\*)/.test(line))
       .filter(({ line }) => /\bglobalThis\.fetch\b|\bfetchImpl\s*\(|(^|[^.\w])fetch\s*\(/.test(line));
-    assert.deepEqual(hits.map((h) => h.i + 1), [], f.name + ' must not call fetch directly');
+    assert.deepEqual(hits.map((h) => h.i + 1), [], f.rel + ' must not call fetch directly');
   }
 });
 
