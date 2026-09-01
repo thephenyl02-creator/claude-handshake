@@ -34,7 +34,7 @@ const T = require('../lib/transport');
 const deployLib = require('../lib/deploy');
 const { FilterViolation } = require('../lib/outbound');
 
-const CLIENT = 'claude-handshake/0.1.4';
+const CLIENT = 'claude-handshake/0.1.5';
 const INJECT_CAP = 5;                 // PROTOCOL section 6.2
 
 // ------------------------------------------------------------------ argv ----
