@@ -179,6 +179,116 @@ chat can do, and is exactly the capability §12 charges for honestly.
 
 ---
 
+## 2.1 Order of work (2026-09-01)
+
+**The owner's sequence, decided on 2026-09-01.** Co-build as designed in §3 is
+third, not first. Nothing in §3 changes; what changes is what runs before it.
+The reasoning is stated per rung rather than as a preamble, because each rung is
+justified by a different thing.
+
+**1. The knowledge layer — `docs/KNOWLEDGE.md`.** The cheapest rung by every
+measure that matters here: **no wire change, no PROTOCOL amendment, no new event
+type, two CLI verbs, zero chars of the 600-char per-turn budget**
+`[C hooks/render.js:31]`. Compare §3.S0, which amends a frozen `[F]` line at
+Opus xhigh and is *"ratified here or not at all"*, and §6.1's six new verbs. It
+pays off on every task rather than on the tasks where two people happen to be
+building two halves of one interface — which is the honest scope limit of the
+seam. And it is the rung that **puts the SessionStart shard scan on the critical
+path**: `DELEGATION §6.2` calls that scan *"the single highest-value item"* and
+notes it closes a gap that exists today — the durable layer is written by seven
+call sites `[C bin/handshake.js:786,822,843,852,883,1363,1848]` and read
+automatically by none, so the parting summary `[P§3.2]` mandates is never read
+either. §4's argument 5 put the scan in delegation's slice so it got built once;
+building it here builds it once and **earlier**, on the critical path of both
+remaining features. `KNOWLEDGE.md §9.K1` specifies it generically — scan shards
+→ typed records → render — so delegation asks it for `offer` / `offer_state` and
+changes nothing inside it.
+
+**2. The two-human run — M12(b) `[PLAN§5]`.** The gate, and it is a gate for
+things already shipped: the day-long volume measurement that decides whether
+zero-setup stays the default rung `[P§9.3]` `[PLAN§7]`, and the first honest
+read on whether relay deployment is the adoption wall. Running it **after** the
+knowledge layer makes it strictly more informative — the run then exercises the
+shard scan, the commit-and-pull cycle and the durable path's absence case
+`[KNOWLEDGE §10.2]` alongside claims and notes, on the same two machines, for
+the same calendar cost.
+
+**3. Co-build S0–S6 as planned (§3), then delegation (§4).** Unchanged in
+content and unchanged in internal order. §4's five arguments for co-build before
+delegation all still hold; only argument 5 moves, and §4 now says so.
+
+**4. A direct P2P transport rung — investigate, do not commit.** A Hyperswarm-
+style DHT + hole-punch + Noise transport with keypair identity: the
+`wybe-labs/claude-together` approach, whose README (read 2026-09-01, the same
+pass as §1.4) states *"different Anthropic accounts, different machines…
+direct, end-to-end encrypted P2P connection"* with *"no relay, no central
+server"*. What it buys is exactly what the ladder is missing between its two
+existing rungs: **proven cross-account identity with zero infrastructure** — no
+Cloudflare account, no `wrangler`, no deploy step, and per-peer keypairs instead
+of a workspace-wide bearer secret, which is the thing `[SEC§2.1]` has to
+apologise for on ntfy.
+
+What it cannot be: **the durable rung** — and the reason is not the one an
+earlier draft of this section gave. That draft read the README's *"queue on disk
+and deliver when you're both online"* as sender-side store-and-forward and
+stopped there. Re-read on 2026-09-01, the README describes something
+considerably stronger: **group replay with a retention window.** *"Each member
+keeps a recent room log (last 200 messages / 7 days) and replays it to peers who
+reconnect… store-and-forward through the group, no server"*, and under
+Reliability, *"any member who saw a message replays it to whoever reconnects. A
+message is only stuck if literally no one who has it is online at the same time
+as you."*
+
+**So the honest comparison is between two retention windows of nearly the same
+shape, not between a queue and a server.** claude-together: **last 200 messages
+/ 7 days**, held by every member. This project's relay rung: **7 days and last
+500 messages, whichever bites first** `[P§9.2]`. Same TTL; this project holds
+2.5× the message count; the difference in kind is only *where* the log lives.
+Against `KNOWLEDGE §10.2`'s week-long absence case, a 7-day window is the
+boundary case on both — it does not obviously break, and the earlier claim that
+it does was wrong.
+
+**The reason it still is not the durable rung is the topology, and it is
+decisive for this project specifically.** Replay needs a **third peer**: the
+README's own example is Alice → Bob → Carol. This project's target is **two
+people** (§2), and in a two-person room there is no third member holding the
+log. When both are offline — the ordinary overnight case, not an edge case —
+there is nobody to replay from, and *"only stuck if literally no one who has it
+is online"* resolves to "stuck". A committed file in the repo has no such
+condition: it is present the moment the other side pulls, at any age, with
+nobody online at all. So this stays a **middle rung between ntfy and the
+relay** — better than ntfy's ~12 h operator cache `[P§9.3]`, roughly level with
+the relay on retention, and below both the relay and the repo on the property
+that matters here — and the repo layer stays the durable truth
+`[PLAN Locked decisions 4]`.
+
+Two conditions on it, both binding:
+
+- **Promoted earlier only if the M12(b) run shows relay deployment is the
+  adoption wall.** If the wall turns out to be something else — invite friction,
+  hook registration, Node on Windows — this rung fixes nothing and costs a
+  transport adapter.
+- **The NAT-traversal failure rate is published but unverified on these two
+  networks.** The README does give a number — under Reliability: *"No central
+  relay by design: if two peers are both behind carrier-grade NAT, hole punching
+  can fail (~5% of pairings). Easiest fix: both install Tailscale — the swarm
+  then finds the direct tailnet path."* That figure is **vendor-reported and
+  unreplicated**: no method, no sample size, no independent measurement, and
+  this project has run none. So the gate is not "nobody has measured" — someone
+  has, and says ~5% — it is that **the ~5% is unverified on the two networks
+  these two users are actually on**, which is the only sample that decides
+  whether this is a rung for *them*. Note also that the vendor's own remedy for
+  the failing 5% is a third-party VPN on both machines, which costs exactly the
+  zero-infrastructure property this rung is being considered for. Replicating
+  the connect rate on these two home networks is the first work item if this is
+  ever promoted, and it is measurement, not a spike of the protocol.
+
+Nothing in rung 4 is designed, ratified or advertised anywhere until that
+measurement exists — the same rule §3.6 applies to co-build: *"Until it is built
+it is advertised nowhere."*
+
+---
+
 ## 3. The build
 
 Derived from `docs/COBUILD.md §10` (v1.1a — *"All four tiers of §1.1 are in
@@ -590,10 +700,12 @@ matrix for an unbuilt feature is the most expensive kind of copy to retract.
 | **S4** | SECURITY.md (enumerated grant, two exceptions, §2.6's honest worth, per-tier new capability) + red team | Opus **xhigh**, 3× adversarial fan-out |
 | **S5** | E2E: (a) CI leg, 2 × `claude -p` + miniflare + mock ntfy + transcript secret-scan; (b) manual two-account leg incl. absence, and the two measurements | local + Opus high (a); human + Opus high (b) |
 | **S6** | The §1.1 matrix into README + INSTALL; release | Sonnet medium draft; Opus high polish |
-| **S7** | **v1.1b, after ship**: `note.blocker` auto-answer relaxation (the first outbound post caused by peer data — its own review); rev-to-rev diff in the read view; the SessionStart shard scan, **built once and shared with delegation** | Opus xhigh (relaxation); Opus high (rest) |
+| **S7** | **v1.1b, after ship**: `note.blocker` auto-answer relaxation (the first outbound post caused by peer data — its own review); rev-to-rev diff in the read view. ~~the SessionStart shard scan~~ — **built earlier, in the knowledge layer (§2.1) `[KNOWLEDGE §9.K1]`**, so nothing about it remains in this milestone | Opus xhigh (relaxation); Opus high (rest) |
 
-Order: **S0 → S1 → S2 → {S3a, S3b} → S4 gate → S5 gate → S6**. Then delegation
-(§4), then S7. Tests, builds and E2E runs are local, no model `[PLAN§5]`.
+Order **within co-build**: **S0 → S1 → S2 → {S3a, S3b} → S4 gate → S5 gate →
+S6**. Then delegation (§4), then S7. Co-build itself is **third** in the project
+order of §2.1: the knowledge layer and the two-human M12(b) run come before S0.
+Tests, builds and E2E runs are local, no model `[PLAN§5]`.
 
 S3a and S3b are the only pair that may run in parallel, and only because S3a is
 render code against a measured budget while S3b is text. S2 must not start before
@@ -603,9 +715,15 @@ S1's ledger exists, because the materializer's path derives from it.
 
 ## 4. Delegation's place: after, and separately ratified
 
-**Verdict: co-build ships first; delegation ships after it, as its own
-ratification; and the SessionStart shard scan is built once, in delegation's
-slice, and shared back.** Not before, and explicitly not *inside*.
+**Verdict: co-build ships before delegation, each as its own ratification; and
+the SessionStart shard scan is built once and shared.** Not before, and
+explicitly not *inside*.
+
+**Amended 2026-09-01 (§2.1):** the scan moved out of delegation's slice and into
+the knowledge layer, which runs ahead of both. It is still built once; it is now
+built earlier, and both features inherit it. Argument 5 below is updated
+accordingly; arguments 1–4, which are what decide the co-build/delegation order,
+are untouched.
 
 `COBUILD §14` states the tension and does not resolve it: *"they are independent
 and neither requires the other, but two new types in one v1.1 is a larger
@@ -649,9 +767,12 @@ decide whether both are wanted before either is ratified."* This plan decides.
    none, so today's mandated parting note `[P§3.2]` is never read either.
    `COBUILD §6.3` deliberately needs **none** of it and says so, listing it as
    out of scope *"rather than smuggled in"*, and `§6.4` says it *"should be
-   built once"*. So: it is orthogonal to both, delegation is the design that
-   needs it, and building it in delegation's slice is how it gets built once
-   instead of twice.
+   built once"*. So: it is orthogonal to both, and where it gets built is a
+   question about the scan, not about this order. **As of §2.1 it is built in
+   the knowledge layer, ahead of both** `[KNOWLEDGE §9.K1]` — generically, so
+   delegation asks it for `offer` / `offer_state` records and adds nothing to
+   it. It is still built once; delegation now inherits working code instead of
+   owning the build.
 
 **Why not inside.** `COBUILD §14` is right that the three routes — `note.info`,
 the seam, the offer — *"are not variants of each other and they should never be
