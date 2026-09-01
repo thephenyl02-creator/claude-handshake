@@ -382,6 +382,34 @@ test('rule 2: with no identity to compare, the monitor\'s own start time decides
   assert.equal(H.disarmedHere(old, new Set(['sess-hb-disarm', OWNER]), startedAt), false);
 });
 
+test('the two rules compose: a sentinel bearing MY id, older than me, is a leftover', () => {
+  // Session ids are not guaranteed distinct across sessions. HANDSHAKE_SESSION_ID
+  // is read straight out of the environment [C bin/handshake.js:135], so any
+  // setup that PINS it rather than minting one per session - the e2e members do
+  // exactly that [C e2e/lib/members.js:112] - hands consecutive sessions the
+  // same id.
+  //
+  // Ownership alone cannot tell those apart, and it used to be asked first and
+  // trusted alone: one `rest`, plus the one SessionEnd sweep in twenty-one that
+  // does not fire [S4], left a sentinel stamped with THIS id that every later
+  // monitor obeyed on its first poll - the permanent, silent disarm the whole
+  // gate exists to close, back through the front door. A monitor's lifetime IS
+  // its session's lifetime [S5], so the sentinel has to be younger than the
+  // process reading it whatever name is on it.
+  const mine = new Set(['sess-hb-disarm', OWNER]);
+  const startedAt = Date.now() - 60000;
+
+  const stale = disarmFile(JSON.stringify({ session: OWNER, at: Date.now() }), 120000);
+  assert.equal(H.disarmedHere(stale, mine, startedAt), false,
+    'written before this monitor existed: the session that rested is over, id reuse or not');
+
+  // The cost of the extra conjunct is nil in the case that matters: `rest` is
+  // typed by a human into a session whose monitor has been running since it
+  // started, so its sentinel is always the younger of the two.
+  const fresh = disarmFile(JSON.stringify({ session: OWNER, at: Date.now() }));
+  assert.equal(H.disarmedHere(fresh, mine, startedAt), true, 'and a live `rest` still means rest');
+});
+
 // ================================================= the section 10.2 latch ====
 //
 // The monitor's OTHER unscoped read of a per-session record: session.json's
@@ -465,6 +493,74 @@ test('this session\'s own posting_stopped latch does silence the monitor', async
   await runMonitorOnce(box, H.POLL_MS);
   assert.equal(queuedPresence(box), 0,
     'section 10.2: once posting has stopped for THIS session it stays stopped');
+});
+
+// ============================================================ the budget =====
+//
+// beat() spawns up to two CLI calls at CLI_TIMEOUT_MS each - up to 16 s - and
+// hooks/stop.js runs it under a 9.5 s watchdog [C hooks/stop.js BUDGET_MS]. On
+// a transport that accepts a connection and never answers, that watchdog used
+// to fire in the middle of the SECOND call: the delta push burnt the budget and
+// the presence post - the one thing the section 8 fallback exists to send -
+// reached nothing, not even the offline queue, with the cadence marker already
+// stamped and the window therefore burnt. Two changes close it, and both are
+// stated here: presence goes first, and each spawn is sized to what is left of
+// the caller's deadline rather than to a constant that can outlast it.
+//
+// The observables are an ORDER and a TIMEOUT, and a timeout leaves no trace on
+// disk, so this is the one place in this file that stands in for a layer: the
+// single seam beat() shells out through [C hooks/common.js runCli]. What those
+// two calls actually DO is proved against the real CLI and the real offline
+// queue instead, through the real hook [C test/stop-hook.test.js].
+const C = require('../hooks/common');
+
+// `spend` is how long the stubbed CLI takes, i.e. how much of its slice a real
+// call would eat before the next one is sized.
+async function beatCalls(opts, spend) {
+  const state = tmpState();
+  claim(state, ['src/a.ts']);                         // unpushed files: both halves have work
+  const calls = [];
+  const real = C.runCli;
+  C.runCli = async (args, o) => {
+    calls.push({ cmd: args[0], timeoutMs: o.timeoutMs });
+    if (spend) await sleep(Math.min(spend, o.timeoutMs));
+    return { ok: true };
+  };
+  let ok;
+  try { ok = await H.beat(state, { root: state.dir }, 'waiting', opts); } finally { C.runCli = real; }
+  return { calls, ok };
+}
+
+test('the monitor\'s own beat is unchanged: two calls, each bounded by CLI_TIMEOUT_MS', async () => {
+  // The monitor has no watchdog above it and passes no deadline, so this
+  // constant IS its bound - the fix for the hook must not shorten it.
+  const { calls } = await beatCalls(undefined);
+  assert.deepEqual(calls.map((c) => c.cmd), ['presence', 'change'],
+    'presence is renewed before the delta is pushed');
+  assert.deepEqual(calls.map((c) => c.timeoutMs), [H.CLI_TIMEOUT_MS, H.CLI_TIMEOUT_MS]);
+});
+
+test('beat() sizes each spawn to what is left of the caller\'s deadline', async () => {
+  const { calls } = await beatCalls({ deadline: Date.now() + 1200 }, 400);
+  assert.deepEqual(calls.map((c) => c.cmd), ['presence', 'change']);
+  assert.ok(calls[0].timeoutMs > 0 && calls[0].timeoutMs <= 1200,
+    'the first spawn takes the wall, not the 8 s constant (' + calls[0].timeoutMs + ' ms)');
+  assert.ok(calls[1].timeoutMs > 0 && calls[1].timeoutMs < calls[0].timeoutMs,
+    'and the second takes what the first left, so the pair fits inside one budget (' +
+    calls[1].timeoutMs + ' ms)');
+});
+
+test('beat() skips a spawn it cannot pay for rather than starting one to kill it', async () => {
+  // The presence post consumes the whole wall; the push is not started.
+  const { calls } = await beatCalls({ deadline: Date.now() + 400 }, 400);
+  assert.deepEqual(calls.map((c) => c.cmd), ['presence'],
+    'the half that matters is the half that ran');
+
+  // And with nothing left at all, nothing is spawned - a node boot paid for
+  // solely to be killed is the cost this arithmetic exists to avoid.
+  const spent = await beatCalls({ deadline: Date.now() - 1 });
+  assert.deepEqual(spent.calls, []);
+  assert.equal(spent.ok, false, 'and the caller is told no beat went out');
 });
 
 // ========================================================= module hygiene ====

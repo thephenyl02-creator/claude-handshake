@@ -307,9 +307,19 @@ a targeted sanitizer (PROTOCOL §Deferred).
   else at `join` `[C bin/handshake.js:511,685,1994]` — and a peer's email is
   learned on *their* machine, never inferred from a shard's self-declared
   header, a field an attacker writes too. So on any one machine only that
-  member's own shard can reach `mismatch`; every peer's shard has no recorded
-  email here and lands in `unknown`, along with any shard whose last commit
-  could not be read at all `[C lib/workspace-files.js:424,428,442]`.
+  member's own shard can reach `ok` or `mismatch`. Everything else falls to one
+  of the earlier branches, and they are **not all `unknown`**, in this order:
+  a shard whose last commit could not be read at all — not a repo, or `git log`
+  itself failed — is `unknown` `[C lib/workspace-files.js:424]`
+  `[C lib/repo.js:341,350]`; a shard with no commit yet on that path, whether
+  because it is written but uncommitted or because the repo has no HEAD, is
+  **`uncommitted`**, counted in neither list, so it raises nothing
+  `[C lib/workspace-files.js:425]` `[C lib/repo.js:347-348,353]` — and that test
+  runs *before* the recorded-email lookup, so an uncommitted peer shard never
+  reaches `unknown` either; and a shard that *is* committed but whose member has
+  no recorded email here — the normal case for every peer — is `unknown`
+  `[C lib/workspace-files.js:428]`. Only the two `unknown` branches feed
+  `unverified_shard_authors` `[C lib/workspace-files.js:436,442]`.
 - **One flag, and the mismatch takes precedence.** Both lists are always
   computed and persisted `[C lib/workspace-files.js:437-443,452-453]`, but the
   digest carries a single `flag`: `non_member_commit` if any mismatch exists,
@@ -322,7 +332,7 @@ a targeted sanitizer (PROTOCOL §Deferred).
   are not reported alongside it; they remain in local state under
   `repo_warnings.unverified` and are absent even from `status --json`, whose
   repo block carries only the flag and the mismatches
-  `[C bin/handshake.js:1246-1247]`. The guarantee is therefore that a shard is
+  `[C bin/handshake.js:1246-1251]`. The guarantee is therefore that a shard is
   never silently reported as clean, not that both signals are shown at once.
 - Per-workspace `inject: on|off`; `/handshake mute` is purely local state
   `[P§3]`.
@@ -501,19 +511,45 @@ endpoint or token change, reporting the dropped count (PROTOCOL §10.3).
   value `[P§2]`, format `m-<8 hex>` (PROTOCOL §1). `session` is a hash of the
   host session id, not a path `[F]`. Nothing in the protocol carries a
   hostname, absolute path, IP address or working directory.
-- **The member id is the one field that can carry your local username.** `init`
-  and `deploy-relay` have to work unattended, so when `--as` is absent they
-  DERIVE the member id from `os.userInfo().username` — non-printable characters
-  stripped, whitespace folded to `-`, truncated to 48 chars, `founder` if
-  nothing survives — with no prompt `[C bin/handshake.js:389-394]`
-  `[C bin/handshake.js:432-433]` `[C bin/handshake.js:1932-1933]`. That id is
-  what the relay stores and what peers see in every envelope, and it is
-  injected into their model context (§5.3), so both commands print the derived
-  name before enrolling anything `[C bin/handshake.js:439,1937]`. `--as <name>`
-  on either command replaces it outright, and `join` never derives at all: it
-  takes `--as`, or asks the human for a member name
-  `[C bin/handshake.js:618-620]`. Pick the id you want peers to read — a
-  derived name is a default, not a guarantee of anonymity.
+- **The member name is the one field that can carry your local username.**
+  `init` and `deploy-relay` have to work unattended, so when `--as` is absent
+  they DERIVE it from `os.userInfo().username`, with no prompt
+  `[C bin/handshake.js:389-394]` `[C bin/handshake.js:432-433]`
+  `[C bin/handshake.js:1932-1933]`. That derivation is lossier than
+  "sanitizing" suggests: the filter is
+  `.replace(/[^\x20-\x7e]/g, '')`, so **every character outside printable ASCII
+  is deleted, not merely the non-printable ones** — then whitespace is folded to
+  `-` and the result truncated to 48 chars `[C bin/handshake.js:392]`. `Ann Lee`
+  becomes `Ann-Lee`; `José` becomes `Jos`; and a username written entirely in
+  Devanagari, Cyrillic, Han or any other non-Latin script leaves the empty
+  string, so the fallback takes over and **that user is enrolled as `founder`**
+  `[C bin/handshake.js:393]` — their own name erased rather than transliterated,
+  with nothing in the derived id to distinguish them. `--as <name>` is what
+  spares them — but the same charset rule follows almost everywhere: the relay
+  rejects any member name outside printable ASCII 1-64 with
+  `member_name_invalid` `[C relay/src/do/workspace.js:25,373]` and `join`
+  enforces that rule client-side before it posts anything
+  `[C bin/handshake.js:621-623]`, so the one route that takes an arbitrary `--as`
+  string unchecked is `init` on the ntfy tier, where nothing enrols.
+- **Where that derived name travels depends on the tier.** On ntfy nobody
+  enrols, so the name *is* the member id: `founderMember` stays `founderName`
+  `[C bin/handshake.js:440,466]` and it goes out as `from.member` in every
+  envelope `[C bin/handshake.js:175-177,206]`, inside the signed canonical form
+  `[C lib/envelope.js:305-306]`. On the relay it is not the id: enrolment mints
+  an opaque `member_id` — 8 random hex `[C relay/src/lib/tokens.js:49-51]` —
+  and *that* is what is stored as the primary key, what `from.member` carries,
+  and what the relay enforces on every post
+  `[C bin/handshake.js:447,466,1945]` `[C relay/src/do/workspace.js:603-604]`.
+  The derived name is still stored beside it as the unique `members.name`
+  `[C relay/src/do/workspace.js:389-397]` and handed to every peer in the
+  roster, in presence, and as a claim's `owner_name`
+  `[C relay/src/do/workspace.js:244,704-714]`. So on both tiers peers read it
+  and it is injected into their model context (§5.3) — which is why both
+  commands print the derived name before enrolling anything
+  `[C bin/handshake.js:432-433]` `[C bin/handshake.js:1932-1933]`. `--as <name>` on either command replaces it
+  outright, and `join` never derives at all: it takes `--as`, or asks the human
+  for a member name `[C bin/handshake.js:618-620]`. Pick the name you want peers
+  to read — a derived one is a default, not a guarantee of anonymity.
 - **Observability off by default** `[R6]`: `[observability] enabled = false` in
   `wrangler.toml`, because platform invocation logs record request URLs and a
   URL here contains the workspace id `[C relay/README.md]`.

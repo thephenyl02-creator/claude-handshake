@@ -81,10 +81,10 @@ test('canonical: undefined keys are omitted, explicit null is emitted', () => {
 
 test('canonical: only ", \\ and C0 are escaped; / and non-ASCII stay literal', () => {
   assert.equal(E.canonicalJson('a/b'), '"a/b"');
-  assert.equal(E.canonicalJson('café '), '"café "');
+  assert.equal(E.canonicalJson('café \x7f'), '"café \x7f"');
   assert.equal(E.canonicalJson('a"b\\c'), '"a\\"b\\\\c"');
   assert.equal(E.canonicalJson('\n\t\r\b\f'), '"\\n\\t\\r\\b\\f"');
-  assert.equal(E.canonicalJson(''), '"\\u0001"');
+  assert.equal(E.canonicalJson('\x01'), '"\\u0001"');
 });
 
 test('canonical: non-integer numbers, -0 and bad keys are refused', () => {

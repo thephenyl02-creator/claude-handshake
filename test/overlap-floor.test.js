@@ -13,7 +13,7 @@
 // the offline queue - which is where the WIRE form can be read, exactly as
 // test/cli.test.js does it.
 
-const { test } = require('node:test');
+const { test, after } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
@@ -23,9 +23,13 @@ const { spawnSync } = require('node:child_process');
 const CLI = path.join(__dirname, '..', 'bin', 'handshake.js');
 const DEAD_ENDPOINT = 'http://127.0.0.1:9';     // discard port: always refused
 
+const temps = [];
+after(() => { for (const d of temps) fs.rmSync(d, { recursive: true, force: true }); });
+
 let n = 0;
 function sandbox() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'hs-overlap-' + (n++) + '-'));
+  temps.push(root);
   const project = path.join(root, 'project');
   fs.mkdirSync(project, { recursive: true });
   return { root, project, data: path.join(root, 'data') };

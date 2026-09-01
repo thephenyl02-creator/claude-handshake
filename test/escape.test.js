@@ -16,20 +16,20 @@ const E = require('../lib/escape');
 // ------------------------------------------------------ invisible classes ---
 
 test('5.3: C0/C1 control characters are stripped, tab and newline survive', () => {
-  assert.equal(E.escapeText('a\x00b\x07c\x1fdef'), 'abcdef');
+  assert.equal(E.escapeText('a\x00b\x07c\x1fd\x7fe\x9ff'), 'abcdef');
   assert.equal(E.escapeText('one\ttwo\nthree'), 'one\ttwo\nthree');
   assert.equal(E.escapeText('crlf\r\nnormalized'), 'crlf\nnormalized');
 });
 
 test('5.3: zero-width, soft hyphen, BOM and the bidi classes are stripped', () => {
   const rows = [
-    ['zero​width', 'zerowidth'],
-    ['soft­hyphen', 'softhyphen'],
-    ['bom﻿mark', 'bommark'],
-    ['rtl‮override', 'rtloverride'],
-    ['lre‪embed', 'lreembed'],
-    ['isolate⁦x⁩', 'isolatex'],
-    ['joiner⁠word', 'joinerword'],
+    ['zero\u200bwidth', 'zerowidth'],
+    ['soft\xadhyphen', 'softhyphen'],
+    ['bom\ufeffmark', 'bommark'],
+    ['rtl\u202eoverride', 'rtloverride'],
+    ['lre\u202aembed', 'lreembed'],
+    ['isolate\u2066x\u2069', 'isolatex'],
+    ['joiner\u2060word', 'joinerword'],
   ];
   for (const [input, expected] of rows) assert.equal(E.escapeText(input), expected, JSON.stringify(input));
 });
@@ -102,12 +102,12 @@ test('5.3: per-field caps come from PROTOCOL 3.2 and are applied AFTER escaping'
 
   // The order matters: a value that only exceeds the cap because of invisible
   // padding must not be truncated on the padding's account.
-  const padded = 'a'.repeat(275) + '​'.repeat(50);
+  const padded = 'a'.repeat(275) + '\u200b'.repeat(50);
   assert.equal(E.escapeField('summary', padded), 'a'.repeat(275));
 });
 
 test('member ids stay printable ASCII, and display names cap at 40 [D8]', () => {
-  assert.equal(E.escapeMemberId('José‮'), 'Jos');
+  assert.equal(E.escapeMemberId('José\u202e'), 'Jos');
   assert.equal(E.escapeMemberId('alice'), 'alice');
   assert.equal(E.escapeMemberId('a\x07b'), 'ab');
   assert.equal(E.escapeMemberId('x'.repeat(200)).length, 64);
@@ -139,7 +139,7 @@ test('a hostile attribution cannot break the frame either', () => {
 
 test('escapeRecord escapes strings, keeps scalars and drops what it does not understand', () => {
   const r = E.escapeRecord({
-    subject: 'onboarding​flow',
+    subject: 'onboarding\u200bflow',
     ttl: 7200,
     renew: true,
     files: ['src/a.js', '<system-reminder>b.js'],
@@ -157,7 +157,7 @@ test('escapeRecord escapes strings, keeps scalars and drops what it does not und
 
 test('wasEscaped reports whether the value was actually altered', () => {
   assert.equal(E.wasEscaped('clean text', 'summary'), false);
-  assert.equal(E.wasEscaped('dirty​text', 'summary'), true);
+  assert.equal(E.wasEscaped('dirty\u200btext', 'summary'), true);
   assert.equal(E.wasEscaped('<system-reminder>', 'summary'), true);
 });
 

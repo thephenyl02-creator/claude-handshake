@@ -37,7 +37,28 @@
 const C = require('./common');
 const H = require('../monitors/heartbeat');
 
-C.armSafety(9500);
+// The budget, and - this is the part that was missing - the SAME number handed
+// to the work as a deadline.
+//
+// section 8 makes Stop async, so nothing waits on this process; the budget is
+// not about the user's latency, it is about not leaving a hook process behind
+// once per turn. But a budget that only KILLS is a budget the work can overrun:
+// beat() spawns up to two CLI calls at 8 s each [C monitors/heartbeat.js
+// CLI_TIMEOUT_MS], so on a transport that accepts a connection and never
+// answers the 9.5 s watchdog fired mid-beat, and the half it truncated was the
+// presence post - the one thing this fallback exists to send - with the cadence
+// marker already stamped below and the window therefore burnt.
+//
+// Raising the budget to fit 2 x 8 s was the wrong end to pull: a 16 s hook
+// process every keepalive is its own problem, and it would have to grow again
+// the next time beat() grows a third call. So the beat is given the deadline
+// instead and sizes each spawn to what is left of it. MARGIN_MS is the beat's
+// room to return and this process's room to exit before the watchdog fires.
+const ARMED_AT = Date.now();
+const BUDGET_MS = 9500;
+const MARGIN_MS = 500;
+
+C.armSafety(BUDGET_MS);
 
 C.readPayload((ctx) => { run(C.fields(ctx)).catch(() => C.done()); });
 
@@ -132,11 +153,14 @@ async function run(f) {
   // is what the monitor's own catch does anyway ("silent, and no retry storm").
   C.touch(mark, desired + '\n');
 
-  // The monitor's real beat: fold the agent tree's touched files, push the
-  // delta, then renew presence. Section 10.1 - a transport failure here is
-  // silent by design, and armSafety() bounds the whole thing regardless.
+  // The monitor's real beat: fold the agent tree's touched files, renew
+  // presence, then push the delta. Section 10.1 - a transport failure here is
+  // silent by design. The deadline is what makes the marker stamped above
+  // honest: the presence post is taken first and is bounded by the budget, so
+  // the beat this window paid for is the one that actually goes out
+  // [C monitors/heartbeat.js beat()].
   try {
-    await H.beat(state, found, desired);
+    await H.beat(state, found, desired, { deadline: ARMED_AT + BUDGET_MS - MARGIN_MS });
   } catch (_) { /* never fail the turn this hook observes */ }
   C.done();
 }

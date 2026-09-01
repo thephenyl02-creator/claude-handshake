@@ -182,6 +182,32 @@ test('with no monitor and no marker, the Stop hook beats (section 8 fallback)', 
   assert.ok(Date.now() - markerMtime(box) < 30000, 'and its mtime is the beat timestamp');
 });
 
+test('the presence post is taken FIRST, ahead of the change-delta push', () => {
+  // beat() spawns TWO CLI calls when the session has files peers have not been
+  // told about [C monitors/heartbeat.js pendingPush], at up to 8 s each, under
+  // this hook's 9.5 s watchdog [C hooks/stop.js BUDGET_MS]. So on a transport
+  // that accepts a connection and never answers, one of the two is going to be
+  // the half that gets truncated - and the order decides which.
+  //
+  // It has to be the push. A missed delta is re-derived on the next beat
+  // (`pushed_files` only advances on success); a missed presence post is a hole
+  // in the section 8 clock that nothing refills, because the cadence marker is
+  // stamped BEFORE the beat and the next window is a whole keepalive away.
+  //
+  // Order is checked on the wire rather than in the source: the offline queue
+  // is append-ordered, so it records which call actually went out first.
+  const box = joinedNtfy();
+  const r = cli(box, ['claim', 'the seam', '--files', 'src/a.js']);
+  assert.equal(r.code, 0, r.err);
+  const before = queued(box).length;
+
+  stop(box);
+
+  assert.deepEqual(queued(box).slice(before).map((e) => e.type),
+    ['presence.update', 'task.change'],
+    'the beat renews presence before it pushes the delta, so a truncated beat still has a heartbeat in it');
+});
+
 // ============================================================ the cadence ====
 
 test('it does not beat twice inside one cadence window, and beats once past it', () => {
@@ -511,7 +537,9 @@ test('both founder sites do what join does: announce the derived name, record th
 test('init announces a member name derived from the machine username, and only then', () => {
   // docs/SECURITY.md 9 is about what the PROTOCOL carries; with --as absent the
   // member name is os.userInfo().username [C bin/handshake.js:389-394] and it
-  // goes out in ws.join and every later from.member_name. Deriving it is fine.
+  // goes out as ws.join's `member_name` [C lib/envelope.js:241] and then, on
+  // ntfy, as `from.member` on every later envelope [C lib/envelope.js:201-202].
+  // Deriving it is fine.
   // Deriving it silently is what made the doc read as a promise it could not keep.
   const a = tmpDir('hs-stop-name-a-' + (n++) + '-');
   const boxA = { project: path.join(a, 'project'), data: path.join(a, 'data') };
@@ -578,4 +606,33 @@ test('the Stop hook writes nothing to stdout, and takes the monitor\'s own beat'
     'the fallback imports the monitor\'s beat rather than reimplementing it');
   assert.equal(typeof require('../monitors/heartbeat').beat, 'function',
     'and monitors/heartbeat.js exports it');
+
+  // The budget must be handed to the WORK, not only to the killer. What the
+  // beat then does with a deadline is executed rather than described
+  // [C test/heartbeat.test.js, the budget]; what cannot be observed from
+  // outside this process is that the two numbers are the SAME one - a hook
+  // whose watchdog and whose beat disagree is exactly the defect (9.5 s of
+  // budget handed to 16 s of work), and it is invisible on the clock because
+  // both spellings exit at the watchdog.
+  assert.match(code, /armSafety\(BUDGET_MS\)/, 'the watchdog is armed from the budget');
+  assert.match(code, /H\.beat\(.*deadline: ARMED_AT \+ BUDGET_MS/,
+    'and the same budget is handed to the beat as a deadline');
+});
+
+test('cmdPresence\'s own usage line and USAGE name the same flags', () => {
+  // Parked here with the other bin/handshake.js source invariant above: the
+  // presence command is this file's subject, and `--reason` is the flag the
+  // fallback's own `tooling_broken` beat would use.
+  //
+  // Two spellings of one command's flags is how a real flag goes missing from
+  // the message written FOR the person who just got the command wrong: USAGE
+  // gained `--reason`, cmdPresence's error string did not, and a user reading
+  // the error was told a flag the parser accepts does not exist.
+  const src = fs.readFileSync(CLI, 'utf8');
+  const errLine = (src.match(/usage: handshake presence [^']*/) || [])[0];
+  const usageLine = (src.match(/' {2}presence {2}[^']*'/) || [])[0];
+  assert.ok(errLine && usageLine, 'both spellings are still findable');
+  const flags = (s) => (s.match(/--[a-z-]+/g) || []).slice().sort();
+  assert.deepEqual(flags(errLine), flags(usageLine),
+    'the error a user sees names every flag `handshake help` does');
 });

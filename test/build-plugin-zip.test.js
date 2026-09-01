@@ -22,8 +22,9 @@
 //   3. Building twice produces byte-identical output. The release pins the
 //      archive's sha256 in plugins[].source.sha256
 //      [C .claude-plugin/marketplace.json], and the installers' primary route
-//      verifies it [C docs/SECURITY.md:310] — a rebuild that shifted one byte
-//      would strand every later installer on a hash the artifact no longer has.
+//      resolves that pinned entry [C docs/SECURITY.md:347-350, the
+//      install-pinning bullet] — a rebuild that shifted one byte would strand
+//      every later installer on a hash the artifact no longer has.
 //
 // Builds run against a staged copy in a temp dir, never the repo: the script
 // writes to <root>/dist [C scripts/build-plugin-zip.js], and a test has no
@@ -69,7 +70,7 @@ const coveredBy = (entries, rel) =>
 //
 // The seeds are the two manifests the host opens BY NAME: the plugin manifest
 // [C .claude-plugin/plugin.json] and the hooks manifest whose command shape
-// test/hooks.test.js already pins [C test/hooks.test.js:751]. Everything else is
+// test/hooks.test.js already pins [C test/hooks.test.js:853]. Everything else is
 // followed out of file contents.
 function runtimeSet() {
   const found = new Set();
@@ -94,10 +95,10 @@ function runtimeSet() {
 
   // The CLI is reached the other way round: the shipped command file and skill
   // are what tell the model to run it [C commands/handshake.md, the verb table;
-  // C skills/handshake-coordination/SKILL.md:329]. Those markdown files are
-  // themselves runtime files — the host reads commands/*.md to offer the slash
-  // command and skills/*/SKILL.md to load the skill, so a zip without them
-  // installs and does nothing. Add each one, not just the bin/ paths inside it.
+  // C skills/handshake-coordination/SKILL.md:375,388-396]. Those markdown
+  // files are themselves runtime files — the host reads commands/*.md to offer
+  // the slash command and skills/*/SKILL.md to load the skill, so a zip without
+  // them installs and does nothing. Add each one, not just the bin/ paths in it.
   for (const md of markdownUnder(['commands', 'skills'])) {
     found.add(md);
     for (const m of read(md).matchAll(/(?:\$\{?CLAUDE_PLUGIN_ROOT\}?\/)?(bin\/[A-Za-z0-9._-]+\.js)/g)) addJs(m[1]);
@@ -105,7 +106,7 @@ function runtimeSet() {
 
   // Transitive require() closure. Two shapes exist in this tree, both string
   // literals: ordinary relative requires, and hooks/common.js's lib() helper,
-  // which joins a bare filename onto ../lib [C hooks/common.js:109].
+  // which joins a bare filename onto ../lib [C hooks/common.js:118].
   while (queue.length) {
     const rel = queue.shift();
     const src = read(rel);
@@ -121,7 +122,7 @@ function runtimeSet() {
   // `deploy-relay` refuses to run unless it finds the bundled relay, so whatever
   // it probes for is a runtime file too. The probes are read out of the source
   // rather than restated, so a third one gets picked up on its own
-  // [C lib/deploy.js:417, function locateRelayDir].
+  // [C lib/deploy.js:460, function locateRelayDir].
   for (const m of read('lib/deploy.js').matchAll(/fs\.existsSync\(path\.join\(c, ([^)]+)\)\)/g)) {
     const parts = (m[1].match(/'[^']+'/g) || []).map((s) => s.slice(1, -1));
     if (parts.length) found.add(['relay'].concat(parts).join('/'));

@@ -31,6 +31,16 @@ const DOC_REL = 'commands/handshake.md';
 function read(rel) { return fs.readFileSync(path.join(ROOT, rel), 'utf8'); }
 
 const doc = read(DOC_REL);
+
+// docs/SECURITY.md's bin/handshake.js citations are pinned here too - scoped to
+// that ONE source file on purpose. It is the file that moves most, and six of
+// these citations were found pointing at unrelated lines within a day of being
+// written, because nothing checked them. Citations into lib/ and relay/ move
+// rarely and stay review-checked; widening the net to every [C ...] in
+// SECURITY.md would make this file red on every doc edit, and a guard that
+// cries wolf gets deleted.
+const SECURITY_REL = 'docs/SECURITY.md';
+const securityDoc = read(SECURITY_REL);
 const { COMMANDS, USAGE } = require('../bin/handshake.js');
 
 test('every verb the CLI routes is spawnable from commands/handshake.md', () => {
@@ -139,26 +149,53 @@ const PINNED = {
   '[C installers/install.ps1:814-845,866]': 'CLAUDE_PLUGIN_ROOT',
 };
 
+const SECURITY_PINNED = {
+  '[C bin/handshake.js:389-394]': 'function defaultMemberName',
+  '[C bin/handshake.js:392]': 'slice(0, 48)',
+  '[C bin/handshake.js:393]': "return base || 'founder'",
+  '[C bin/handshake.js:432-433]': 'asFlag || defaultMemberName()',
+  '[C bin/handshake.js:618-620]': 'member name (printable ASCII, 1-64 chars)',
+  '[C bin/handshake.js:621-623]': 'must be 1-64 printable ASCII chars',
+  '[C bin/handshake.js:1246-1251]': 'shard_warning: (repoState.warnings',
+  '[C bin/handshake.js:1284-1289]': "shard_warning === 'non_member_commit'",
+  '[C bin/handshake.js:1932-1933]': 'asFlag || defaultMemberName()',
+  '[C bin/handshake.js:511,685,1994]': 'recordMemberEmail(state',
+  '[C bin/handshake.js:440,466]': 'founderMember = founderName',
+  '[C bin/handshake.js:447,466,1945]': 'joined.member_id || founderName',
+  '[C bin/handshake.js:175-177,206]': 'member: cfg.member',
+};
+
+// [doc path, doc text, pin table, which citations the unpinned check covers]
+const DOCS = [
+  [DOC_REL, doc, PINNED, /\[C [\w./-]+:[\d,\-]+\]/g],
+  [SECURITY_REL, securityDoc, SECURITY_PINNED, /\[C bin\/handshake\.js:[\d,\-]+\]/g],
+];
+
 test('the load-bearing citations still land on the code they claim', () => {
   const drifted = [];
-  for (const [citation, needle] of Object.entries(PINNED)) {
-    assert.ok(doc.includes(citation),
-      DOC_REL + ' no longer carries ' + citation + ' - if it was retargeted on purpose, ' +
+  for (const [docRel, docText, pins] of DOCS) {
+  for (const [citation, needle] of Object.entries(pins)) {
+    assert.ok(docText.includes(citation),
+      docRel + ' no longer carries ' + citation + ' - if it was retargeted on purpose, ' +
       'move the pin to the new range here rather than deleting the check');
     const [, rel, spans] = citation.match(/\[C ([\w./-]+):([\d,\-]+)\]/);
     const lines = read(rel).split('\n');
     const text = spans.split(',')
       .map((span) => { const [lo, hi] = span.split('-').map(Number); return lines.slice(lo - 1, hi || lo).join('\n'); })
       .join('\n');
-    if (!text.includes(needle)) drifted.push(citation + ' no longer covers `' + needle + '`');
+    if (!text.includes(needle)) drifted.push(docRel + ': ' + citation + ' no longer covers `' + needle + '`');
+  }
   }
   assert.deepEqual(drifted, [],
-    'the cited lines moved - retarget the citation in ' + DOC_REL + ' and update the pin');
+    'the cited lines moved - retarget the citation in the doc named and update its pin');
 });
 
 test('no line-numbered citation in the doc is left unpinned', () => {
   // Without this, a new citation could be added stale and never checked.
-  const unpinned = [...new Set([...doc.matchAll(/\[C [\w./-]+:[\d,\-]+\]/g)].map((m) => m[0]))]
-    .filter((c) => !(c in PINNED));
-  assert.deepEqual(unpinned, [], 'add each of these to PINNED with the evidence it is meant to show');
+  for (const [docRel, docText, pins, scope] of DOCS) {
+    const unpinned = [...new Set([...docText.matchAll(scope)].map((m) => m[0]))]
+      .filter((c) => !(c in pins));
+    assert.deepEqual(unpinned, [],
+      docRel + ': add each of these to its pin table with the evidence it is meant to show');
+  }
 });

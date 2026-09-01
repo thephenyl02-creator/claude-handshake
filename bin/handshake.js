@@ -433,9 +433,9 @@ async function cmdInit(args) {
   const founderName = asFlag || defaultMemberName();
   // SECURITY.md 9 is about what the protocol carries. When --as is absent the
   // name IS this machine's login name [C bin/handshake.js:391], and it goes on
-  // the wire in ws.join and in every later `from.member_name`. Deriving it is
-  // fine; deriving it silently is not - so the derivation is announced before
-  // the relay enrolment below sends it anywhere.
+  // the wire as ws.join's `member_name` and, on ntfy, as `from.member` on every
+  // later envelope [C lib/envelope.js:241, 201-202]. Deriving it is fine;
+  // deriving it silently is not - announced here, before anything sends it.
   if (!asFlag) out('member name: ' + founderName + '  (from this machine\'s username - `--as <name>` to choose your own)');
   let founderMember = founderName;
   let founderToken = null;
@@ -1757,7 +1757,7 @@ async function cmdPresence(args) {
   const found = requireWs(args); if (!found) return;
   const stateName = args._[0];
   if (!['working', 'waiting', 'blocked', 'tooling_broken'].includes(stateName)) {
-    err('usage: handshake presence working|waiting|blocked|tooling_broken [--note "..."] [--branch <b>] [--agents <n>]');
+    err('usage: handshake presence working|waiting|blocked|tooling_broken [--note "..."] [--branch <b>] [--agents <n>] [--reason <why>: tooling_broken only]');
     process.exitCode = 2; return;
   }
   const ctx = openWorkspace(found.ws, args);

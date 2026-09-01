@@ -24,6 +24,12 @@ const C = require('../hooks/common');
 const POLL_MS = 5000;                    // disarm responsiveness, not heartbeat cadence
 const MAX_FILES = 64;                    // PROTOCOL section 2.5
 
+// The bound on ONE CLI spawn. The monitor has no watchdog above it - it is the
+// long-lived process, not a hook - so for the monitor this constant IS the
+// bound. A caller that does have a wall passes `beat(..., {deadline})` and each
+// spawn takes the smaller of the two.
+const CLI_TIMEOUT_MS = 8000;
+
 function main() {
   // The monitor's own start. A monitor's lifetime IS its session's lifetime
   // (section 8), so this is the only clock that tells "written during my
@@ -124,54 +130,101 @@ function main() {
   tick().catch(() => {});
 }
 
-// Is this disarm sentinel THIS session's? Two answers, in order.
+// Is this disarm sentinel THIS session's? Two rules, and they COMPOSE - the
+// lifetime one is a precondition on the ownership one, not a fallback for it.
 //
-// 1. OWNERSHIP, the shared rule every other reader of this file uses
-//    [C hooks/common.js ownsRecord]. `rest` stamps the sentinel with the
-//    session that wrote it [C bin/handshake.js:1842], and another session's
-//    disarm is not this session's.
+// 1. START TIME, always. A monitor's lifetime is its session's lifetime
+//    (section 8, [S5]), so a sentinel whose mtime predates this process was
+//    necessarily left behind by a session that is over - whatever name is
+//    stamped on it. A hook cannot make this test: it is a fresh process every
+//    turn with no idea when its session began, which is why hooks/stop.js has
+//    ownership and nothing else.
 //
-// 2. START TIME, when ownership cannot decide - the record names nobody (an
-//    older client, or a torn write), or this process has no identity at all
-//    because the host exports none of the three session variables. A hook
-//    cannot do this: it is a fresh process every turn with no idea when its
-//    session began, which is why hooks/stop.js stops at rule 1 and treats an
-//    unattributable record as someone else's. A monitor can: its lifetime is
-//    its session's lifetime (section 8, [S5]), so a sentinel whose mtime is
-//    newer than this process's start was necessarily written after this
-//    session began, and a sentinel older than that was necessarily left behind
-//    by a session that is over.
+// 2. OWNERSHIP, when it can decide - the shared rule every other reader of this
+//    file uses [C hooks/common.js ownsRecord]. `rest` stamps the sentinel with
+//    the session that wrote it [C bin/handshake.js:1842], and another session's
+//    disarm is not this session's, however recently it was written. It cannot
+//    decide when the record names nobody (an older client, or a torn write) or
+//    when this process has no identity at all because the host exports none of
+//    the three session variables; then rule 1 stands alone.
 //
-// Rule 2 is not decoration. Without it, an env-less host would trade the
-// permanent disarm for a `rest` that no longer stops the monitor at all - the
-// user's own command silently ignored, which is a worse failure than the one
-// being fixed. It errs toward stopping (a second parent session in the same
-// project resting would stop this monitor too, on such a host); stopping is
-// visible in `status` and recoverable by restarting the session, and it is the
-// direction that keeps `rest` honest.
+// Rule 1 used to sit BEHIND rule 2, reached only when ownership had no answer,
+// and that hole had the shape of the defect this whole gate exists to close:
+// session ids repeat whenever HANDSHAKE_SESSION_ID is pinned rather than minted
+// per session (the e2e members do exactly that [C e2e/lib/members.js:112]), so
+// one `rest` plus one missed SessionEnd sweep - and SessionEnd is best-effort,
+// 20 of 21 [S4] - left a sentinel bearing THIS id that every future monitor
+// obeyed on its first poll, silently and forever. Requiring the sentinel to be
+// younger than the process reading it costs nothing real: `rest` is typed by a
+// human into a session whose monitor is already running.
+//
+// Rule 1 is not decoration in the other direction either. Without it, an
+// env-less host would trade the permanent disarm for a `rest` that no longer
+// stops the monitor at all - the user's own command silently ignored, which is
+// a worse failure than the one being fixed. Alone it errs toward stopping (a
+// second parent session in the same project resting would stop this monitor
+// too, on such a host); stopping is visible in `status` and recoverable by
+// restarting the session, and it is the direction that keeps `rest` honest.
 function disarmedHere(file, mine, startedAt) {
   const mtime = C.mtimeMs(file);
   if (mtime === null) return false;                   // absent: nothing to obey
+  if (mtime < startedAt) return false;                // rule 1: a session that is over
   const owner = C.recordOwner(C.readRecord(file));
   if (owner !== null && mine && mine.size) return mine.has(owner);
-  return mtime >= startedAt;
+  return true;                                        // rule 2 cannot decide; rule 1 already did
 }
 
-// One heartbeat: carry the whole agent tree's file footprint, then renew.
-async function beat(state, found, desired) {
+// One heartbeat: fold the whole agent tree's file footprint into the claim,
+// renew presence, then carry the delta to peers.
+//
+// ORDER. Presence is posted FIRST and the change-delta push second, and the
+// order is load-bearing rather than incidental, because the two halves are not
+// equally recoverable. A missed presence post is a hole in the section 8 clock
+// that nothing refills: the caller's cadence marker is already stamped
+// [C hooks/stop.js], so the next attempt is a whole keepalive away and peers
+// watch the member go quiet meanwhile. A missed delta push costs nothing
+// durable - `pushed_files` is only advanced on success, so pendingPush()
+// re-derives the same delta on the very next beat [C pendingPush below]. When
+// only one of the two fits, it must be the presence post.
+//
+// fold() still runs before BOTH: on ntfy the presence body carries the full
+// claim set (section 9.3), so the folded child files belong in it.
+//
+// BUDGET. Two spawns at CLI_TIMEOUT_MS each is up to 16 s, and hooks/stop.js
+// runs under a 9.5 s watchdog [C hooks/stop.js BUDGET_MS]. Against a transport
+// that accepts a connection and never answers, that watchdog used to fire in
+// the middle of the SECOND call - so the push burnt the budget and the presence
+// post reached nothing, not even the offline queue, with the cadence marker
+// already stamped. `opts.deadline` is an absolute wall-clock ms: each spawn
+// gets the smaller of CLI_TIMEOUT_MS and what is left of it, and a spawn with
+// nothing left is skipped rather than started in order to be killed. The
+// monitor passes no deadline and is bounded by CLI_TIMEOUT_MS exactly as
+// before.
+async function beat(state, found, desired, opts) {
+  const o = opts || {};
+  const deadline = Number.isFinite(o.deadline) ? o.deadline : null;
+  const slice = () => (deadline === null ? CLI_TIMEOUT_MS : Math.min(CLI_TIMEOUT_MS, deadline - Date.now()));
+
   const now = Date.now();
   fold(state, now);
   const push = pendingPush(state, now);
+
+  const presenceMs = slice();
+  if (presenceMs <= 0) return false;
+  const res = await C.runCli(['presence', desired], { cwd: found.root, timeoutMs: presenceMs });
+  if (res.ok) renewLocal(state, now);
+
   if (push) {
     // section 7.2 rule 3: "the parent's next heartbeat carries the union".
     // `change --change files` posts task.change AND, on the relay, makes the
     // matching claim call that updates server state (section 3.1).
-    const r = await C.runCli(['change', push.subject, '--change', 'files', '--files', push.delta.join(',')],
-      { cwd: found.root, timeoutMs: 8000 });
-    if (r.ok) markPushed(state, push.subject_key, push.all);
+    const changeMs = slice();
+    if (changeMs > 0) {
+      const r = await C.runCli(['change', push.subject, '--change', 'files', '--files', push.delta.join(',')],
+        { cwd: found.root, timeoutMs: changeMs });
+      if (r.ok) markPushed(state, push.subject_key, push.all);
+    }
   }
-  const res = await C.runCli(['presence', desired], { cwd: found.root, timeoutMs: 8000 });
-  if (res.ok) renewLocal(state, now);
   return res.ok;
 }
 
@@ -264,4 +317,4 @@ if (require.main === module) {
 // MUST take the same beat, not a second implementation of one - a duplicate
 // would drift on the fold, the push delta or the local renewal and only be
 // caught in production.
-module.exports = { beat, fold, pendingPush, markPushed, renewLocal, disarmedHere, MAX_FILES, POLL_MS };
+module.exports = { beat, fold, pendingPush, markPushed, renewLocal, disarmedHere, MAX_FILES, POLL_MS, CLI_TIMEOUT_MS };

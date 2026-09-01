@@ -273,6 +273,11 @@ function sessionIdentities(f, env) {
 // file this whole gate exists to stop honouring. Ignoring it costs one session
 // of beating at the transport's own keepalive, which is visible and
 // recoverable; honouring it is silent and forever.
+//
+// The SWEEP takes the OPPOSITE action on that same unattributed record - it
+// deletes what the readers here refuse to honour. That is deliberate, and the
+// invariant which makes the pair safe is stated once, at the bottom of
+// hooks/session-end.js. It is not restated here.
 function ownsRecord(rec, ids) {
   if (!rec || typeof rec !== 'object') return false;
   const owner = typeof rec.session === 'string' && rec.session ? rec.session : null;
