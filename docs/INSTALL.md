@@ -449,6 +449,47 @@ things are **not** automatic and need your own follow-up:
 
 ## Uninstalling
 
+### Detaching a project first
+
+Uninstalling removes the *tool*. It does not remove the `.handshake/` directory
+claude-handshake wrote **into your repo** — that is project content, it is
+committed, and every teammate who pulls has a copy. If you want the project
+detached, do that before (or instead of) uninstalling — `/handshake scrub` in
+Claude Code, or the `scrub` verb through whichever invocation form your install
+route gives you ([Invoking the CLI outside Claude
+Code](#invoking-the-cli-outside-claude-code)).
+
+That deletes `.handshake/` from the working tree, removes the `claude-handshake`
+block from the project's `CLAUDE.md` if one is there, and stops the tool from
+re-creating either on its own — every repo **write** path is gated on that
+directory existing, exactly the state `init --no-repo` leaves behind. The three
+commands that write it fresh (`init`, `deploy-relay`, `scrub --restore`) are all
+typed by you.
+
+What `scrub` deliberately does **not** do:
+
+- It does not end your membership, touch the workspace secret or your relay
+  sub-token, or stop the live layer. You stay a member; claims, notes and
+  presence keep working. Signing off is `/handshake rest`.
+- It does not commit. The deletion rides your next commit like any other change
+  — claude-handshake never makes a coordination-only commit — so until you
+  commit and push it, teammates still have the directory. Their clones keep
+  working until they pull; their handshake keeps working regardless, on the live
+  layer.
+- It does not rewrite history. Shards that were already committed stay in every
+  clone, fork and archive of those commits. Taking them out is a `git
+  filter-repo`-class rewrite and a force-push, and this tool will not do it.
+
+If other members' task shards are in the directory, `scrub` lists them and asks
+for a typed confirmation first (`--yes` skips that prompt). Re-attach later with
+`/handshake scrub --restore`, which rewrites the layer for the **same** workspace
+out of your local state — add `--claude-md` to restore the `CLAUDE.md` block too.
+`/handshake init` is *not* the way back: it mints a new workspace.
+
+A **non-member** who cloned the repo does not need any of this, and does not
+need the tool installed. `.handshake/README.md` says so in the directory itself;
+they can delete it with a plain `git rm -r .handshake`.
+
 **Primary route:**
 
 ```sh
@@ -502,9 +543,10 @@ delete them at your leisure.
 **Either route**, your workspace's local state — `~/.claude/handshake/<ws>/`
 or the plugin data directory — holds the sub-token and, on ntfy, the topic
 (both bearer credentials, SECURITY.md §3). Neither uninstall path removes a
-**joined workspace's membership on the transport itself** — if you're leaving
-a team's workspace for good, run `/handshake rest` (or ask the founder to
-remove your member) before uninstalling, not after.
+**joined workspace's membership on the transport itself** — `/handshake rest`
+signs the session off, and the founder's member-remove (relay) or a topic
+rotation (ntfy) is what actually ends a membership. Do that part before
+uninstalling, not after.
 
 ## Security: credentials and push protection
 

@@ -30,6 +30,32 @@ plain text, distributed to every teammate the same way the rest of the repo
 is — by `git pull`. The live layer is what makes coordination feel automatic;
 the durable layer is what survives after everyone signs off.
 
+**What a cloner sees, and how to get rid of it.** `.handshake/` is committed, so
+anyone who clones the repo gets it — including people who have never heard of
+this tool. What they can read is the *public half* of the workspace record:
+workspace id and name, transport kind, protocol/client versions, and the relay
+or ntfy **endpoint URL**. The endpoint is genuinely there in the clear — it is
+the address, not the key, and the relay authenticates every request, so the URL
+on its own opens nothing. What they never see is any credential: that file is
+written from a field **allowlist** (`PUBLIC_FIELDS` in
+[`lib/workspace-files.js`](lib/workspace-files.js)) rather than by copying local
+state, and the guarded names — workspace secret, ntfy topic, enrollment token,
+recovery key, member token — are refused by name on the way in, so a field added
+to the workspace later cannot leak into the committed file by accident. The
+one credential file, `.handshake/secret.json`, is committed **only** where the
+fail-closed private-repo guard returned an affirmative `isPrivate: true`;
+otherwise it is gitignored and the secret travels out of band. The directory
+carries a generated `README.md` that says all of this to whoever opens it.
+
+A non-member can ignore the directory or delete it (`git rm -r .handshake`) —
+nothing in it needs the tool installed, and nothing in it instructs an
+assistant. A **member** who wants this project detached runs `/handshake scrub`:
+it removes `.handshake/` and the `CLAUDE.md` block and stops the tool
+re-creating them, while leaving membership, credentials and the live layer
+alone. The removal rides your next commit, and shards already in git history
+stay in git history. Details, including how to re-attach:
+[docs/INSTALL.md → Detaching a project](docs/INSTALL.md#uninstalling).
+
 - **Zero-setup mode** to try it — no accounts, no servers, just an invite blob
 - **Team relay mode** (your own free Cloudflare Worker) for real work — deployed
   with **one command**, `/handshake deploy-relay`; you never type `wrangler`
@@ -206,6 +232,7 @@ carrying your live claims across. Full details and the free-tier limits:
 | `doctor` | Pass/warn/fail health check (Node, workspace, credentials, transport, private-repo guard, git history, more) | no |
 | `deploy-relay` | Deploy your own Cloudflare relay in **one command** (no `wrangler` typing) and print the invite | yes |
 | `upgrade` | Migrate an existing zero-setup workspace → team relay (deploys one for you if you have none) | yes |
+| `scrub` | Detach **this project** from the durable layer: delete `.handshake/` and the `CLAUDE.md` block, and stop re-creating them. Membership, credentials and the live layer are untouched. `--restore` rewrites the layer for the same workspace | yes |
 
 `rotate` is also routed (`/handshake rotate`) but is an offboarding action that
 needs the recovery key — never run it on your own initiative. Full verb

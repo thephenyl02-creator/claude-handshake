@@ -66,7 +66,7 @@ test('help lists every implemented subcommand', () => {
   assert.equal(r.code, 0);
   for (const cmd of ['init', 'invite', 'join', 'claim', 'change', 'release', 'done', 'note',
     'warn', 'presence', 'post', 'sync', 'cursor', 'status', 'rotate', 'leave',
-    'mute', 'unmute', 'rest', 'upgrade', 'doctor']) {
+    'mute', 'unmute', 'rest', 'upgrade', 'doctor', 'scrub']) {
     assert.ok(new RegExp('^\\s+' + cmd + '\\b', 'm').test(r.out), 'usage must document `' + cmd + '`');
   }
   assert.match(r.out, /Credentials are read from stdin, never from argv/);

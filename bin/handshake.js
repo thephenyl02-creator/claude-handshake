@@ -1061,7 +1061,7 @@ async function cmdTasks(args) {
   }
   const root = detected.root;
   if (!repoLayerPresent(root)) {
-    err('handshake: no ' + wsFiles.DIR + '/ in ' + root + ' - run `handshake init` here first.');
+    err('handshake: no ' + wsFiles.DIR + '/ in ' + root + ' - `handshake scrub --restore` re-attaches this workspace; `handshake init` would mint a new one.');
     process.exitCode = 2; return;
   }
 
@@ -1513,7 +1513,10 @@ async function cmdDoctor(args) {
     add('workspace', 'pass', found.ws + ' via ' + found.source);
   }
 
-  const ws = found ? found.ws : 'doctor-probe';
+  // The probe id is shaped like a real workspace id because stateDir refuses
+  // anything else (the untrusted-ws chokepoint in lib/state.js). All-zeros
+  // cannot be minted by a CSPRNG in practice, and the dir is removed below.
+  const ws = found ? found.ws : '00000000000000000000000000000000';
   const state = stateLib.openState(ws);
   const w = state.writable();
   add('state dir writable', w.ok ? 'pass' : 'fail', state.dir + (w.ok ? '' : ' - ' + w.error));
@@ -2215,6 +2218,191 @@ async function cmdUpgrade(args) {
   out('  transport before the dual-read window closes must be re-invited out of band.');
 }
 
+// ================================================================= scrub ====
+
+// Detach THIS PROJECT from the repo layer. Not an uninstall, not a departure:
+// membership, credentials, local state and the live layer are all untouched,
+// and the whole point of saying so in the output is that "remove the folder"
+// and "leave the team" are the two things a user will assume this did.
+//
+// There is deliberately NO new mode flag. Every repo-write path in this client
+// is already gated on the directory being present - the shard writer
+// [C bin/handshake.js:258-272], the guard [C bin/handshake.js:239-252] and the
+// projection [C bin/handshake.js:1063-1066] all return early through
+// repoLayerPresent() [C bin/handshake.js:229-231] - and that is exactly the
+// state `init --no-repo` leaves behind [C bin/handshake.js:496]: it never
+// creates the directory, so the check is false forever after. Removing the
+// directory therefore IS the flip. A second flag in local state would be a
+// second source of truth for a question the filesystem already answers, and
+// the two would drift the first time a peer's commit brought the directory
+// back on a pull.
+async function cmdScrub(args) {
+  if (refuseIfChild('scrub')) return;
+  const detected = repoRoot();
+  const found = resolveWs(args);
+  const state = found ? stateLib.openState(found.ws) : null;
+  // A resolved ws is not membership: workspace.json in a CLONED tree resolves
+  // here too. Only local state that actually holds this workspace makes any
+  // sentence about YOU true - and only then is there bookkeeping to update.
+  const cfg0 = state ? state.read() : null;
+  const isMember = Boolean(cfg0 && cfg0.ws);
+
+  // Outside a git tree the layer can only be a copy somebody moved here; there
+  // is no commit to make and nothing git ever distributed. cwd is still the
+  // right place to look, because that is where such a copy would be.
+  const root = detected ? detected.root : process.cwd();
+
+  // ------------------------------------------------- the inverse: re-attach --
+  if (args.flags.restore) {
+    if (!found || !state) {
+      err('handshake: no workspace resolves here, so there is nothing to re-attach.');
+      err('           `handshake init` creates a NEW workspace; it does not restore this one.');
+      process.exitCode = 2; return;
+    }
+    const cfg = state.read();
+    if (!cfg.secret) {
+      err('handshake: local state for ' + found.ws + ' has no workspace secret - nothing to write.');
+      process.exitCode = 1; return;
+    }
+    if (!detected) {
+      err('handshake: not inside a git working tree. `' + wsFiles.DIR + '/` is only useful where');
+      err('           git carries it to peers, so nothing was written.');
+      process.exitCode = 2; return;
+    }
+    const layer = writeRepoLayer(found.ws, cfg, { detected, state, filterOpts: { projectDir: process.cwd() } });
+    out('repo layer re-attached for workspace ' + found.ws + ' (no new workspace was created)');
+    printRepoLayer(layer);
+    if (args.flags['claude-md']) {
+      const r = wsFiles.writeClaudeMdBlock(root, { consent: true });
+      out('  CLAUDE.md block: ' + r.action + ' (' + r.file + ')');
+    } else {
+      out('');
+      out('  The CLAUDE.md block is NOT restored without `--claude-md`: writing into a');
+      out('  project\'s CLAUDE.md changes what every future session here reads, which is a');
+      out('  separate consent from re-creating ' + wsFiles.DIR + '/.');
+    }
+    out('');
+    out('  Peers\' shards come back when you pull them; this wrote only the workspace');
+    out('  record and your own side of the layer.');
+    return;
+  }
+
+  // --------------------------------------------------------- nothing to do --
+  const layerPresent = repoLayerPresent(root);
+  const block = wsFiles.readClaudeMdBlock(root);
+  if (!layerPresent && !block.present) {
+    out('nothing to scrub in ' + root);
+    out('  no ' + wsFiles.DIR + '/ and no claude-handshake block in CLAUDE.md' +
+      (detected ? '' : ' (and this is not a git working tree)') + '.');
+    if (found) {
+      out('  This project already has no repo layer - which is what `init --no-repo` leaves.');
+      out('  Your membership in ' + found.ws + ' is untouched and the live layer is unaffected.');
+    }
+    return;
+  }
+
+  // ------------------------------------------------- peers' shards die too --
+  // The confirmation is typed, defaulting to NO, like every other destructive
+  // prompt in this CLI; `--yes` is accepted the way `deploy-relay` accepts it
+  // [C bin/handshake.js:1901-1902] rather than refused the way `join` refuses
+  // it, because scrub spends no credential and mints no membership. It is only
+  // ASKED when peers are actually in the directory: a member deleting their own
+  // solo project's own generated folder is not a decision anyone needs a gate
+  // for, and a prompt that always fires is a prompt people learn to type
+  // through.
+  const self = isMember ? cfg0.member : null;
+  const mine = self ? wsFiles.shardFileName(self) : null;
+  const peers = wsFiles.listShards(root).map((f) => path.basename(f)).filter((n) => n !== mine);
+  if (peers.length) {
+    out('WARNING: ' + peers.length + ' task shard(s) here belong to other members:');
+    for (const n of peers.slice(0, 10)) out('  ' + wsFiles.DIR + '/' + wsFiles.TASKS_DIR + '/' + n);
+    if (peers.length > 10) out('  +' + (peers.length - 10) + ' more');
+    out('');
+    out('They die with the directory in YOUR working tree, and the commit that carries');
+    out('this removal deletes them for everyone who pulls it. Their own clones keep');
+    out('their copies until they pull. Their handshake keeps working either way -');
+    out("this removes the repo layer, not anyone's membership or the live layer.");
+    out('');
+    if (!args.flags.yes && !(await confirm('Remove the repo layer for this project?'))) {
+      out('not scrubbed');
+      return;
+    }
+  }
+
+  const removed = wsFiles.removeRepoLayer(root);
+  const md = wsFiles.removeClaudeMdBlock(root);
+
+  // Guard bookkeeping. The shard-authorship record is a list of files that no
+  // longer exist, and `status` renders it [C bin/handshake.js:1246-1251], so it
+  // goes. `repo_guard` deliberately STAYS: it carries the visibility verdict
+  // and, if one ever fired, the hard-fail record and the standing rotation
+  // demand. A secret that was committed is still committed - deleting the
+  // working-tree copy does not un-leak it, and a scrub that quietly cleared
+  // `rotation_demanded` would turn "we leaked, rotate" into silence.
+  // Gated on MEMBERSHIP, not on a state handle: update() writes, and writing
+  // would create a state directory for a workspace this machine never joined.
+  if (isMember) state.update((s) => { delete s.repo_warnings; return s; });
+
+  out('scrubbed ' + root);
+  if (removed.existed) {
+    out('  removed ' + wsFiles.DIR + '/  (' + removed.files.length + ' file(s), ' +
+      removed.shards.length + ' task shard(s))');
+  } else {
+    out('  no ' + wsFiles.DIR + '/ was here');
+  }
+  out('  CLAUDE.md: ' + ({
+    removed_block: 'claude-handshake block removed',
+    removed_file: 'held nothing but the claude-handshake block, so the file is gone',
+    no_block: 'no claude-handshake block in it - left alone',
+    no_claude_md: 'no CLAUDE.md here',
+  }[md.action] || md.action));
+
+  out('');
+  if (isMember) {
+    out('  Untouched: your membership, the workspace secret and any relay sub-token in');
+    out('  ' + state.dir + ',');
+    out('  and the LIVE layer. You are still a member' + (found ? ' of ' + found.ws : '') + ' - claims, notes and');
+    out('  presence keep working. This detaches the PROJECT from the repo layer, not you');
+    out('  from the workspace. Signing off for a session is `handshake rest`; nothing');
+    out('  here ends a membership on the transport.');
+  } else {
+    out('  No local membership for this workspace exists on this machine, so no local');
+    out('  state was created or touched. If you joined on another machine, that machine');
+    out('  is unaffected; if you cloned this repo without joining, you are done.');
+  }
+
+  if (state) {
+    const queued = (stateLib.readJsonFile(state.files.queue, { entries: [] }).entries || []).length;
+    if (queued) {
+      out('  ' + queued + ' post(s) are still queued for the live layer. The queue is local state,');
+      out('  not repo content: scrub does not touch it and they flush on your next sync.');
+    }
+  }
+
+  out('');
+  out('  No repo write path re-creates ' + wsFiles.DIR + '/ on its own - each is gated on the');
+  out('  directory being there, the same state `init --no-repo` leaves behind. Only');
+  out('  `init`, `deploy-relay` and `scrub --restore` write it fresh, each a typed command.');
+
+  out('');
+  if (detected) {
+    out('  The deletion rides your NEXT commit. claude-handshake never commits for you and');
+    out('  never makes a coordination-only commit, so until you commit and push this,');
+    out('  peers still have the directory.');
+    out('  Committed HISTORY still holds every shard that was ever committed. Taking those');
+    out('  out of history is a git rewrite - force-push, everyone re-clones - and this tool');
+    out('  will not do that for you.');
+  } else {
+    out('  Not a git working tree, so nothing here was ever distributed by git: there is no');
+    out('  commit to make and no history to worry about.');
+  }
+
+  out('');
+  out('  Re-attach this project later with `handshake scrub --restore` (add `--claude-md`');
+  out('  for the CLAUDE.md block). It rewrites the layer for THIS workspace out of local');
+  out('  state; `handshake init` would mint a NEW one instead.');
+}
+
 // ================================================================== main ====
 
 const COMMANDS = {
@@ -2224,7 +2412,7 @@ const COMMANDS = {
   sync: cmdSync, cursor: cmdCursor, status: cmdStatus, tasks: cmdTasks, guard: cmdGuard,
   rotate: cmdRotate, leave: cmdLeave, doctor: cmdDoctor,
   mute: cmdMute, unmute: cmdUnmute, rest: cmdRest,
-  'deploy-relay': cmdDeployRelay, upgrade: cmdUpgrade,
+  'deploy-relay': cmdDeployRelay, upgrade: cmdUpgrade, scrub: cmdScrub,
 };
 
 const USAGE = [
@@ -2254,6 +2442,7 @@ const USAGE = [
   '  deploy-relay [--name <n>] [--as <member name>] [--work-dir <path>] [--yes] [--print-only]  deploy your own Cloudflare relay (one command)',
   '  upgrade   [--relay <origin>] [--yes]  migrate zero-setup -> team relay (PROTOCOL 9.4)',
   '  doctor    [--json]',
+  '  scrub     [--yes] [--restore [--claude-md]]  detach THIS project from the repo layer (not your membership)',
   '',
   'Credentials are read from stdin, never from argv.',
 ].join('\n');

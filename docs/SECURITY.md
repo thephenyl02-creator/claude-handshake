@@ -515,7 +515,7 @@ endpoint or token change, reporting the dropped count (PROTOCOL §10.3).
   `init` and `deploy-relay` have to work unattended, so when `--as` is absent
   they DERIVE it from `os.userInfo().username`, with no prompt
   `[C bin/handshake.js:389-394]` `[C bin/handshake.js:432-433]`
-  `[C bin/handshake.js:1932-1933]`. That derivation is lossier than
+  `[C bin/handshake.js:1935-1936]`. That derivation is lossier than
   "sanitizing" suggests: the filter is
   `.replace(/[^\x20-\x7e]/g, '')`, so **every character outside printable ASCII
   is deleted, not merely the non-printable ones** — then whitespace is folded to
@@ -546,7 +546,7 @@ endpoint or token change, reporting the dropped count (PROTOCOL §10.3).
   `[C relay/src/do/workspace.js:244,704-714]`. So on both tiers peers read it
   and it is injected into their model context (§5.3) — which is why both
   commands print the derived name before enrolling anything
-  `[C bin/handshake.js:432-433]` `[C bin/handshake.js:1932-1933]`. `--as <name>` on either command replaces it
+  `[C bin/handshake.js:432-433]` `[C bin/handshake.js:1935-1936]`. `--as <name>` on either command replaces it
   outright, and `join` never derives at all: it takes `--as`, or asks the human
   for a member name `[C bin/handshake.js:618-620]`. Pick the name you want peers
   to read — a derived one is a default, not a guarantee of anonymity.
