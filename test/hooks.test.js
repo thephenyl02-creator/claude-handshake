@@ -900,9 +900,16 @@ test('no hook writes to stdout except the designed injections', () => {
   }
   assert.ok(!/process\.stdout\.write|console\.log/.test(code(path.join(ROOT, 'monitors', 'heartbeat.js'))),
     'a monitor NEVER writes to stdout [S5]');
-  // The two that DO write are the designed injections, and nothing else.
-  for (const f of ['user-prompt-submit.js', 'pre-tool-use.js']) {
+  // The two that DO write are the designed injections, and nothing else. The
+  // count is EXACT and per file, so an undesigned print is still red: what the
+  // control catches is a stray write, not a designed one. user-prompt-submit.js
+  // has two because K2 added the once-per-session knowledge block as "a
+  // separate string emitted by a separate branch" (KNOWLEDGE.md 7) - the
+  // standing block ships first and unconditionally, the knowledge block after
+  // it and at most once per session.
+  const DESIGNED = { 'user-prompt-submit.js': 2, 'pre-tool-use.js': 1 };
+  for (const [f, expected] of Object.entries(DESIGNED)) {
     const hits = (code(path.join(HOOKS, f)).match(/process\.stdout\.write/g) || []).length;
-    assert.strictEqual(hits, 1, f + ' has exactly one designed injection');
+    assert.strictEqual(hits, expected, f + ' has exactly ' + expected + ' designed injection(s)');
   }
 });

@@ -306,14 +306,7 @@ Three details, each of which is a defect if it is got wrong:
   case is therefore a block that arrives one or two turns late; there is no case
   in which the scan and the latch race and the block is lost for the session.
 
-A **child session renders it too**, from the parent's cache, under a rule of its
-own. A child never scans `[C hooks/session-start.js:43-47]`, so the
-`scan_session` test cannot apply to it: it prints the parent's cache whatever
-that cache's age, and records its **own** session id in the same bounded map, so
-it prints once per child session and never clears the parent's entry. Rule 2 of
-`[P§7.2]` lets a child read the parent's local cache; this is a read, it
-advances no watermark (the knowledge block is regenerated state, never
-consumed), and a subagent working the same tree benefits from the same facts.
+A **child session never renders it** - built that way, deliberately, and this paragraph records the reversal from the first draft (which had a child render from the parent's cache under its own latch key). Rule 2 of `[P§7.2]` lets a child read the parent's local cache, so this is a scope choice, not a prohibition: the block is the parent session's opening context, and a subagent is handed the facts it needs in the prompt that spawned it. The cost argument decides it - an agent-heavy session spawns many children, and one ~500-token block per child is exactly the per-child multiplication §3.4 refuses to pay. A child therefore never keys the map and never clears the parent's entry `[C hooks/user-prompt-submit.js injectKnowledge]`. Reversing this is one guard and one inverted test; K4 may revisit it with evidence.
 
 ### 3.3 What is injected, in what order, under what cap
 
@@ -324,7 +317,7 @@ consumed), and a subagent working the same tree benefits from the same facts.
 | attribution line | **≤ 75 chars** per entry | `member ≤20 · YYYY-MM-DD · first path ≤32` = 68, plus the optional ` (aged)` = 75 |
 | block total | **2,000 chars** hard | **derived, not picked**: 353-char frame + 6 × 259 + a 27-char overflow line = 1,934, capped at 2,000. ~500 tokens; the arithmetic is shown in §7 |
 | frequency | **once per session** | latched on a printed non-empty block, §3.2 |
-| overflow | `+N more — handshake learned` | the `[P§10.2]` rule reused verbatim: a trimmed list always says it was trimmed `[C hooks/render.js:63]` |
+| overflow | `+N more — handshake tasks` | the `[P§10.2]` rule reused verbatim: a trimmed list always says it was trimmed `[C hooks/render.js:63]` |
 | scan bound | 20 shards × newest 200 `learned` records | §11.4; truncation reported the same way |
 
 **Ranking happens at render time, not at scan time.** The scan now runs before
@@ -758,7 +751,7 @@ So `handshake learn` prints, once, when `.handshake/tasks/` has uncommitted
 changes:
 
 ```
-learning recorded in .handshake/tasks/fenil.md — it reaches bob's repo on your next commit.
+learning recorded in .handshake/tasks/fenil.md — it reaches your peers' repos on your next commit.
 Until then it lives only on this disk: `learn` posts nothing to the transport.
 ```
 
@@ -819,7 +812,7 @@ silent trim, so the arithmetic is shown rather than asserted:
 | **frame subtotal** | **353** | |
 | 6 × attribution line | 6 × 75 = 450 | `member ≤20 · YYYY-MM-DD · path ≤32` (68) + optional ` (aged)` (7) |
 | 6 × quoted text line | 6 × 184 = 1,104 | 2 indent + `"` + ≤180 + `"` |
-| `+N more — handshake learned` | 27 | never trimmed `[C hooks/render.js:63]` |
+| `+N more — handshake tasks` | 27 | never trimmed `[C hooks/render.js:63]` |
 | **total, worst case** | **1,934** | cap **2,000**, 66 chars of slack |
 
 **The per-turn cost is zero characters and zero tokens — and that is the honest
@@ -995,8 +988,11 @@ child early-return `[C hooks/session-start.js:28,43-47]`; the 0600 write path
 - Performs no network I/O and writes to no shard (asserted structurally).
 - Bounded: 20 shards × 200 newest records, and the truncation is **reported**,
   never silent `[P§10.2]`.
-- Records from a shard flagged `non_member_commit` come back marked, and the
-  digest builder excludes them — **and a companion test pins the flag's reach**:
+- Records from a shard flagged `non_member_commit` are excluded IN THE SCAN
+  itself (counted under `excluded.non_member_commit`, the shard row marked
+  `excluded: true`) rather than merely marked for a downstream builder to drop —
+  a control that depends on a consumer remembering to apply it is one refactor
+  from gone; K3's `learned --all` re-reads the shards for the with-warning view — **and a companion test pins the flag's reach**:
   with no recorded email for a peer member, that peer's shard comes back
   `unknown` / `unverified_shard_authors` and its records are **not** excluded
   `[C lib/workspace-files.js:427-432]`, which is §3.3's point that this rule
@@ -1087,7 +1083,7 @@ rendered-examples reference, in the shape of `standing-block.md`) ·
   match a single-bracket tag — with `escapeSlot`'s unconditional angle-bracket
   strip `[C hooks/render.js:95]` as the second net.
 - Budget: 6 maximal entries render ≤ 2,000 chars (the §7 itemisation, worst case
-  1,934), and the 7th becomes `+1 more — handshake learned`.
+  1,934), and the 7th becomes `+1 more — handshake tasks`.
 
 ### K3 — The read verb
 
@@ -1259,7 +1255,7 @@ types only their ordinary commit.
    --paths src/auth/session.ts --subject "auth token refresh"
    ```
 
-   The CLI prints the §6.2 line: *reaches bob's repo on your next commit*.
+   The CLI prints the §6.2 line: *reaches your peers' repos on your next commit* (generalized from the running example: the CLI has no single peer to name, and prints the writing member's own shard path).
 3. **Fenil commits his ordinary work.** The shard rides it `[PLAN§6]`. No
    coordination-only commit.
 4. **Bob pulls.** Next morning, `git pull` as usual.

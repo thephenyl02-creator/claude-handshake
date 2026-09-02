@@ -38,6 +38,15 @@ const SENTINELS = Object.freeze({
   // - which is what makes ntfy's state-change rule reproducible across
   // processes.
   stopBeat: 'stop.beat',
+  // KNOWLEDGE.md 3.2: the once-per-session knowledge-injection latch. It is a
+  // sentinel and NOT session.json's per-session flag, because the injector is
+  // the one path forbidden to write that file (see buildView() below: "session
+  // .json is read READ-ONLY here"), and because the hook's session identity may
+  // not match the CLI's, so the flag could latch under the wrong key even if
+  // the write were allowed. Body: a bounded session-id -> injected-at map,
+  // newest 16 kept. Nothing else reads or writes it, so there is nothing to
+  // fight over.
+  knowledgeInjected: 'knowledge.injected.json',
 });
 
 // PostToolUse fires at p50 0.4 s / p90 3.1 s in agent workloads [S7] and 218

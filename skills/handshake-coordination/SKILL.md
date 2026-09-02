@@ -390,6 +390,9 @@ those files are a projection of claims (PROTOCOL §5).
 | Release | `node "$CLAUDE_PLUGIN_ROOT/bin/handshake.js" release "<subject>" --reason done\|superseded\|tiebreak_loss\|manual` |
 | Finish | `node "$CLAUDE_PLUGIN_ROOT/bin/handshake.js" done "<subject>" --summary "…"` |
 | Note | `node "$CLAUDE_PLUGIN_ROOT/bin/handshake.js" note discovery\|error\|fix\|blocker\|info "<text>" [--paths a,b] [--subject "<claim>"]` |
+| Record a learning — **provisional row** (KNOWLEDGE.md K0; §5.2 replaces it) | `node "$CLAUDE_PLUGIN_ROOT/bin/handshake.js" learn "<text>" [--paths a,b] [--subject "<claim>"]` — durable, posts nothing; it reaches peers on the human's next commit |
+| …when to record | All three must hold: a **non-obvious fact about THIS codebase** (a trap, or a fix with its cause), it **cost real effort** to find, and it **saves a peer that effort**. Roughly one per claim. |
+| …when not to | Anything derivable by reading the code; anything the standing block already carries (claims, presence, progress); opinions and proposals. |
 | Overlap warning | `node "$CLAUDE_PLUGIN_ROOT/bin/handshake.js" warn overlap --subject "…" --peer <member> --peer-subject "…"` (measured for you; refused under 50 — a sub-floor overlap you judged goes out as a note, §3.3) |
 | Presence at the edges | `node "$CLAUDE_PLUGIN_ROOT/bin/handshake.js" presence working\|waiting\|blocked\|tooling_broken [--note "…"]` |
 | Status | `node "$CLAUDE_PLUGIN_ROOT/bin/handshake.js" status [--json]` |

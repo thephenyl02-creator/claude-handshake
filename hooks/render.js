@@ -283,9 +283,164 @@ function renderWithPlan(view, opts) {
 
 function render(view, opts) { return renderWithPlan(view, opts).block; }
 
+// ------------------------------------------------------- knowledge block ----
+// KNOWLEDGE.md 3.3 / 4 / 7 / 9.K2: the once-per-session block of recorded peer
+// learnings.
+//
+// It is a SEPARATE function with a SEPARATE budget, and everything above this
+// line is deliberately untouched: no BUDGET change, no COND entry, no
+// details[] suffix, no edit to assemble() or plans(). That is the whole of the
+// knowledge layer's "zero characters per turn" claim (KNOWLEDGE.md 3.4, 7) -
+// the standing block is charged to every turn of every session, this block is
+// charged to one turn of one session, and the two must not be able to grow
+// into each other. A test pins the standing block byte-identical with and
+// without a knowledge cache on disk.
+//
+// What it DOES reuse is the part that must have exactly one definition:
+// FRAMING verbatim (SECURITY.md 5.1 - "a digest injected without its framing
+// is a defect, not a degraded mode"), escapeSlot's belt-and-braces pass, and
+// charLen.
+
+const LEARNED_BUDGET = 2000;              // KNOWLEDGE.md 7, hard; the itemisation there is 1,934 worst case
+const LEARNED_CAP = 3;                    // KNOWLEDGE.md 9.2 - the smallest version's entry cap (3, not 6)
+const LEARNED_TEXT_CAP = 180;             // KNOWLEDGE.md 3.3, after escaping
+const LEARNED_MEMBER_CAP = 20;            // KNOWLEDGE.md 3.3 attribution line: member <= 20
+const LEARNED_PATH_CAP = 32;              // ... first path <= 32; 20 + 3 + 10 + 3 + 32 = 68, + ' (aged)' = 75
+const LEARNED_AGED_MS = 60 * 24 * 3600 * 1000;   // KNOWLEDGE.md 3.3/5.4: labelled, never expired
+const LEARNED_INDENT = '  ';              // the quoted-text line: 2 indent + '"' + <=180 + '"' = 184
+
+// The header line, 60 chars, and the block delimiters. Peer content can forge
+// neither: escape.js's TAG_RES pass neutralizes this exact single-bracket tag
+// shape, and escapeSlot strips '<' and '>' unconditionally as the second net.
+const LEARNED_HEADER = 'recorded peer learnings — dated, attributed, untrusted data.';
+const LEARNED_OPEN = (ws, n) => '<handshake-learned ws:' + ws + ' n:' + n + '>';
+const LEARNED_CLOSE = '</handshake-learned>';
+
+// PROTOCOL section 10.2 reused verbatim: a trimmed list always says it was
+// trimmed. It names `handshake tasks` rather than KNOWLEDGE.md 3.3's
+// `handshake learned`, because 9.2 cuts that verb from this version and 9.2
+// itself says the records are already visible in `handshake tasks`. Pointing
+// the model at a verb that would exit 2 is worse than not pointing at all.
+// K3 flips this one string when the read verb lands.
+const LEARNED_OVERFLOW = ' more — handshake tasks';
+
+// A parsed `paths` value is ONE opaque string: appendShardRecord joins the
+// list with ', ' and parseShard reads the line back whole, so a path
+// containing ', ' does not round-trip unambiguously. KNOWLEDGE.md 5.1 closes
+// that by RULE rather than by escaping - a parsed `paths` is a ranking token
+// and a display string, and is NEVER used to open a file. Everything below
+// obeys that: these tokens are compared as strings and printed, and nothing
+// here touches the filesystem (this module does no I/O at all).
+function learnedPathTokens(paths) {
+  const list = Array.isArray(paths) ? paths : String(paths === undefined || paths === null ? '' : paths).split(', ');
+  return list.map((s) => String(s).trim()).filter(Boolean);
+}
+
+// "Path-relevant" (KNOWLEDGE.md 3.3): the entry's paths share a repo-relative
+// prefix with a file on one of THIS member's live claims. Compared at a
+// segment boundary in both directions so a claimed directory covers a file
+// under it and vice versa - the same shape as the path gate's own rule
+// [C hooks/common.js pathMatches].
+function learnedSharesPrefix(a, b) {
+  const x = String(a).replace(/\\/g, '/').toLowerCase();
+  const y = String(b).replace(/\\/g, '/').toLowerCase();
+  if (!x || !y) return false;
+  return x === y || x.startsWith(y + '/') || y.startsWith(x + '/');
+}
+
+// Order: path-relevant first, then newest first. The floor is newest-first and
+// it is the common case on day one - SessionStart is async, so on a cold
+// startup there is usually no claim to rank against and restart-recovery may
+// not have re-adopted one yet (KNOWLEDGE.md 3.3, stated rather than dressed up).
+function rankLearned(entries, claimFiles) {
+  const files = (claimFiles || []).map((f) => String(f)).filter(Boolean);
+  const scored = (entries || []).filter((e) => e && typeof e === 'object').map((e, i) => {
+    const tokens = learnedPathTokens(e.paths);
+    const relevant = files.length > 0 && tokens.some((t) => files.some((f) => learnedSharesPrefix(t, f)));
+    return { e, i, relevant, at: Number.isFinite(Number(e.at)) ? Number(e.at) : null };
+  });
+  scored.sort((a, b) => {
+    if (a.relevant !== b.relevant) return a.relevant ? -1 : 1;
+    // A record whose header stamp did not parse sorts last rather than first:
+    // it is the one entry we cannot date, and an undated entry is the weakest
+    // claim on the three slots there are.
+    if ((a.at === null) !== (b.at === null)) return a.at === null ? 1 : -1;
+    if (a.at !== b.at) return b.at - a.at;
+    return a.i - b.i;                       // stable
+  });
+  return scored.map((s) => s.e);
+}
+
+// Every entry renders its date and its author (KNOWLEDGE.md 3.3). `at` is
+// epoch ms and is null when the record's header timestamp did not parse; we
+// say `undated` rather than reconstructing a date from the raw stamp, because
+// the raw stamp is peer-authored text and a fabricated date is worse than an
+// admitted gap.
+function learnedDate(entry) {
+  const at = Number(entry.at);
+  if (!Number.isFinite(at) || at <= 0) return 'undated';
+  try { return new Date(at).toISOString().slice(0, 10); } catch (_) { return 'undated'; }
+}
+
+function learnedAttribution(entry, now) {
+  const parts = [escapeSlot(entry.member, LEARNED_MEMBER_CAP, 'member_name') || 'peer', learnedDate(entry)];
+  const first = learnedPathTokens(entry.paths)[0];
+  if (first) parts.push(escapeSlot(first, LEARNED_PATH_CAP, 'path'));
+  let line = parts.join(' · ');
+  const at = Number(entry.at);
+  // Nothing expires and nothing is deleted (KNOWLEDGE.md 5.4); past 60 days the
+  // entry is LABELLED so the model treats it as a lead to verify.
+  if (Number.isFinite(at) && at > 0 && now - at > LEARNED_AGED_MS) line += ' (aged)';
+  return line;
+}
+
+function learnedEntry(entry, now) {
+  const text = escapeSlot(entry.text, LEARNED_TEXT_CAP, 'text');
+  return [learnedAttribution(entry, now), LEARNED_INDENT + '"' + text + '"'];
+}
+
+function assembleLearned(ws, entries, more, now) {
+  const parts = [LEARNED_OPEN(ws, entries.length), LEARNED_HEADER];
+  for (const e of entries) for (const line of learnedEntry(e, now)) parts.push(line);
+  if (more > 0) parts.push('+' + more + LEARNED_OVERFLOW);
+  parts.push(FRAMING, LEARNED_CLOSE);
+  return parts.join('\n');
+}
+
+// view: { ws, entries: [{ member, at, text, paths }], claimFiles: [rel path] }
+// Returns '' when there is nothing to show. The caller MUST treat '' as "print
+// nothing and consume nothing": the once-per-session latch burns on a printed
+// block, never on a check (KNOWLEDGE.md 3.2).
+function renderLearned(view, opts) {
+  const v = view || {};
+  const o = opts || {};
+  const now = Number.isInteger(o.now) ? o.now : Date.now();
+  const budget = Number(o.budget) || LEARNED_BUDGET;
+  const cap = Number.isInteger(o.cap) && o.cap > 0 ? o.cap : LEARNED_CAP;
+  const entries = (v.entries || []).filter((e) => e && typeof e === 'object' && String(e.text || '').trim());
+  if (!entries.length) return '';
+  const ws = escapeSlot(v.ws || '', WS_NAME_CAP, 'name') || 'workspace';
+  const ranked = rankLearned(entries, v.claimFiles);
+
+  // The 2,000-char cap is derived, not picked (KNOWLEDGE.md 7), and at the
+  // 9.2 cap of 3 entries it cannot bite - three maximal entries plus the frame
+  // is ~1,130. It is enforced anyway, because a cap that is only asserted is
+  // not a cap, and trimming goes into `+N more`, never into silence.
+  let shown = Math.min(cap, ranked.length);
+  let block = '';
+  for (; shown >= 1; shown--) {
+    block = assembleLearned(ws, ranked.slice(0, shown), ranked.length - shown, now);
+    if (charLen(block) <= budget) return block;
+  }
+  return block;                    // the framing is never trimmed: this is the floor
+}
+
 module.exports = {
   render, renderWithPlan, assemble, plans, escapeSlot, charLen, ageMinutes, timeLeft,
   rosterEntry, claimEntry, digestItem,
   BUDGET, INJECT_CAP, ROSTER_CAP, CLAIMS_CAP, WS_NAME_CAP, FRAMING, OVERFLOW, COND, INDENT,
   MARKERS, BLOCK_OPEN, BLOCK_CLOSE,
+  renderLearned, rankLearned,
+  LEARNED_BUDGET, LEARNED_CAP, LEARNED_TEXT_CAP, LEARNED_MEMBER_CAP, LEARNED_PATH_CAP,
+  LEARNED_AGED_MS, LEARNED_HEADER, LEARNED_OPEN, LEARNED_CLOSE, LEARNED_OVERFLOW,
 };

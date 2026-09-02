@@ -255,7 +255,14 @@ function enforceRepoGuard(ctx, opts) {
 // by design: a missing repo layer, an unjoined workspace or a filter refusal
 // must never turn a successful claim into a failed command - the live layer
 // already carried it.
-function writeShard(ctx, kind, fields) {
+// `opts.latch === false`: the caller's ONLY output is this write (nothing rides
+// the live layer), so a filter refusal is reported and the command fails, but
+// it must not latch section 10.2's posting_stopped - that latch exists so a
+// session does not keep spawning the CLI to be refused on the WIRE, and a verb
+// that never posts has no wire to stop. `learn` is that caller; claim/done/
+// parting keep the default because their live post fails the same filter.
+function writeShard(ctx, kind, fields, opts) {
+  const o = opts || {};
   const detected = repoRoot();
   if (!detected || !repoLayerPresent(detected.root)) return null;
   const self = ctx.cfg.member;
@@ -265,7 +272,13 @@ function writeShard(ctx, kind, fields) {
       filterOpts: ctx.filterOpts, email: ctx.cfg.git_email || null,
     });
   } catch (e) {
-    if (e instanceof FilterViolation) { reportFailure(ctx, e, 'task shard write'); return null; }
+    if (e instanceof FilterViolation) {
+      if (o.latch === false) {
+        err('handshake: shard write blocked by the secret filter (' + e.findings.map((f) => f.id).join(', ') + '); nothing was written');
+        return null;
+      }
+      reportFailure(ctx, e, 'task shard write'); return null;
+    }
     err('handshake: task shard not written (' + (e && e.message) + ')');
     return null;
   }
@@ -2403,12 +2416,95 @@ async function cmdScrub(args) {
   out('  state; `handshake init` would mint a NEW one instead.');
 }
 
+// ================================================================= learn ====
+
+// The write half of the knowledge layer (docs/KNOWLEDGE.md K0). One durable,
+// dated, attributed, path-tagged record about THIS codebase, appended to the
+// author's own shard.
+//
+// `learn` POSTS NOTHING, deliberately (KNOWLEDGE.md 5.1). `note.discovery` did
+// NOT gain a durable twin, because they are different speech acts: a note is
+// news - SKILL.md admits one only when a peer "would do something different
+// knowing it", now - while most learnings affect nobody today and everybody in
+// three weeks. A note is also a transport operation against ntfy's ~150/day
+// budget, and a learning has to cost zero of those or the layer is unusable on
+// the zero-setup rung. Something that is both news and a durable fact is two
+// commands, not one flag.
+async function cmdLearn(args) {
+  // section 7.2 rule 1 settles `note` for a child and says nothing about
+  // durable writes, so this refusal is argued on two other grounds
+  // (KNOWLEDGE.md 5.1). (a) A learning is written AGAINST a claim via
+  // --subject, and a child that MUST NOT claim has no business recording
+  // against one. (b) Attribution: the record lands in the PARENT member's
+  // shard under the parent's name, so a child appending its own conclusions
+  // there makes the one attribution control this layer has assert something
+  // false - the same reason appendShardRecord's owner-only throw exists
+  // [C lib/workspace-files.js:333-341]. A child that learned something says so
+  // to its parent, in its result; the parent's model decides.
+  if (refuseIfChild('learn')) return;
+  const text = args._.join(' ').trim() || (typeof args.flags.text === 'string' ? args.flags.text : '');
+  if (!text) {
+    err('usage: handshake learn "<text>" [--paths a,b] [--subject "<claim>"] [--yes]');
+    process.exitCode = 2; return;
+  }
+  const found = requireWs(args); if (!found) return;
+
+  // The `note.*` path shape (PROTOCOL 3.2): a comma list, first 8 kept, each
+  // element capped at 300 by the escaper on write.
+  const paths = typeof args.flags.paths === 'string'
+    ? args.flags.paths.split(',').map((s) => s.trim()).filter(Boolean).slice(0, 8)
+    : undefined;
+  const subj = typeof args.flags.subject === 'string' ? args.flags.subject.trim() : '';
+  const key = subj ? subject.subjectKey(subj) : undefined;
+
+  // No durable layer at all - `init --no-repo`, or not a git tree - and this
+  // verb refuses rather than shrugging (KNOWLEDGE.md 6.2). Stricter than the
+  // equivalent refusal elsewhere, and deliberately so: an offer with no durable
+  // layer at least rides the ntfy cache for ~12 h, while a learning rides
+  // nothing at all, because `learn` posts nothing.
+  const detected = repoRoot();
+  if (!detected || !repoLayerPresent(detected.root)) {
+    if (!args.flags.yes) {
+      err('no durable layer on this workspace: a learning here reaches nobody, ever.');
+      err('`learn` posts nothing to the transport, so there is no live copy either.');
+      err('Use `handshake note discovery` for the live path, or run init in a git tree.');
+      process.exitCode = 2; return;
+    }
+    out('learning not recorded: no durable layer on this workspace (--yes acknowledged).');
+    process.exitCode = 1; return;   // honest exit: nothing was written, whatever the flag said
+  }
+
+  const ctx = openWorkspace(found.ws, args);
+  const shard = writeShard(ctx, 'learned', {
+    id: wsFiles.newLearningId(),
+    text,
+    paths,
+    subject: subj || undefined,
+    subject_key: key,
+  }, { latch: false });
+  // Best-effort is the rule for `claim`/`done` because the LIVE layer already
+  // carried those. Here the shard write is the whole command: if the secret
+  // filter refused it (reported already, and nothing is on disk - the gate runs
+  // before the write) there is no other copy anywhere, so the command failed.
+  if (!shard) { out('learning NOT recorded - nothing was written.'); process.exitCode = 1; return; }
+
+  // KNOWLEDGE.md 6.2, and it is the whole mitigation for the commit gap, so it
+  // is printed rather than implied. The condition the design states - that
+  // `.handshake/tasks/` has uncommitted changes - is satisfied by construction
+  // and needs no `git` subprocess to check: writeShard just appended a new
+  // timestamped record and this tool never commits anything itself (PLAN.md 6).
+  // Not a nag, not a prompt to commit, and emphatically not a commit.
+  const rel = path.relative(process.cwd(), shard.file).split(path.sep).join('/');
+  out('learning recorded in ' + rel + " - it reaches your peers' repos on your next commit.");
+  out('Until then it lives only on this disk: `learn` posts nothing to the transport.');
+}
+
 // ================================================================== main ====
 
 const COMMANDS = {
   init: cmdInit, invite: cmdInvite, join: cmdJoin,
   claim: cmdClaim, release: cmdRelease, done: cmdDone, change: cmdChange,
-  post: cmdPost, note: cmdNote, warn: cmdWarn, presence: cmdPresence,
+  post: cmdPost, note: cmdNote, warn: cmdWarn, presence: cmdPresence, learn: cmdLearn,
   sync: cmdSync, cursor: cmdCursor, status: cmdStatus, tasks: cmdTasks, guard: cmdGuard,
   rotate: cmdRotate, leave: cmdLeave, doctor: cmdDoctor,
   mute: cmdMute, unmute: cmdUnmute, rest: cmdRest,
@@ -2426,6 +2522,7 @@ const USAGE = [
   '  release   "<subject>" [--reason done|superseded|tiebreak_loss|manual|expired]',
   '  done      "<subject>" [--summary "..."] [--files a,b]',
   '  note      discovery|error|fix|blocker|info "<text>" [--paths a,b] [--subject "..."]',
+  '  learn     "<text>" [--paths a,b] [--subject "<claim>"] [--yes]   record one durable learning; posts nothing',
   '  warn      overlap --subject "..." --peer <member> --peer-subject "..."',
   '  presence  working|waiting|blocked|tooling_broken [--note "..."] [--branch <b>] [--agents <n>] [--reason <why>: tooling_broken only]',
   '  post      <note.*|warn.overlap|task.change> --text "..." [--paths a,b]',

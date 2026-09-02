@@ -222,6 +222,7 @@ carrying your live claims across. Full details and the free-tier limits:
 | `release` | Give up a claim | no |
 | `done` | Finish and record a claim | no |
 | `post <type>` | Send a note, overlap warning, or task-change alert. Flags differ by type: `note.*` needs `--text` (optional `--paths`, the only type that takes it); `warn.overlap` needs `--subject`, `--peer`, `--peer-subject` and is refused below a 50 % subject overlap; `task.change` needs `--subject` plus `--change files\|ttl\|tiebreak_loss\|scope` | no |
+| `learn` | Record one durable learning — a dated, attributed, path-tagged fact about *this* codebase — into your own task shard. Posts nothing to the transport, so it reaches peers on your next ordinary commit; refused without `--yes` where there is no durable layer, because there it would reach nobody, ever | no |
 | `mute` | Stop peer chatter from reaching your context (local only — your own claims/notes still go out) | no |
 | `unmute` | Alias for `mute off` (local only) | no |
 | `rest` | Sign off for this session; stop broadcasting | no |

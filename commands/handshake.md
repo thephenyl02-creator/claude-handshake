@@ -73,8 +73,9 @@ a path, and never fall back to `bin/handshake.js` relative to the project.
 | `guard` | `node "$CLAUDE_PLUGIN_ROOT/bin/handshake.js" guard [--refresh] [--json] [--ack-rotated]` | no — read-only; `--ack-rotated` records a local acknowledgment only, see below |
 | `post` | `node "$CLAUDE_PLUGIN_ROOT/bin/handshake.js" post <note.discovery\|note.error\|note.fix\|note.blocker\|note.info\|warn.overlap\|task.change> <flags>` — **the flags differ per type, see below**; `--paths` is `note.*`-only, and `--text` is required there but optional on `task.change` | no |
 | `note` | `node "$CLAUDE_PLUGIN_ROOT/bin/handshake.js" note discovery\|error\|fix\|blocker\|info "<text>" [--paths a,b] [--subject "<claim>"]` | no — same class as `post` |
+| `learn` | `node "$CLAUDE_PLUGIN_ROOT/bin/handshake.js" learn "<text>" [--paths a,b] [--subject "<claim>"] [--yes]` | no — same class as `claim`/`done`: it appends one record to the member's **own** shard in the repo layer and posts nothing. It never commits, so it reaches peers on the human's next commit; `--yes` is needed only where there is no durable layer at all, and there it records nothing |
 | `warn` | `node "$CLAUDE_PLUGIN_ROOT/bin/handshake.js" warn overlap --subject "<…>" --peer <member> --peer-subject "<…>"` | no — same class as `post` |
-| `presence` | `node "$CLAUDE_PLUGIN_ROOT/bin/handshake.js" presence working\|waiting\|blocked\|tooling_broken [--note "<…>"] [--branch <b>] [--agents <n>]` — plus `[--reason <why>]`, which is read on `tooling_broken` **only** and ignored on the other three states `[C bin/handshake.js:1771-1774]` | no — same class as `claim` |
+| `presence` | `node "$CLAUDE_PLUGIN_ROOT/bin/handshake.js" presence working\|waiting\|blocked\|tooling_broken [--note "<…>"] [--branch <b>] [--agents <n>]` — plus `[--reason <why>]`, which is read on `tooling_broken` **only** and ignored on the other three states `[C bin/handshake.js:1784-1787]` | no — same class as `claim` |
 | `doctor` | `node "$CLAUDE_PLUGIN_ROOT/bin/handshake.js" doctor` | no — read-only |
 | `deploy-relay` | `node "$CLAUDE_PLUGIN_ROOT/bin/handshake.js" deploy-relay` | **yes** — deploys a Worker to their Cloudflare account |
 | `upgrade` | `node "$CLAUDE_PLUGIN_ROOT/bin/handshake.js" upgrade` | **yes** |
@@ -85,7 +86,7 @@ Also routed: `rotate` → `node "$CLAUDE_PLUGIN_ROOT/bin/handshake.js" rotate [-
 on your own initiative. The flag is `--grace`, taking 0..86400 seconds; a
 hostile departure is `rotate --grace 0` (SECURITY §7.1 step 3 - §7.2 is the
 ntfy runbook, where rotate does not exist). Anything outside that range, or a
-non-integer, is a usage error and exits 2 `[C bin/handshake.js:1317-1319]`; an
+non-integer, is a usage error and exits 2 `[C bin/handshake.js:1330-1332]`; an
 unrecognized *spelling* is a different matter — parseArgs stores it under a key
 `rotate` never reads `[C bin/handshake.js:42-56]`, so it is ignored silently
 and the relay's 86400 s default applies.
@@ -222,36 +223,36 @@ offer `init` as the way back, because `init` mints a *new* workspace.
   authorship check that backs the warning is **per shard, not a membership
   lookup**: each `.handshake/tasks/<member>.md` has its last commit's author
   email compared against the email recorded for *that member*, and only a
-  mismatch raises the warning `[C lib/workspace-files.js:412-443]`. So what it
+  mismatch raises the warning `[C lib/workspace-files.js:442-473]`. So what it
   actually catches is someone else's commit on a member's own shard — a
   perfectly well-known workspace member included. Three outcomes, not two:
   a mismatch is the loud `non_member_commit` warning; **`unverified` covers
   two different unknowns** — no recorded email for that member, and a shard
   whose last commit could not be read at all (no git, not a repo, no commits
-  yet on that path) `[C lib/workspace-files.js:424,428]` — printed as a note
+  yet on that path) `[C lib/workspace-files.js:454,458]` — printed as a note
   saying authorship is unknown, which is not the same as clean
-  `[C lib/workspace-files.js:529-531]`;
+  `[C lib/workspace-files.js:559-561]`;
   and a shard with no commit yet is `uncommitted` and raises neither. A shard's
   own self-declared header email is never accepted as proof, and emails are
   recorded only for the **local** member, and only from that machine's own
   `git config user.email` `[C lib/repo.js:358-365]` — at `join`
-  `[C bin/handshake.js:681-686]`, and, because the founder never joins, at
-  `init` `[C bin/handshake.js:502-512]` and `deploy-relay`
-  `[C bin/handshake.js:1992-1998]` too. A peer's email is never learned
+  `[C bin/handshake.js:694-699]`, and, because the founder never joins, at
+  `init` `[C bin/handshake.js:515-525]` and `deploy-relay`
+  `[C bin/handshake.js:2005-2011]` too. A peer's email is never learned
   remotely, so on a fresh machine a peer's shard normally lands in
   `unverified`.
 - `guard` reports the fail-closed private-repo verdict (SECURITY §6) —
   read-only. `guard` always re-probes - the 600 s cache is what `sync` and
   `status` read, not this verb - so `--refresh` is accepted for symmetry and
-  changes nothing `[C bin/handshake.js:1111-1114]` (the force flag already
+  changes nothing `[C bin/handshake.js:1124-1127]` (the force flag already
   defaults to true; the 600 s TTL is `[C lib/repo.js:25]`);
   `--ack-rotated` records a **local-only acknowledgment** that a leaked secret
   has been rotated — it does not touch git history, and a credential
   committed in the past stays in every clone, fork and archive of that
   commit regardless.
 - `post` sends one of seven types, and **they do not share a flag set**
-  `[C bin/handshake.js:890-960]`. An unknown type is a usage error, exit 2
-  `[C bin/handshake.js:894-897]`:
+  `[C bin/handshake.js:903-973]`. An unknown type is a usage error, exit 2
+  `[C bin/handshake.js:907-910]`:
   - `note.discovery|note.error|note.fix|note.blocker|note.info` — `--text` is
     **required** (kept to 800 chars). Optional `--paths a,b` (comma list,
     first 8 kept) and `--subject`. **`--paths` exists on this branch only**;
@@ -262,7 +263,7 @@ offer `init` as the way back, because `init` mints a *new* workspace.
     still accepted so the older command form keeps working, but it is ignored,
     so a claimed number can neither relabel the emission nor carry it past the
     floor. A computed value under the 50 % floor **refuses the post** rather
-    than sending it `[C bin/handshake.js:928-934]` (PROTOCOL §5.2) — a refusal
+    than sending it `[C bin/handshake.js:941-947]` (PROTOCOL §5.2) — a refusal
     that prints its reason and still exits 0, so read the line rather than the
     exit code. What the model still decides is whether the work genuinely
     overlaps, i.e. whether to run this at all.
@@ -272,7 +273,7 @@ offer `init` as the way back, because `init` mints a *new* workspace.
     280-char note, not as the body.
 
   On the types that use text, a bare `post <type> some words` works too: the
-  positional remainder stands in for `--text` `[C bin/handshake.js:898]` —
+  positional remainder stands in for `--text` `[C bin/handshake.js:911]` —
   but only as a *fallback*, so an explicit `--text` wins over it here. `note`
   resolves the same pair the other way round; see below.
 
@@ -282,41 +283,41 @@ offer `init` as the way back, because `init` mints a *new* workspace.
 
 ## `note`, `warn`, `presence`, `change`, `leave`
 
-These five are routed exactly like the rest `[C bin/handshake.js:2408-2416]` and
-documented in the CLI's own usage `[C bin/handshake.js:2425-2438]`, so a request
+These five are routed exactly like the rest `[C bin/handshake.js:2504-2512]` and
+documented in the CLI's own usage `[C bin/handshake.js:2522-2535]`, so a request
 for one of them is a request to run it, not an unknown verb.
 
 - `note <kind> "<text>"` **is** `post note.<kind>` under another name — it hands
   straight to `cmdPost`, so the 800-char cap, `--paths` (first 8) and
-  `--subject` behave identically `[C bin/handshake.js:1667-1676]`. Two
+  `--subject` behave identically `[C bin/handshake.js:1680-1689]`. Two
   differences worth knowing: the kind is positional and must be one of
   `discovery|error|fix|blocker|info` — anything else is a usage error, exit 2
-  `[C bin/handshake.js:1668-1673]` — and here the **positional text wins over
-  `--text`**, the reverse of `post` `[C bin/handshake.js:1677]`.
+  `[C bin/handshake.js:1681-1686]` — and here the **positional text wins over
+  `--text`**, the reverse of `post` `[C bin/handshake.js:1690]`.
 - `warn overlap` is `post warn.overlap` under another name, with the same
   required trio and the same rule that the `jaccard` on the wire is always
-  computed, never asserted `[C bin/handshake.js:1681-1687]`. A first word other
-  than `overlap` is a usage error, exit 2 `[C bin/handshake.js:1682-1685]`. The
+  computed, never asserted `[C bin/handshake.js:1694-1700]`. A first word other
+  than `overlap` is a usage error, exit 2 `[C bin/handshake.js:1695-1698]`. The
   sub-50 % refusal above applies unchanged, so read the printed line rather
   than the exit code.
 - `presence <state>` says what this session is doing. On the relay it is a
   heartbeat call, not an envelope; on ntfy it is a `presence.update` envelope
   carrying the **full active claim set**, truncated if it will not fit the body
   cap — the output says so when it truncates
-  `[C bin/handshake.js:1773-1795]`. `tooling_broken` alone reads an extra
+  `[C bin/handshake.js:1786-1808]`. `tooling_broken` alone reads an extra
   `--reason` (120 chars, `unspecified` if omitted)
-  `[C bin/handshake.js:1771-1774]`.
+  `[C bin/handshake.js:1784-1787]`.
 - `change` is not a note *about* a claim, it is a **claim edit**, which is why
   it is not the same risk as `note`. Unlike `post task.change`, `--change` has
   no default here: omit it, or pass anything outside
   `files|ttl|tiebreak_loss|scope`, and it is a usage error, exit 2
-  `[C bin/handshake.js:1692-1696]`. `--files` is a **capped union, never a
+  `[C bin/handshake.js:1705-1709]`. `--files` is a **capped union, never a
   replace** (first 64), and on the relay it re-issues the claim with the added
-  paths `[C bin/handshake.js:1702-1714]` — so `change --files` *widens* what
+  paths `[C bin/handshake.js:1715-1727]` — so `change --files` *widens* what
   you are holding, and peers' overlap detection moves with it. `--change ttl`
   needs `--ttl <seconds>` beside it to say what the new TTL is — the same range
-  carries it `[C bin/handshake.js:1702-1714]`, though the CLI's own usage line
-  omits the flag `[C bin/handshake.js:2425-2438]` — and only `--files` re-issues
+  carries it `[C bin/handshake.js:1715-1727]`, though the CLI's own usage line
+  omits the flag `[C bin/handshake.js:2522-2535]` — and only `--files` re-issues
   the relay claim, so a ttl change is an announcement to peers, not an edit to
   the relay's stored claim. No confirmation
   (it is the same class as `claim`), but name the subject and what changed in
@@ -325,11 +326,11 @@ for one of them is a request to run it, not an unknown verb.
 - `leave` is the **sign-off**, which is why it is not the same risk as `note`
   either: it posts `ws.leave` with your open claim keys, writes a parting record
   into your task shard, and stores it in local state
-  `[C bin/handshake.js:1338-1366]`. `--reason` is `signoff|session_end|error`
+  `[C bin/handshake.js:1351-1379]`. `--reason` is `signoff|session_end|error`
   and defaults to `signoff`; anything else is a usage error, exit 2
-  `[C bin/handshake.js:1342-1345]`. It is not `mute` and not quite `rest`:
+  `[C bin/handshake.js:1355-1358]`. It is not `mute` and not quite `rest`:
   `rest` additionally disarms the heartbeat and stops posting for the session
-  `[C bin/handshake.js:1844-1850]`, which `leave` does not. Either way the open
+  `[C bin/handshake.js:1857-1863]`, which `leave` does not. Either way the open
   claims are **left to expire on their TTL**, not released — say which ones,
   the same as for `rest`.
 

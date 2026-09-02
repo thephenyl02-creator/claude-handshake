@@ -11,7 +11,7 @@
     "handshake": "bin/handshake.js"
   },
   "scripts": {
-    "test": "node --test test/filter.test.js test/envelope.test.js test/subject.test.js test/state.test.js test/invite.test.js test/transport.test.js test/session.test.js test/escape.test.js test/repo.test.js test/workspace-files.test.js test/no-direct-send.test.js test/cli.test.js test/cli-invocation.test.js test/command-doc-verbs.test.js test/deploy-create-token-left-behind.test.js test/overlap-floor.test.js test/overlap-note-path.test.js test/doctor-classifier.test.js test/doctor-plugin-check.test.js test/hooks.test.js test/stop-hook.test.js test/heartbeat.test.js test/deploy.test.js test/seams.test.js test/scrub.test.js test/audit-loose-ends.test.js test/version.test.js test/build-plugin-zip.test.js",
+    "test": "node --test test/filter.test.js test/envelope.test.js test/subject.test.js test/state.test.js test/invite.test.js test/transport.test.js test/session.test.js test/escape.test.js test/repo.test.js test/workspace-files.test.js test/no-direct-send.test.js test/cli.test.js test/cli-invocation.test.js test/command-doc-verbs.test.js test/deploy-create-token-left-behind.test.js test/overlap-floor.test.js test/overlap-note-path.test.js test/doctor-classifier.test.js test/doctor-plugin-check.test.js test/hooks.test.js test/stop-hook.test.js test/heartbeat.test.js test/deploy.test.js test/seams.test.js test/learned.test.js test/shard-scan.test.js test/knowledge-inject.test.js test/scrub.test.js test/audit-loose-ends.test.js test/version.test.js test/build-plugin-zip.test.js",
     "test:e2e": "node e2e/run.js"
   },
   "license": "MIT",

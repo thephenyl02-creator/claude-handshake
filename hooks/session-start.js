@@ -6,10 +6,12 @@
 // touch the network, so it carries everything that needs a transport:
 //
 //   1. write the `pending` sync marker (UserPromptSubmit waits <= 500 ms on it)
-//   2. run one bounded sync and write the digest cache
-//   3. restart-recovery reconcile - re-adopt this member's own still-live
+//   2. scan the durable layer's shards into the knowledge cache - local disk
+//      only, BEFORE the network (KNOWLEDGE.md 3.2)
+//   3. run one bounded sync and write the digest cache
+//   4. restart-recovery reconcile - re-adopt this member's own still-live
 //      claims, preserving acquired_at (section 5.3 / 5.4)
-//   4. clear the marker, push any watermark the injector advanced locally
+//   5. clear the marker, push any watermark the injector advanced locally
 //
 // It branches on the payload `source`. A child session does none of it:
 // section 7.2 rule 2 - "a child performs no network I/O for handshake
@@ -17,6 +19,7 @@
 
 const C = require('./common');
 const S = require('./sync');
+const K = require('../lib/shard-scan');
 
 C.armSafety(9500);
 
@@ -57,6 +60,25 @@ async function run(f) {
   }
 
   C.touch(pending, JSON.stringify({ source: f.source || null, at: Date.now() }) + '\n');
+
+  // KNOWLEDGE.md 3.2, and the ordering is the whole argument: the shard scan
+  // runs BEFORE the network sync, not after. It is local disk I/O, it makes no
+  // network call and nothing in it depends on the sync's result - so placed
+  // after S.refresh it would sit behind that 7 000 ms timeout while the
+  // injector waits at most PENDING_WAIT_MS = 500 [C hooks/common.js:58] and
+  // then renders. On a fresh pull (no knowledge.json yet) the first prompt
+  // would render before the scan finished, which is precisely the acceptance
+  // run this feature exists for (KNOWLEDGE.md 10.1 step 5). Placed here it runs
+  // inside the window the injector already waits on.
+  //
+  // It goes AFTER the marker rather than before it so a first prompt arriving
+  // mid-scan is told `sync pending` [C hooks/render.js:67] rather than shown an
+  // empty block. It never throws, so the sync below is unaffected either way,
+  // and it is on this branch only: `clear`/`compact` are context operations
+  // inside a session that has already scanned, and a child never gets here at
+  // all (rule 7.2, the early return above).
+  K.scanToCache(state, found.root, { sessionId: f.sessionId, kinds: K.SESSION_START_KINDS });
+
   try {
     const res = await S.refresh(state, found, { transport, limit: 20, timeoutMs: 7000 });
     if (res.ok) S.reconcileOwnClaims(state, res.parsed, cfg, Date.now());
