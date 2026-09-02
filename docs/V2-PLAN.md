@@ -1559,14 +1559,17 @@ or `task.done` *"and on nothing else"*, hardened by §14 item 24. That is a
 deadlock in the commonest abandonment there is: a closed laptop emits neither
 event, the claim merely expires by TTL, and a sequenced Claude waits forever with
 nothing told to anyone — which defeats §5.4's own criterion, *nobody leaves,
-nobody idles, no human is asked*. **So the third trigger is the base claim going
-stale**: the reader-derived staleness rule `[P§4.3]` and claim expiry `[P§5.3]`,
-both of which every client already computes from data it already holds
-`[C hooks/common.js:566-568]`. No wire change, no new state, and it closes the
-deadlock. The rule is therefore: *a sequenced task re-evaluates on the peer's
-`task.release` or `task.done` for that `subject_key`, **or** on the base claim
-expiring or going stale, and on nothing else* — in particular never on a peer
-note saying the work is finished (§10.5).
+nobody idles, no human is asked*. **So the third trigger is the base claim expiring** — the claim's own TTL
+`[P§5.3]`, which every client already computes from data it already holds
+`[C hooks/common.js:566-568]`, or equivalently the peer's presence reaching
+`gone`, whose threshold **is** the default claim TTL `[P§4.3]`. **Never
+`stale`**: on the relay a peer is `stale` after 360 s of silence `[P§4.3]`, and a
+trigger at that age would let a coffee break hand a live task to the other
+Claude. No wire change, no new state, and it closes the deadlock. The rule is
+therefore: *a sequenced task re-evaluates on the peer's `task.release` or
+`task.done` for that `subject_key`, **or** on the base claim expiring (presence
+`gone`), and on nothing else* — in particular never on a peer note saying the
+work is finished (§10.5), and never on `quiet` or `stale`.
 
 **But "resume when this arrives" is new local behaviour, introduced here, and no
 existing rule has its shape.** It is worth saying plainly because the nearest
@@ -1615,7 +1618,7 @@ else. So the discriminator is stated here, once, and §6 and §12.3 point at it:
 | (a) same task | `task.claim` with a colliding `subject_key` | existing | no |
 | (b) same file, different symbols | PreToolUse path match + `symbols` disjoint | **V-D2**, on `task.change{scope}` where the relay decides carriage (§2.3) | one OPTIONAL field |
 | (c) stack | the sha `git ls-remote` returns for the peer's declared `branch` changed since the last read | the existing `presence.update.branch` `[C docs/PROTOCOL.md:295]`, plus a **local** read | **no** — V-D1 withdrawn (§2.3) |
-| (c) sequence → resume | `task.release` / `task.done`, **or the base claim expiring / going stale** `[P§4.3]` `[P§5.3]` | existing `[C lib/envelope.js:41-45]`; staleness is reader-derived and travels not at all | **no** |
+| (c) sequence → resume | `task.release` / `task.done`, **or the base claim expiring (presence `gone`, never `stale`)** `[P§5.3]` `[P§4.3]` | existing `[C lib/envelope.js:41-45]`; staleness is reader-derived and travels not at all | **no** |
 | contradiction (§6) | **the model, reading the fetched diff, judges that two requirements cannot both hold — and then posts `task.seam{propose, contested: true}` into a seam.** Detection is a reading; the round opens on the structured act and on nothing else (§5.4's discriminator, §6.2). **[proposed — §14 item 42]**, since detection-by-reading relaxes decision 2 | `task.seam` + **V-D3** | dependent on `[COBUILD §11 E1-E3]` |
 
 ---
@@ -3362,7 +3365,7 @@ never finish anything.
 **What the plan builds:** the instability counter of §5.4 — after **[proposed: 3]**
 head moves since the last successful rebase, the client stops rebasing and
 sequences instead, resuming on `task.release` / `task.done` **or on the base
-claim going stale** (§5.4). **The probe is `merge-tree --write-tree`, which is
+claim expiring** (§5.4; presence `gone`, never `stale`). **The probe is `merge-tree --write-tree`, which is
 non-mutating by construction, so a dirty result costs nothing and leaves the
 local branch, the index and the working tree untouched — and the first draft's
 `rebase --dry-run` does not exist**, so the safety claim rested on
@@ -3820,7 +3823,7 @@ way three sections earlier.
 | 21 | **Zero new event types** — **re-argued at the revision**, because the first draft's supporting argument (an OPTIONAL field degrades better on a v1.0 peer) is sound on ntfy and worth nothing on a type the relay projects through fixed columns. Re-tested, the conclusion survives and the route to it changed | §2.3 | as written, now **two** OPTIONAL fields on envelope-carried types, `[P§3]`'s closed-catalog `[F]` line untouched — and the alternative (one new `task.branch` type, which the relay would carry for free `[C docs/PROTOCOL.md:230-233]`) rejected because it would be the **third** amendment to that line in one wave |
 | 22 | Notice priority — **rewritten at the revision**: the channel already has three producers the first draft's four-kind order did not know about `[C hooks/common.js:594-614,668-673]` | §2.4, §10.3 | a **total order over seven kinds**, safety first — rotation demand → private-repo guard → push refused → escalated → conflict → rebase needed → round open — implemented as a **sort by rank** replacing the bare `.slice(0, 2)` `[C hooks/render.js:187]` |
 | 23 | **Decision 4's `branch CI passing` fact is unavailable** (§4.2 item 4 skips CI on `handshake/*`); replaced by the **`merge-tree` probe + successive `ls-remote` reads** | §5.4, §12.5 | as written — **plus an optional item: an opt-in lightweight per-branch job** (one runner, one OS, unit suite only), *not built here*, decided after V2 measures CI cost |
-| 24 | **Resume-on-event is new local behaviour**, not a reuse of any existing rule — **rewritten at the revision**: "and on nothing else" deadlocked the commonest abandonment there is, a closed laptop, which emits neither event | §5.4 | a sequenced task re-evaluates on the peer's `task.release` / `task.done` for that `subject_key`, **or on the base claim expiring or going stale** `[P§4.3]` `[P§5.3]`, and on nothing else — in particular never on a peer note |
+| 24 | **Resume-on-event is new local behaviour**, not a reuse of any existing rule — **rewritten at the revision**: "and on nothing else" deadlocked the commonest abandonment there is, a closed laptop, which emits neither event | §5.4 | a sequenced task re-evaluates on the peer's `task.release` / `task.done` for that `subject_key`, **or on the base claim expiring — presence `gone`, never `stale`** `[P§5.3]` `[P§4.3]`, and on nothing else — in particular never on a peer note |
 | 25 | **Decision 5's four-part trigger is reduced**: symbol and contested-marking travel; values and diffs are derived locally | §6.2 | symbol rides `[COBUILD §7.1]`'s existing immutable `name`; no fourth field |
 | 26 | **Amending `[PLAN§6]`'s acceptance criterion** rather than retiring it | §4.3, §13.1 | *"no coordination-only commits **on a branch a human works on**"* |
 | 27 | Cut trigger — contradiction frequency too low to justify V6 | §12.6 | < 1 per pair per week at V2/V5 |
@@ -3916,6 +3919,12 @@ not match; §14 item 12, restated so the instability counter the owner ratifies
 counts a conflicting real rebase as well as a head move, as §5.4 mechanism 2
 builds it; and the PR-open push suspension (item 44), moved from V1 — which ships
 no work branch — to V4, with its Delivers line, its Touches entry and its test.
+
+**One more, from the friction walk that followed:** the third resume trigger
+said *expiring or going stale*, and `stale` is 360 s of silence on the relay
+`[P§4.3]` — a coffee break would have handed a live task to the peer's Claude.
+It now reads *expiring (presence `gone`, never `stale`)* in §5.4, §5.5, §12.3,
+§14 item 24 and the M28 row.
 **Three blockers.** The peer-diff refuse-list was a **denylist** on the one
 surface §4.3 argues for an allowlist, and omitted most of the surface it claimed
 (S2-2 → §4.2 item 5, item 36). The work-branch commit had **no stated base tree
@@ -3978,7 +3987,7 @@ and F2-10's object-accumulation and unrelated-histories halves are refuted by
 | **M25** | Credentials, signing and forge rejection addressed: the push reuses the human's git credentials, is never given its own, and **fails rather than prompts** (`GIT_TERMINAL_PROMPT=0` is already set); the V1 preflight proves it with `git push --dry-run`; `commit.gpgsign` is checked and either overridden per-commit or the opt-in refuses; a **`rejected`** arm distinct from offline, because the `push refused` notice literal already means the secret-scan refusal | §10.1 |
 | **M26** | §11's preamble states per-leg expected results and §11.3/§11.4 carry them: relay is zero human turns, ntfy is one `handshake seam pull` confirmation per inbound revision per receiving side. §6.4 states the same in prose. §12.7 gains the bullet: **autonomous contradiction resolution is a relay-tier capability**. **Fix round 1:** the preamble's *"they differ in exactly one place"* was falsified by §11.6's own per-leg security result, so it now names **two** — the contradiction protocol, and `from` being server-authoritative on the relay and self-declared on ntfy (which is also why M20's branch check keys on a different id per leg). **Fix round 2:** a tally invites the next miscount, and §11.5 held a third per-leg result the count had missed — `· older chatter gone` `[C hooks/render.js:70]`, which renders on ntfy and nowhere else. The clause became a **scope** rather than a tally: two differences change a *pass criterion*, one changes only what renders. **Fix round 3 (R2-4):** that replacement went one phrase too far — it said the third changes *"only what renders **and no criterion**"*, and the line sits inside §11.5's **Asserted** paragraph, which is where this document's pass criteria live, so it **is** a per-leg criterion. The clause now says what is true of it: it changes only what is **rendered**, not what either leg must **achieve**. Three passes on one sentence is itself the lesson — the first two were corrected for over-claiming a count, and the third for over-claiming a kind | §6.4, §10.6 (tests), §11 preamble, §11.3, §11.4, §11.5, §11.6, §12.7 |
 | **M27** | Three re-anchorings. `branches-ignore` moved into **V1**. The secret-scan false-positive trigger moved to **V4** with counters in V4's Delivers, since V1's commits carry filtered shard text and not code diffs. The outcome-corpus cut trigger moved to a window **after V8**, since V8 creates the kind and the rule could otherwise only ever fire. §10.2 and §12.2 corrected to claim only what each rung can raise | §10.1, §10.2, §10.4, §12.2, §12.6, §14 items 4, 14, 16 |
-| **M28** | Four gaps closed. **Mutual stacking**: the lexicographically smaller member id never stacks, reusing the frozen comparator `[proposed]`. **Vanished peer**: base-claim expiry/staleness becomes a third resume trigger, so item 24 is release, done, **or** the base claim going stale. **Rewritten or deleted base**: one stack-invalidation rule covering the peer's own lease-protected rewrite, a human's rewrite and a deletion. **Nested stacks**: not permitted, stated | §4.1 (D1 rule 2), §5.4, §9, §10.5, §14 items 24, 33, 34 |
+| **M28** | Four gaps closed. **Mutual stacking**: the lexicographically smaller member id never stacks, reusing the frozen comparator `[proposed]`. **Vanished peer**: base-claim expiry (presence `gone`, never `stale`) becomes a third resume trigger, so item 24 is release, done, **or** the base claim expiring. **Rewritten or deleted base**: one stack-invalidation rule covering the peer's own lease-protected rewrite, a human's rewrite and a deletion. **Nested stacks**: not permitted, stated | §4.1 (D1 rule 2), §5.4, §9, §10.5, §14 items 24, 33, 34 |
 | **M36** | The card renders the symbol's **discriminating tail** (`Handler.shape`) through the existing 20-char slot, because `escapeSlot` ellipsises and the path is what survives otherwise; the **full `path::Symbol.member` prints on the PreToolUse gate line**, which has no 600-char budget. §11.1's assertion rewritten so it cannot pass vacuously, and a V3 test pins the entry's content | §2.4, §5.3, §7.1, §10.3, §11.1, §14 item 9 |
 | **M37** | A **total order over seven kinds** with safety first — rotation demand, private-repo guard, push refused, escalated, conflict, rebase needed, round open — replacing a four-kind order that did not know the channel already has three producers seeded ahead of it. The bare `.slice(0, 2)` becomes a **sort by rank**. §2.4's "four kinds into two slots" corrected to seven. Test: a rotation demand plus two coordination notices still renders the rotation demand | §2.4, §10.3, §14 item 22 |
 | **M40** | A **`SKILL.md` row in §2.4** with the per-rung line-count delta, the per-engagement token total against the 410-line baseline, and a **480-line ceiling that gates every rung**. Progressive disclosure through the existing `references/` for the stack tree, the contradiction discipline and the capability semantics, leaving trigger conditions in `SKILL.md` proper. V3, V5 and V6 carry the split; V3's tests carry the gate | §2.4, §10.3, §10.5, §10.6, §14 item 37 |
