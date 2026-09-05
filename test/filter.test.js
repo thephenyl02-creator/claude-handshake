@@ -133,6 +133,76 @@ test('local-secret tripwire: exact and windowed', () => {
   clean('PORT is 3000 locally', opts);                            // short/benign value not tracked
 });
 
+test('the 12-char window is for credential material, not for the PROSE beside it', () => {
+  // A secret-bearing file carries sentences as well as secrets, and
+  // `readSecretValues` walks every string in a JSON file - this project's own
+  // `.handshake/secret.json` has a `warning` sentence beside the workspace
+  // secret. Sliding a 12-character window along an English sentence collides
+  // with ordinary English: measured on the shipped path, the needle
+  // "CREDENTIAL FILE. Workspace secret ... (SECURITY.md 3.1)." blocked the
+  // ordinary text "a non-member commit warning (SECURITY.md 5.4)." as a leak.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hsk-prose-'));
+  const SEC = 'hsk_' + 'z9y8x7w6v5u4t3s2r1q0';
+  fs.writeFileSync(path.join(dir, 'secret.json'), JSON.stringify({
+    warning: 'CREDENTIAL FILE. Workspace secret and transport credential. Holder set = ' +
+      'every reader of this repo, now and ever (SECURITY.md 3.1).',
+    passphrase: 'correct horse battery staple',
+    secret: SEC,
+  }));
+  const opts = { projectDir: dir };
+  // The false positive that made the commit scanner unusable, and that is live
+  // on the outbound path today.
+  clean('surfaced as a non-member commit warning (SECURITY.md 5.4).', opts);
+  clean('Holder set = every reviewer, I think', opts);
+  // Nothing about the exact match is weakened: a whitespace passphrase quoted
+  // whole is still a leak, and so is any part of a credential-shaped needle.
+  blocked('the passphrase is correct horse battery staple', opts);
+  blocked('token ' + SEC, opts);
+  blocked('it starts with hsk_z9y8x7w6 apparently', opts);        // 12-char window, no whitespace
+});
+
+test('the window survives WRAPPED credential material, and the PEM arm still owns service-account.json', () => {
+  // The prose guard above tests for whitespace, and whitespace is very nearly
+  // the right test for "this needle is a sentence" - but not quite. Wrapped
+  // base64 carries whitespace too, and it is the shape most likely to be leaked
+  // BY THE CHUNK, one line at a time. So the guard is SHAPE and not whitespace:
+  // every piece base64, every piece but the last at least 32 characters.
+  const dir = fs.mkdtempSync(path.join(fs.realpathSync.native(os.tmpdir()), 'hsk-wrapped-'));
+  const L = ['MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7VJTUt9Us8cKj',
+    'MRcwCXALYUcpZfEcbLwuKq2xKtjnvBYh0IUEZjPTfbBTiOgpjHFwYPZLoSFTvkFT',
+    'gWmcVKtdBCUxA1SXFqXhUgtHZ'];
+
+  // 1. A JSON value that is wrapped base64 and carries NO PEM armour, so the
+  //    armour arm of `readSecretValues` does not claim it and the JSON walk
+  //    hands the tripwire a needle with spaces in it. Measured before this fix:
+  //    a sixteen-character chunk of it sailed through.
+  const wrapped = path.join(dir, 'secrets.json');
+  fs.writeFileSync(wrapped, JSON.stringify({
+    note: 'Rotate this every ninety days, see the runbook (SECURITY.md 3.1).',
+    tls_key: L.join(' '),
+  }));
+  let opts = { secretFiles: [wrapped] };
+  blocked('half of it is ' + L[1].slice(10, 26), opts);
+  blocked('the whole thing is ' + L.join(' '), opts);
+  // ...and the prose in the same file is still exact-match-only.
+  clean('see the runbook (SECURITY.md 5.4).', opts);
+  clean('Rotate this every ninety days or so', opts);
+
+  // 2. THE CASE THE ARMOUR ARM ALREADY OWNS, pinned so nobody widens the window
+  //    to reach it a second time. A real `service-account.json` carries a
+  //    literal `-----BEGIN PRIVATE KEY-----` in its body, which sends the whole
+  //    file down the PEM arm - stripped of armour AND of whitespace - so the
+  //    needle never has whitespace in it at all and the window has always
+  //    worked here.
+  const sa = path.join(dir, 'service-account.json');
+  const key = '-----BEGIN PRIVATE KEY-----\n' + L.join('\n') + '\n-----END PRIVATE KEY-----\n';
+  fs.writeFileSync(sa, JSON.stringify({ type: 'service_account', private_key: key }));
+  opts = { secretFiles: [sa] };
+  assert.ok(filter._internals.readSecretValues([sa]).every((v) => !/\s/.test(v)),
+    'the PEM arm packs the whole body, so nothing it produces carries whitespace');
+  blocked('pasted the key ' + L[1].slice(10, 40) + ' by mistake', opts);
+});
+
 // ------------------------------------------------------- false positives ---
 test('plain prose', () => clean('refactored the onboarding flow, tests green'));
 test('short git sha', () => clean('fixed in commit a1b2c3d'));

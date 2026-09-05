@@ -108,6 +108,23 @@ async function run(f) {
   const child = C.isChild(state, f);
   if (child.child) return C.done();
 
+  // ---- V2-PLAN 10.1: the state-branch batch is git, not the transport -------
+  // Gates 4 and 5 below are about the LIVE layer: gate 4 is a transport
+  // credential that was refused, gate 5 is the transport's own keepalive
+  // cadence. Neither says anything about whether this machine may commit a
+  // shard to a git branch, and a `push:` line that went silent because ntfy
+  // returned 403 would be exactly the lie section 4.1 spends a paragraph
+  // forbidding. So the state batch is taken on EVERY path past the three gates
+  // above - a live monitor owns the clock (gate 1), `rest` stops it (gate 2),
+  // and a child never writes at all (gate 3) - and it carries its own ≤ 1/min
+  // clock, so taking it here as well as inside beat() cannot double-commit
+  // [C monitors/heartbeat.js STATE_BATCH_MS].
+  const stateDeadline = ARMED_AT + BUDGET_MS - MARGIN_MS;
+  const stateOnly = async () => {
+    try { await H.stateBatch(state, found, { deadline: stateDeadline, where: 'stop' }); } catch (_) { /* silent */ }
+    return C.done();
+  };
+
   const cfg = state.read();
   const transport = C.transportOf(found, cfg);
   const K = C.keepaliveSeconds(transport) * 1000;    // 60 s relay / 600 s ntfy
@@ -127,7 +144,7 @@ async function run(f) {
   // posting really is still refused.
   if (stateLib) {
     const s = stateLib.readJsonFile(state.files.session, null);
-    if (C.ownsRecord(s, mine) && s.posting_stopped && s.posting_stopped[transport]) return C.done();
+    if (C.ownsRecord(s, mine) && s.posting_stopped && s.posting_stopped[transport]) return stateOnly();
   }
 
   // ---- 5. the cadence gate, the monitor's own `due` -----------------------
@@ -143,7 +160,7 @@ async function run(f) {
   const due = transport === 'relay'
     ? (age === null || age >= K)
     : (age === null || stateChanged || age >= K);
-  if (!due) return C.done();
+  if (!due) return stateOnly();
 
   // The marker is stamped BEFORE the beat, not after. The monitor can set
   // lastBeat afterwards because a `busy` flag holds the next tick off while one
@@ -160,7 +177,7 @@ async function run(f) {
   // the beat this window paid for is the one that actually goes out
   // [C monitors/heartbeat.js beat()].
   try {
-    await H.beat(state, found, desired, { deadline: ARMED_AT + BUDGET_MS - MARGIN_MS });
+    await H.beat(state, found, desired, { deadline: stateDeadline, where: 'stop' });
   } catch (_) { /* never fail the turn this hook observes */ }
   C.done();
 }

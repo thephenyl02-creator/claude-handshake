@@ -30,6 +30,38 @@ const MAX_FILES = 64;                    // PROTOCOL section 2.5
 // spawn takes the smaller of the two.
 const CLI_TIMEOUT_MS = 8000;
 
+// ------------------------------------------- V2-PLAN 10.1: the batch clock --
+//
+// The state branch is pushed at MOST once a minute, on the monitor's own clock
+// (section 4.1). "The monitor's own clock" is the whole point: a batch on tool
+// cadence would be the amplifier section 10.2 forbids, and a batch on turn
+// cadence would be worse. But the fallback in hooks/stop.js is a fresh process
+// every turn with no memory, so the clock cannot be a variable the way
+// `lastBeat` is - it is `state.beat`'s own `at` field, read and written by
+// whichever of the two processes is beating [C lib/state.js readStateBeat].
+const STATE_BATCH_MS = 60000;
+
+// section 2.5's per-beat split, summed: fetch 1,500 + scan 1,500 + commit 500 +
+// push (the rest, ceiling 5,000). The scan row is Stage 2's - there is no
+// commit scanner yet - and it is included anyway so the ceiling does not have
+// to move when the scanner lands. This is the state work's OWN ceiling; the
+// caller's deadline still wins wherever it is tighter, which is what makes the
+// Stop-hook path fit inside its 9,500 ms watchdog.
+const STATE_BEAT_MS = 8500;
+
+// Below this there is no point starting: `detectRepo` alone is a spawn, and
+// "a spawn with nothing left is skipped rather than started in order to be
+// killed" applies to the first one as much as to the last.
+const STATE_MIN_MS = 400;
+
+// The visibility probe is a `gh` process. `repo.guard()` re-probes at most once
+// per its own 600 s TTL, so this is paid roughly once in ten beats and never on
+// the other nine - which is also section 14 item 49's "re-probe once per
+// session rather than staying refused for the life of the workspace". A beat
+// with no room for it uses the cached verdict and says `off - visibility
+// unproven` for that beat only.
+const VERDICT_PROBE_MS = 2000;
+
 function main() {
   // The monitor's own start. A monitor's lifetime IS its session's lifetime
   // (section 8), so this is the only clock that tells "written during my
@@ -225,7 +257,170 @@ async function beat(state, found, desired, opts) {
       if (r.ok) markPushed(state, push.subject_key, push.all);
     }
   }
+
+  // The state-branch batch, LAST (V2-PLAN 2.5's ordering rule: "the presence
+  // post is taken first and the git work second, so on a slow transport the
+  // thing that gets truncated is the push"). It is also the most recoverable
+  // step in the beat: the shard is on disk, the local commit stands, and the
+  // deferred arm retries on the next beat. Never let it fail the heartbeat.
+  try {
+    await stateBatch(state, found, { deadline, now: Date.now(), where: o.where || 'monitor' });
+  } catch (_) { /* section 10.1: silent, and no retry storm */ }
+
   return res.ok;
+}
+
+// ONE state-branch batch. Returns a record rather than throwing, so both
+// callers (this monitor and the Stop-hook fallback) can be silent by contract
+// and a test can still assert what happened.
+//
+// THE RETURN IS THE BEAT'S OWN RESULT, WIDENED. When a beat runs, every field
+// `runBeat` returns is on this object - `ok`, `outcome`, `push`, `commit`,
+// `pushed`, `parent`, `created_root`, `attempts`, `deferred_count`, `message`
+// - plus `ran: true` and `result`, the whole beat record, for a caller that
+// wants it whole. When no beat runs, `ran` is false and `reason` says which
+// gate stopped it (`not_installed` · `not_enabled` · `child` · `no_root` ·
+// `no_member` · `not_due` · `no_time` · `recent_offline` · `locked`). Two
+// shapes would have been two vocabularies for one event.
+//
+// Everything here is gated so that a workspace which never opted in pays
+// NOTHING: no git process, no `gh` process, no file written. That is the shape
+// section 10.1's "no commit is created before the opt-in" test asks for, and it
+// is also why the opt-in check comes before the repo probe rather than after.
+async function stateBatch(state, found, opts) {
+  const o = opts || {};
+  const now = Number.isInteger(o.now) ? o.now : Date.now();
+  const stateLib = C.lib('state.js');
+  const out = { ran: false, reason: null, result: null, outcome: null, push: null };
+
+  const sb = C.lib('state-branch.js');
+  if (!sb || !stateLib) { out.reason = 'not_installed'; return out; }
+
+  // 1. The opt-in gate, first and cheapest. Fail closed: absent, unparseable
+  //    or `enabled !== true` all mean off (section 4.2 item 3).
+  let optIn = null;
+  try { optIn = sb.readOptIn(state); } catch (_) { optIn = null; }
+  // The record is NOT written here - nothing ran, and a beat record for a
+  // capability nobody switched on would move the clock for no work. The `push:`
+  // word is still reported on the return, because section 4.4 rule 1's field is
+  // populated in every state of the world and a caller that logs this record
+  // must be able to name the state without re-deriving it.
+  if (!optIn || optIn.enabled !== true) {
+    out.reason = 'not_enabled';
+    out.push = sb.PUSH_STATES.not_enabled;
+    return out;
+  }
+
+  // 2. section 7.2 rule 1. The verdict spawns nothing, by contract - a subagent
+  //    that shells out to `git rev-parse` to be told it may not write has
+  //    already paid for the write.
+  if (C.provenChild() || (o.child && o.child.child === true)) { out.reason = 'child'; return out; }
+
+  const root = (found && found.root) || null;
+  if (!root) { out.reason = 'no_root'; return out; }
+  const member = (state.read() || {}).member || null;
+  if (!member) { out.reason = 'no_member'; return out; }
+
+  // 3. The clock: at most one batch a minute, shared across processes. It is a
+  //    CADENCE and not a lock - it is read here, before eight git spawns, and
+  //    written after, and `force` skips it - so the mutual exclusion that stops
+  //    two writers in one clone is `sb.acquireBatchLock`, taken inside the beat
+  //    [C lib/state-branch.js runBeatUngated].
+  const last = stateLib.readStateBeat(state);
+  if (!o.force && last.at !== null && now - last.at >= 0 && now - last.at < STATE_BATCH_MS) {
+    out.reason = 'not_due'; return out;
+  }
+
+  // 3b. THE OFFLINE SHORT-CIRCUIT ON A FORCED FLUSH, and it is a wall-clock fix
+  //     rather than a behaviour change. SessionEnd and SessionStart's late
+  //     flush both pass `force`, which is right - the batch that does not go
+  //     now is the one a sequenced peer waits on. But when the LAST beat came
+  //     back `offline` moments ago, spending the flush's whole slice failing to
+  //     reach the same remote buys nothing: the deferred arm already retries
+  //     next session and the marker is already set. Measured before this: 6.6 s
+  //     at every session end on an offline machine, against ~1.8 s warm. The
+  //     window is one batch interval, so a remote that came back is tried again
+  //     on the next flush rather than written off.
+  if (o.force && !o.ignoreRecentOffline && last.at !== null &&
+      now - last.at >= 0 && now - last.at < STATE_BATCH_MS &&
+      (last.outcome === 'offline' || last.reason === 'offline')) {
+    out.reason = 'recent_offline';
+    out.outcome = 'offline';
+    out.push = sb.PUSH_STATES.offline;
+    return out;
+  }
+
+  // 4. The threaded deadline (section 2.5): the smaller of this work's own
+  //    ceiling and what is left of the caller's wall.
+  const caller = Number.isFinite(o.deadline) ? o.deadline : null;
+  const deadline = caller === null ? now + STATE_BEAT_MS : Math.min(now + STATE_BEAT_MS, caller);
+  if (deadline - now < STATE_MIN_MS) {
+    // Nothing was spawned and nothing was spent, so the CLOCK does not move -
+    // the next turn retries instead of waiting out a minute this beat did not
+    // use. Only the outcome is recorded, which is what `status` prints.
+    stateLib.writeStateBeat(state, {
+      at: last.at, outcome: 'deferred', reason: 'no_time',
+      push: sb.PUSH_STATES.deferred, where: o.where || 'monitor',
+    });
+    out.reason = 'no_time';
+    out.outcome = 'deferred';
+    out.push = sb.PUSH_STATES.deferred;
+    return out;
+  }
+
+  // 5. The visibility verdict, computed HERE so the beat never pays for a `gh`
+  //    process it cannot afford. `cachedVerdict` shells out to nothing and
+  //    downgrades a stale affirmative; the fresh probe is taken only when there
+  //    is room for it, and `guard()` re-probes at most once per its 600 s TTL.
+  const repoLib = C.lib('repo.js');
+  let verdict = repoLib ? repoLib.cachedVerdict(state, { now }) : null;
+  if (repoLib && (!verdict || verdict.stale) && deadline - Date.now() > VERDICT_PROBE_MS + 1500) {
+    try { verdict = repoLib.guard({ state, cwd: root, now, timeout: VERDICT_PROBE_MS }); } catch (_) { /* keep the cached one */ }
+  }
+
+  const res = sb.runBeat({
+    root, state, member, deadline, verdict,
+    cachedOnly: true,            // belt and braces: the gate must not re-probe
+    child: false,
+    where: o.where || 'monitor',
+  });
+
+  // A beat that could not take the batch lock spawned nothing and wrote
+  // nothing, so the CLOCK does not move and no record is written: the process
+  // that holds the lock is doing this work right now and will write its own.
+  if (res.reason === 'locked') {
+    out.reason = 'locked';
+    out.outcome = res.outcome;
+    out.push = res.push;
+    return out;
+  }
+
+  // The beat's own fields, widened onto this record. `ran` and `result` are
+  // set AFTER the assign so a future field on the beat cannot overwrite either.
+  Object.assign(out, res);
+  out.ran = true;
+  out.result = res;
+
+  // 6. The record. `at` moves because a batch really ran, and the outcome word
+  //    is what section 4.4 rule 1's `push:` line prints - offline, rejected,
+  //    or `deferred (no time in the beat)`, distinct from each other and from
+  //    every other state (section 14 item 49).
+  stateLib.writeStateBeat(state, {
+    at: Date.now(), outcome: res.outcome, reason: res.reason, push: res.push,
+    detail: res.detail || null, commit: res.commit || null, where: o.where || 'monitor',
+  });
+
+  // 7. The late-not-lost marker. It is cleared ONLY by a batch that reached the
+  //    remote, or by one that found nothing left to send; every other outcome
+  //    leaves it, and the next session start is what commits it (section 10.1's
+  //    "late rather than for good").
+  if (res.outcome === sb.OUTCOMES.ok || res.outcome === sb.OUTCOMES.unchanged ||
+      res.outcome === sb.OUTCOMES.absent) {
+    stateLib.clearStatePending(state);
+  } else {
+    stateLib.markStatePending(state, res.outcome || 'deferred');
+  }
+  return out;
 }
 
 // section 7.2 rule 3: children append upward into child_touches, keyed by the
@@ -317,4 +512,9 @@ if (require.main === module) {
 // MUST take the same beat, not a second implementation of one - a duplicate
 // would drift on the fold, the push delta or the local renewal and only be
 // caught in production.
-module.exports = { beat, fold, pendingPush, markPushed, renewLocal, disarmedHere, MAX_FILES, POLL_MS, CLI_TIMEOUT_MS };
+module.exports = {
+  beat, fold, pendingPush, markPushed, renewLocal, disarmedHere,
+  stateBatch,
+  MAX_FILES, POLL_MS, CLI_TIMEOUT_MS,
+  STATE_BATCH_MS, STATE_BEAT_MS, STATE_MIN_MS, VERDICT_PROBE_MS,
+};

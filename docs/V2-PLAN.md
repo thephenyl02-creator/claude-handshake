@@ -1477,17 +1477,24 @@ why, so the reasonable conclusion is that it is broken.
    from a closed set — `pushing`, `refused — secret scan, <file>`,
    `off — gh unauthenticated`, `off — visibility unproven`,
    `rejected — forge ruleset: <the forge's own line>`,
-   `deferred (no time in the beat)`, `offline`, `no recorded lease`,
+   `deferred (no time in the beat)`, `deferred (rebuild attempts exhausted)`,
+   `offline`, `no recorded lease`, `paused — handshake/state is checked out`,
+   `off — not enabled`,
    `paused — remote head is not the one this tool pushed`, `off — no remote`.
    Without it, *"my branch stopped moving"* has **nine** causes, each announcing
    itself somewhere different and two notice slots between them.
 
    **The vocabulary is closed but it is not flat: it is owned per stage, and the
    test clause binds against the owning stage's subset** (added at the
-   second-look round, U2-3). **Stage 1 owns seven** — `pushing`,
+   second-look round, U2-3). **Stage 1 owns ten** — `pushing`, `off — not enabled` (before the opt-in,
+   with the verb that enables it),
    `off — gh unauthenticated`, `off — visibility unproven`,
    `rejected — forge ruleset: <line>`, `deferred (no time in the beat)`,
-   `offline`, `off — no remote`. **Stage 2 adds three**, each needing something
+   `deferred (rebuild attempts exhausted)` (§10.1 rule 4's rebuild ceiling is an
+   attempt bound, not a time bound, and the words must be true), `offline`,
+   `off — no remote`, and `paused — handshake/state is checked out` (the
+   checked-out guard: a paused write must leave a line under this rule; these
+   three admitted at the Stage 1 build, 2026-09-05). **Stage 2 adds three**, each needing something
    Stage 1 does not build: `refused — secret scan, <file>` (the scanner ships in
    Stage 2), `no recorded lease` (D1's force-push helper is Stage 2's, and Stage 1
    force-pushes nothing) and `paused — remote head is not the one this tool
@@ -2309,8 +2316,9 @@ with the refs it leaves (§4.3), and `SKILL.md`'s *"Tests are green on my branch
 flipped, because from this stage the branch **is** the live view.
 
 **Three preconditions, not five, and the two that left.** The **CI filter** is
-gone entirely — `[skip ci]` replaces it (§4.2 item 4), no workflow is read, no
-workflow is edited, and this repository's own `ci.yml` is **not** touched by this
+gone entirely — `[skip ci]` replaces it (§4.2 item 4); the preflight reads `.github/workflows/*.yml` — bounded in
+count and size, never executed, never edited — only to warn on
+`pull_request_target`; and this repository's own `ci.yml` is **not** touched by this
 plan. The **recorded `git --version`** is gone from here because the only thing
 it gated was stacking; it moves to G1's own entry work (Appendix G1). What is
 left is three questions about *this* machine, all answerable in a second, none of
@@ -2705,10 +2713,12 @@ marker present on three paths out of four is a marker that bills on the fourth.
 `git push --dry-run` cannot run non-interactively, and when `commit.gpgsign` is
 on and unresolved** — and **passes, with a warning and not a refusal, on a
 repository whose workflows use `pull_request_target`** and on a GitLab remote
-whose policy it cannot read (§4.2 item 4). **No workflow file is opened by any
+whose policy it cannot read (§4.2 item 4). **No workflow file is written or executed by any
 path in this stage**, asserted by fixture: a repository with four push-triggered
-workflows and no branch filter enables the automated push with no refusal and no
-read. **A six-day-absent client that only runs `git fetch` gets
+workflows and no branch filter enables the automated push with no refusal, and
+the only read of `.github/workflows/` is the bounded `pull_request_target` probe
+(amended at the Stage 1 build: the first draft said *no read*, which contradicted
+§4.2 item 4's warning — a warning needs one read). **A six-day-absent client that only runs `git fetch` gets
 the peer's records in its SessionStart block** — the read half, pinned, and the
 test §11.2 asserts. **SessionStart against an unreachable remote still clears the
 pending marker and still runs the sync**: the fetch is abandoned at its 1,500 ms
@@ -4724,6 +4734,15 @@ now stated in §10.2, §4.2 item 4 and §12.5; and the rule that no `update-ref`
 `handshake/<self>` happens while any worktree has it checked out, measured on
 git 2.53: `update-ref` moves a checked-out `HEAD` silently where `branch -f`
 refuses.
+
+**Amended at the Stage 1 build (2026-09-05), three rulings the builder asked
+for:** §4.4 rule 1's Stage 1 vocabulary is ten words, not seven — the
+checked-out pause, the attempts-exhausted deferral and the not-yet-enabled state
+each needed a true line under a rule that says *always populated*;
+the preflight reads workflow files (bounded, read-only) for the
+`pull_request_target` warning, and §10.1's *no read* assertion became *no write,
+no execution*; and the SessionEnd flush keeps the plan's 3,000 ms rather than
+the 7,000 the first integration used.
 **Three blockers.** The peer-diff refuse-list was a **denylist** on the one
 surface §4.3 argues for an allowlist, and omitted most of the surface it claimed
 (S2-2 → §4.2 item 5, item 36). The work-branch commit had **no stated base tree

@@ -16,6 +16,7 @@ should check before trusting a run.
 - [The self-check](#the-three-valued-self-check)
 - [Upgrading](#upgrading)
 - [Uninstalling](#uninstalling)
+- [The coordination state branch (opt-in)](#the-coordination-state-branch-opt-in)
 - [Security: credentials and push protection](#security-credentials-and-push-protection)
 - [Troubleshooting](#troubleshooting)
 
@@ -471,9 +472,13 @@ What `scrub` deliberately does **not** do:
 - It does not end your membership, touch the workspace secret or your relay
   sub-token, or stop the live layer. You stay a member; claims, notes and
   presence keep working. Signing off is `/handshake rest`.
-- It does not commit. The deletion rides your next commit like any other change
-  — claude-handshake never makes a coordination-only commit — so until you
-  commit and push it, teammates still have the directory. Their clones keep
+- It does not commit **on a branch you work on**. The deletion rides your next
+  commit like any other change — claude-handshake never commits to a branch you
+  work on and never merges into one — so until you commit and push it,
+  teammates still have the directory. (Where you switched the
+  [coordination state branch](#the-coordination-state-branch-opt-in) on, the
+  tool does commit — on its own orphan `handshake/state`, which merges into
+  nothing. `scrub` lists that branch and leaves it; it never deletes a branch.) Their clones keep
   working until they pull; their handshake keeps working regardless, on the live
   layer.
 - It does not rewrite history. Shards that were already committed stay in every
@@ -547,6 +552,104 @@ or the plugin data directory — holds the sub-token and, on ntfy, the topic
 signs the session off, and the founder's member-remove (relay) or a topic
 rotation (ntfy) is what actually ends a membership. Do that part before
 uninstalling, not after.
+
+## The coordination state branch (opt-in)
+
+Off by default, and it stays off until a human types the opt-in on that machine.
+Your peer switching it on grants you nothing, and yours grants them nothing.
+
+```
+/handshake pair --state-branch            # the gate; it prints everything below first
+/handshake branches                       # what exists, how big it is, how to delete it
+/handshake pair --state-branch --revoke   # off again; nothing is committed or pushed after it
+```
+
+Those are the forms you type **inside Claude Code**. Outside it, reach the same
+verbs through whichever invocation your install route gives you ([Invoking the
+CLI outside Claude Code](#invoking-the-cli-outside-claude-code)).
+
+What you are switching on, in the same words the gate prints:
+
+> These commits are **authored as you**, about **one a minute**, on a branch
+> that **never merges into anything you work on**, and they **will appear in
+> your GitHub activity**. Two people means two work branches plus one
+> `handshake/state`: **three refs, forever** — three on the remote, and on your
+> own machine you also carry the local copies the tool writes,
+> `handshake/state` and `handshake/<you>`. The tool's commits never run CI;
+> yours do.
+
+What is committed is an explicit allowlist — your own task shard, derived from
+your member id and never accepted as a path — and every commit message carries
+`[skip ci]`, which both GitHub and GitLab honour. Your `HEAD` never moves, your
+index is never read or written, and no checkout ever happens: the commits are
+built through a temporary index, so uncommitted work in your tree is untouched.
+
+**The bytes are scanned before every one of those commits, and a finding
+refuses the commit** rather than publishing it: the shard is split into its
+records and each one goes through the same outbound secret filter that already
+stands in front of every message this tool sends (`lib/filter.js`). Nothing
+partial is written — the refusal happens before the blob is even created — and
+`/handshake status` names the file it came from. Read the honest limit with it:
+that filter is a seatbelt against **accidental** disclosure plus one fail-closed
+tripwire on your own `.env`-shaped files. It is not a defence against a
+motivated adversary, and it is the reason the branch is private-repo only.
+
+**Never pull `handshake/<you>` into a checkout you care about.** It is rewritten
+under a lease, and a clone that followed it gets a mess the tool cannot see.
+
+**It is private-repo only.** On a public repository the whole automated push
+path stays off and `/handshake status` says so; enabling it anyway takes a
+distinct typed confirmation that names the consequence, and the override is
+recorded. On a non-github.com remote the tool cannot *prove* visibility either
+way: it asks you to confirm the remote is private and records that answer as
+`unprovable` — never as an override of a public verdict.
+
+**The gate refuses `--yes`, and refuses to run from a subagent.** The typed
+confirmation is a speed bump and an audit line, not proof of consent: the model
+drives this terminal too (SECURITY.md §1.2).
+
+Three preconditions run before it can be enabled, and each refusal names the
+next move: the visibility verdict above, a `git push --dry-run` that must run
+**non-interactively** (the tool never prompts for a credential and never will —
+a helper that would prompt fails instead of hanging), and `commit.gpgsign`,
+which must be off or accepted with `--allow-unsigned`, because an automated
+commit with signing on hangs on a `pinentry` prompt that has no terminal.
+
+Two things the gate **warns** about and does not block. Every commit the tool
+writes carries `[skip ci]`, which both GitHub and GitLab honour — but GitHub
+documents one exception, `on: pull_request_target`, so the gate reads
+`.github/workflows/*.yml` **read-only, once, at the moment you type the
+command**, and names any workflow that uses it. (That read happens in the
+opt-in command and nowhere else: no hook, no monitor and no automatic path
+opens a workflow file, ever.) The second warning is for a non-github.com
+remote, where the tool cannot read whether a pipeline execution policy
+overrides the marker.
+
+**Deleting the branches is safe**, and each takes two commands, because the tool
+writes a local copy as well as pushing one:
+
+```
+git push origin --delete handshake/state
+git branch -D handshake/state
+```
+
+The tool never deletes a branch itself. `/handshake branches` prints both
+commands for every handshake ref your clone actually carries.
+
+**When the branch stops moving, one field says why.** `/handshake status` and
+`/handshake branches` both carry a `push:` line, **always** populated — in every
+state of the world, including before you switch the branch on — from a closed
+set of ten: `pushing`, `offline`,
+`rejected — forge ruleset: <the forge's own line>`,
+`deferred (no time in the beat)`, `deferred (rebuild attempts exhausted)`,
+`off — no remote`, `off — gh unauthenticated`, `off — visibility unproven`,
+`paused — handshake/state is checked out`, and
+`off — not enabled (handshake pair --state-branch)`. Beside it sit a deferred
+count, the last SessionStart fetch duration, and whether the shard scan came
+back truncated — those appear only once the branch is on, because a deferred
+count for a path that has never run is decoration. Before you switch it on you
+also get the sentence that names the capability, the cause and the command that
+changes it (`state branch: off — not enabled on this machine; …`).
 
 ## Security: credentials and push protection
 

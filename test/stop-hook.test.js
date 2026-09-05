@@ -615,8 +615,17 @@ test('the Stop hook writes nothing to stdout, and takes the monitor\'s own beat'
   // budget handed to 16 s of work), and it is invisible on the clock because
   // both spellings exit at the watchdog.
   assert.match(code, /armSafety\(BUDGET_MS\)/, 'the watchdog is armed from the budget');
-  assert.match(code, /H\.beat\(.*deadline: ARMED_AT \+ BUDGET_MS/,
+  // The deadline is now a named constant, because V2-PLAN 10.1 gives it a
+  // second consumer - the state-branch batch on the paths that do not reach
+  // the beat at all. The pin is therefore on the two facts rather than on one
+  // spelling: the constant is derived from this hook's own watchdog minus its
+  // margin, and BOTH consumers are handed that same constant.
+  assert.match(code, /const stateDeadline = ARMED_AT \+ BUDGET_MS - MARGIN_MS;/,
+    'the deadline is derived from the watchdog, not invented');
+  assert.match(code, /H\.beat\([^)]*deadline: stateDeadline/,
     'and the same budget is handed to the beat as a deadline');
+  assert.match(code, /H\.stateBatch\([^)]*deadline: stateDeadline/,
+    'and to the state batch on the paths that never reach the beat');
 });
 
 test('cmdPresence\'s own usage line and USAGE name the same flags', () => {

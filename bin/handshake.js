@@ -33,6 +33,8 @@ const ntfy = require('../lib/transport-ntfy');
 const T = require('../lib/transport');
 const deployLib = require('../lib/deploy');
 const { FilterViolation } = require('../lib/outbound');
+const escapeLib = require('../lib/escape');
+const stateBranch = require('../lib/state-branch');
 
 const CLIENT = 'claude-handshake/0.1.5';
 const INJECT_CAP = 5;                 // PROTOCOL section 6.2
@@ -268,9 +270,17 @@ function writeShard(ctx, kind, fields, opts) {
   const self = ctx.cfg.member;
   if (!self) return null;
   try {
-    return wsFiles.appendShardRecord(detected.root, { self, member: self, kind, fields }, {
+    const written = wsFiles.appendShardRecord(detected.root, { self, member: self, kind, fields }, {
       filterOpts: ctx.filterOpts, email: ctx.cfg.git_email || null,
     });
+    // V2-PLAN 10.1's late-not-lost marker. A record is on disk and its batch
+    // has not reached the remote; the next beat clears this, and if no beat
+    // ever gets one - a killed session, a SessionEnd that did not fire, one in
+    // twenty-one [S4] - the NEXT session start commits it and says so. Marking
+    // it here rather than in the beat is what makes the marker true of a
+    // session that wrote a shard and then died before any beat ran at all.
+    if (written) { try { stateLib.markStatePending(ctx.state, 'shard_write'); } catch (_) { /* advisory */ } }
+    return written;
   } catch (e) {
     if (e instanceof FilterViolation) {
       if (o.latch === false) {
@@ -1240,6 +1250,15 @@ async function cmdStatus(args) {
       read_truncated: Boolean(peers.truncated),
     },
     queue: { pending: ctx.queue.size() },
+    // V2-PLAN 4.4 rule 1: the `push:` field, always populated, from a closed
+    // vocabulary - one field, one place, naming the actual cause when the
+    // branch is not moving. Computed from what this side already holds:
+    // `status` must stay fast and must never burn a GitHub API call, so
+    // NOTHING here reaches the network and nothing runs `gh`. `stateBranchFacts`
+    // itself shells out to nothing at all; the derived peer lines below cost
+    // four local git calls (`rev-parse` twice, `ls-tree` once, and the repo
+    // probe that finds the root) and only once the branch is switched on.
+    state_branch: stateBranchFacts(ctx),
     local_switches: {
       muted: Boolean(ctx.cfg.muted),
       resting: Boolean(ctx.cfg.rest && ctx.cfg.rest.session === sessionId()),
@@ -1304,6 +1323,25 @@ async function cmdStatus(args) {
   if (report.local_switches.resting) out('RESTING: broadcasting stopped this session; listening continues; claims left to expire on TTL.');
   // section 8: a host without monitors MUST say so.
   if (!monitors) out('monitors unavailable, heartbeating on turn boundaries: the Stop hook beats at the transport cadence (at most once per ' + (ctx.cfg.transport === 'relay' ? 60 : 600) + 's), not once per turn');
+
+  // V2-PLAN 10.1 / 4.4 rules 1 and 3. Placed directly under the monitors line
+  // because the headless clause is the second half of that same sentence -
+  // section 4.4 rule 3's "headless: state pushes ride the Stop hook,
+  // peer-branch evaluation is off", the half the first draft left out. The
+  // This header IS rule 3's line when the capability is off: it names the
+  // capability, the cause and the next move in one sentence. The `push:` line
+  // below it is printed either way - rule 1's field is always populated, and
+  // before the opt-in its value is the not-enabled word.
+  const sbFacts = report.state_branch;
+  out('state branch: ' + (sbFacts.enabled
+    ? 'on — ' + recordedVisibility(sbFacts.visibility) + '  [' + stateBranch.STATE_BRANCH + ']'
+    : NOT_ENABLED_LINE));
+  for (const line of stateBranchStatusLines(ctx, sbFacts, {
+    root: sbFacts.enabled ? (repoRoot() || {}).root || null : null, headless: !monitors,
+    // ONE bounded `ls-remote` behind rule 3's peer line, and `--no-network`
+    // turns it off for anyone who wants `status` to shell out to nothing.
+    probe: args.flags['no-network'] !== true,
+  })) out(line);
   // Honest framing: section 7.1's safe fallback classifies HOOK-driven
   // sessions. A typed CLI command is an explicit human action, so only a
   // proven child (CLAUDE_CODE_CHILD_SESSION=1) is refused - the fallback is
@@ -1519,6 +1557,16 @@ async function cmdDoctor(args) {
     add('plugin loaded', 'warn', 'plugin-load check skipped: ' + String(e && e.message).slice(0, 80));
   }
 
+  // V2-PLAN section 14 item 49: the REGISTERED hook set against the INSTALLED
+  // one, naming the missing entry by name. This is the WSL case and the
+  // fallback route's - `hooks.json` is hand-merged into `~/.claude/settings.json`
+  // and has to be re-merged on every upgrade whose hook set changed
+  // [C docs/INSTALL.md:584] - and Stage 1 makes it MORE likely to bite rather
+  // than less, because a session whose SessionEnd hook is missing is a session
+  // that never flushes its last state batch.
+  const hookDiff = compareHookSets();
+  add('hooks registered vs installed', hookDiff.level, hookDiff.message);
+
   const found = resolveWs(args);
   if (!found) {
     add('workspace', 'warn', 'not inside a handshake workspace (cwd: ' + process.cwd() + ')');
@@ -1672,6 +1720,70 @@ function worst(checks) {
   if (checks.some((c) => c.verdict === 'fail')) return 'fail';
   if (checks.some((c) => c.verdict === 'warn')) return 'warn';
   return 'pass';
+}
+
+// The plugin's own hook manifest is the REGISTERED set; `~/.claude/settings.json`
+// is where the fallback and WSL routes carry the INSTALLED one, hand-merged.
+// A hand-merge that predates a release which added a hook silently drops it,
+// and a dropped hook fails soft - which is the worst failure available here,
+// because nothing anywhere says the capability is gone. Cheap by construction:
+// two `readFileSync`s and no subprocess, and it is skipped entirely on a
+// machine whose settings.json carries no handshake hook at all (the plugin
+// route, where the host registers them and there is nothing to compare).
+function compareHookSets() {
+  const manifest = path.join(__dirname, '..', 'hooks', 'hooks.json');
+  let registered;
+  try { registered = JSON.parse(fs.readFileSync(manifest, 'utf8')); } catch (e) {
+    return { level: 'warn', message: 'could not read the plugin hook manifest (' + String(e && e.message).slice(0, 60) + ')' };
+  }
+  const wantScripts = new Map();     // event -> the hooks/<file>.js it registers
+  for (const [event, groups] of Object.entries((registered && registered.hooks) || {})) {
+    for (const grp of groups || []) {
+      for (const h of (grp && grp.hooks) || []) {
+        const m = /hooks[\/]([a-z-]+\.js)/.exec(String((h && h.command) || ''));
+        if (m) wantScripts.set(event, m[1]);
+      }
+    }
+  }
+  if (!wantScripts.size) return { level: 'warn', message: 'the plugin hook manifest registers no hooks - that cannot be right' };
+
+  const cfgDir = process.env.CLAUDE_CONFIG_DIR
+    ? path.resolve(process.env.CLAUDE_CONFIG_DIR)
+    : path.join(require('os').homedir(), '.claude');
+  const settingsFile = path.join(cfgDir, 'settings.json');
+  let settings;
+  try { settings = JSON.parse(fs.readFileSync(settingsFile, 'utf8')); } catch (_) {
+    return { level: 'pass', message: 'no hand-merged hook set in ' + settingsFile + ' - the plugin route registers them, nothing to compare' };
+  }
+  const installed = new Set();
+  let anyHandshake = false;
+  for (const [event, groups] of Object.entries((settings && settings.hooks) || {})) {
+    for (const grp of groups || []) {
+      for (const h of (grp && grp.hooks) || []) {
+        const cmd = String((h && h.command) || '');
+        if (!/handshake/i.test(cmd)) continue;
+        anyHandshake = true;
+        const m = /hooks[\/]([a-z-]+\.js)/.exec(cmd);
+        if (m) installed.add(event + ':' + m[1]);
+      }
+    }
+  }
+  if (!anyHandshake) {
+    return { level: 'pass', message: settingsFile + ' carries no hand-merged handshake hook - the plugin route registers them, nothing to compare' };
+  }
+  const missing = [];
+  for (const [event, script] of wantScripts) {
+    if (!installed.has(event + ':' + script)) missing.push(event + ' (' + script + ')');
+  }
+  if (!missing.length) {
+    return { level: 'pass', message: 'all ' + wantScripts.size + ' registered hooks are in ' + settingsFile };
+  }
+  return {
+    level: 'fail',
+    message: 'MISSING from ' + settingsFile + ': ' + missing.join(', ') +
+      ' - a hand-merged hook set from an older release. Re-run the installer and merge the printed ' +
+      'snippet again (docs/INSTALL.md, "Hooks not firing on WSL"); a missing hook fails SOFT and nothing else says so.',
+  };
 }
 
 // ====================================================== sugar over `post` ===
@@ -2399,8 +2511,9 @@ async function cmdScrub(args) {
 
   out('');
   if (detected) {
-    out('  The deletion rides your NEXT commit. claude-handshake never commits for you and');
-    out('  never makes a coordination-only commit, so until you commit and push this,');
+    out('  The deletion rides your NEXT commit on a branch you work on. From v2 the tool');
+    out('  DOES commit - on `' + stateBranch.STATE_BRANCH + '`, its own orphan branch - but it never commits to a');
+    out('  branch you work on and never merges into one, so until you commit and push this,');
     out('  peers still have the directory.');
     out('  Committed HISTORY still holds every shard that was ever committed. Taking those');
     out('  out of history is a git rewrite - force-push, everyone re-clones - and this tool');
@@ -2410,10 +2523,53 @@ async function cmdScrub(args) {
     out('  commit to make and no history to worry about.');
   }
 
+  // section 14 item 47(e): the tool writes its refs with `update-ref` as well as
+  // pushing them, so a listing that offered only the remote delete would leave
+  // the reader still carrying both refs in their own `git branch`. Each ref
+  // gets the remote delete AND `git branch -D`, and they are LISTED rather than
+  // deleted - the tool never deletes a branch (V2-PLAN 4.1).
+  if (detected) {
+    const leftovers = scrubLeftoverRefs(detected.root, isMember ? cfg0.member : null);
+    out('');
+    if (leftovers.length) {
+      out('  REFS THIS DOES NOT TOUCH, and they are generated, unreviewed and never merged');
+      out('  into your branches. Deleting them is safe; scrub lists them and leaves them,');
+      out('  because the tool never deletes a branch:');
+      for (const ref of leftovers) {
+        out('    ' + ref.name);
+        out('      git push origin --delete ' + ref.name);
+        out('      git branch -D ' + ref.name);
+      }
+    } else {
+      out('  No handshake refs are in this clone, so there is nothing else to delete.');
+    }
+  }
+
   out('');
   out('  Re-attach this project later with `handshake scrub --restore` (add `--claude-md`');
   out('  for the CLAUDE.md block). It rewrites the layer for THIS workspace out of local');
   out('  state; `handshake init` would mint a NEW one instead.');
+}
+
+// The handshake refs this clone actually carries, listed for `scrub` so a
+// reader who is detaching is told about BOTH copies of each - the tool writes
+// its refs into the human's shared `.git` with `update-ref` as well as pushing
+// them (V2-PLAN 4.1, section 14 item 47(e)), so an offer of only
+// `git push origin --delete` leaves them still in `git branch`. Derived, never
+// guessed: a ref that is not there is not listed.
+function scrubLeftoverRefs(root, member) {
+  const names = [stateBranch.STATE_BRANCH];
+  if (member) {
+    const own = stateBranch.ownRef(member).replace(/^refs\/heads\//, '');
+    if (!names.includes(own)) names.push(own);
+  }
+  const found = [];
+  for (const name of names) {
+    const r = repoLib.git(root, ['rev-parse', '--verify', '-q', 'refs/heads/' + name], { timeout: 5000 });
+    const remote = repoLib.git(root, ['rev-parse', '--verify', '-q', 'refs/remotes/origin/' + name], { timeout: 5000 });
+    if (r.ok || remote.ok) found.push({ name, local: r.ok, remote: remote.ok });
+  }
+  return found;
 }
 
 // ================================================================= learn ====
@@ -2499,6 +2655,737 @@ async function cmdLearn(args) {
   out('Until then it lives only on this disk: `learn` posts nothing to the transport.');
 }
 
+// =========================================================== state branch ===
+//
+// V2-PLAN 10.1 (Stage 1). Two verbs and one shared view:
+//   `handshake pair --state-branch`   the opt-in gate, human-only, join-shaped
+//   `handshake branches`              the read-only branch view
+// plus the `push:` line section 4.4 rule 1 puts in BOTH of them and in
+// `status`. Nothing here is on a hot path: every function below is reached
+// only from a typed command.
+
+// THE `push:` LINE IS PRINTED IN EVERY STATE OF THE WORLD, INCLUDING BEFORE THE
+// OPT-IN. Section 4.4 rule 1 says "always-populated ... One field, one place,
+// always filled in", and an earlier build read the off state as rule 3's
+// business instead and printed no field at all - which made "always" mean
+// "whenever the capability is on" and left a reader of `status` unable to tell
+// a missing field from a missing feature. The owner's ruling of 2026-09-05 is
+// that rule 1 means what it says: the off state gets the tenth Stage 1 word,
+// `off — not enabled (handshake pair --state-branch)`
+// [C lib/state-branch.js PUSH_STATES.not_enabled], and the field is never
+// absent.
+//
+// Rule 3's own line is still printed beside it, and it is not a duplicate: the
+// `push:` field is one value from a closed set, and this is the sentence that
+// names the capability, the cause and what publishing it would mean.
+const NOT_ENABLED_LINE =
+  'off — not enabled on this machine; `handshake pair --state-branch` shows what it publishes and switches it on';
+
+const STATE_REFS_CLAUSE = [
+  'Exactly members + 1 refs, ever: two people means two work branches plus one',
+  'handshake/state - three refs, forever. Three on the REMOTE, and your own clone',
+  'also carries the LOCAL copies the tool writes with update-ref, handshake/state',
+  'and handshake/<you>, which is what `git branch` shows you.',
+];
+
+// One local git call, bounded by lib/repo.js's own runner - never a shell, argv
+// straight to the process. `null` on any failure, because a number this command
+// could not read is reported as unknown and never as zero.
+function stateGit(root, gitArgs) {
+  const r = repoLib.git(root, gitArgs, { timeout: 5000 });
+  return r.ok ? String(r.stdout || '') : null;
+}
+
+// Which ref answers for "the state branch as this clone can see it". The
+// remote-tracking copy first: it is what SessionStart fetches, it is the peer's
+// side of the story, and reading it costs no network. The local copy second,
+// for the machine that has committed but never pushed.
+function stateRefsHere(root) {
+  const refs = [];
+  for (const ref of [stateBranch.REMOTE_STATE_REF, stateBranch.STATE_REF]) {
+    const sha = stateGit(root, ['rev-parse', '--verify', '-q', ref]);
+    if (sha && sha.trim()) refs.push({ ref, sha: sha.trim().split(/\s+/)[0] });
+  }
+  return refs;
+}
+
+// section 4.4 rule 3, derived locally and from nothing the peer sent. With ONE
+// shared `handshake/state` (decision 3) the existence of the branch cannot tell
+// two members apart, so the derivation is the peer's own shard PATH inside the
+// tree that branch carries: a member who has opted in has written one, a member
+// who has not, has not.
+//
+// TWO THINGS THIS FUNCTION LEARNED THE HARD WAY, both measured.
+//
+// (1) A LOCAL REF IS EVIDENCE ABOUT THE PAST, NOT ABOUT THE REMOTE. The
+//     positive claim - "bob has not enabled it" - was derived from an `ls-tree`
+//     over a ref this clone fetched at some point, so on any clone whose last
+//     fetch predates the peer's opt-in it asserted the opposite of the truth:
+//     measured, bob's shard was on the remote's `handshake/state` while alex's
+//     `handshake branches` still printed `bob: no state branch ... not enabled
+//     yet`, and it cleared only after alex's next SessionStart. Section 10.1's
+//     Tests say the line is "derived from `ls-remote`", so it is: ONE bounded
+//     `ls-remote --exit-code --heads`, and the local tree may answer for a peer
+//     only when the sha it returns is the sha this clone holds. Different sha,
+//     or no answer, and the honest unknown arm prints instead. That is one
+//     2-second-ceiling network call on two typed verbs and on no hook path.
+//
+// (2) PRESENCE IN A SHARED TREE IS NOT PROOF THE PEER'S TOOL WROTE IT. Every
+//     opted-in member pushes to this branch and the write allowlist is enforced
+//     only on the writer's own side, so a member who wanted to could add a file
+//     with another member's derived shard name and suppress that member's line.
+//     The one locally derivable counter-fact is the COMMITTER: every commit
+//     this tool writes carries `handshake@claude-handshake.invalid`
+//     [C lib/state-branch.js TOOL_IDENTITY], and a hand-built tree does not.
+//     A shard whose last commit was not committed by the tool proves nothing
+//     either way, so it gets the third arm rather than silence.
+function stateBranchPeerLines(ctx, root, facts, opts) {
+  const o = opts || {};
+  const lines = [];
+  if (!root) return lines;
+  const peers = ctx.state.getPeers();
+  const members = (peers.members || [])
+    .map((m) => (m && typeof m === 'object' ? (m.member || m.name) : m))
+    .filter((m) => typeof m === 'string' && m && m !== ctx.cfg.member);
+  if (!members.length) return lines;
+
+  const unknown = (why) => {
+    lines.push('peer state branches: unknown — ' + why);
+    return lines;
+  };
+
+  const refs = stateRefsHere(root);
+
+  // The remote's own answer, bounded, and skipped entirely when the caller says
+  // so (`--no-network`, and every test that wants the derivation alone).
+  let probe = null;
+  if (o.probe !== false) {
+    try {
+      probe = stateBranch.lsRemoteRef(root, stateBranch.STATE_REF, {
+        timeout: stateBranch.LSREMOTE_CEILING_MS,
+      });
+    } catch (_) { probe = null; }
+  }
+
+  if (probe && probe.present === false) {
+    // PROVED absent on the remote: nobody has enabled it, and that is derived
+    // from the remote itself rather than from a ref that may be stale.
+    for (const m of members) {
+      lines.push(escapeLib.escapeMemberId(m) + ': no state branch on the remote — not enabled yet');
+    }
+    return lines;
+  }
+  if (probe && probe.present === null) {
+    // Unreachable, unauthenticated, or out of time. Nothing may be claimed.
+    return unknown('the remote could not be asked whether `' + stateBranch.STATE_BRANCH +
+      '` exists (' + (probe.reason || 'unknown') + '); it is asked again on the next `handshake branches`');
+  }
+  if (!refs.length) {
+    if (probe === null) {
+      // No probe was taken (the caller opted out). Fall back to the SessionStart
+      // fetch's own record, which is what the derivation had before.
+      const fetched = facts && Number.isFinite(facts.fetch_ms) && !facts.fetch_reason;
+      if (!fetched) {
+        return unknown('`' + stateBranch.STATE_BRANCH +
+          '` has not been fetched into this clone yet; the next session start fetches it');
+      }
+      for (const m of members) {
+        lines.push(escapeLib.escapeMemberId(m) + ': no state branch on the remote — not enabled yet');
+      }
+      return lines;
+    }
+    // The remote HAS the branch and this clone has never fetched it, so the
+    // tree that names the peers is not here.
+    return unknown('`' + stateBranch.STATE_BRANCH + '` is on the remote but not in this clone yet; ' +
+      'the next session start fetches it');
+  }
+
+  // The local tree may answer only if it IS the remote's tree.
+  if (probe && probe.present === true && probe.sha && probe.sha !== refs[0].sha) {
+    return unknown('this clone\'s copy of `' + stateBranch.STATE_BRANCH + '` is behind the remote (' +
+      refs[0].sha.slice(0, 8) + ' vs ' + probe.sha.slice(0, 8) + '); the next session start fetches it, ' +
+      'or run `git fetch origin ' + stateBranch.STATE_BRANCH + '`');
+  }
+
+  const listing = stateGit(root, ['ls-tree', '-r', '--name-only', refs[0].ref, '--', wsFiles.DIR + '/' + wsFiles.TASKS_DIR]);
+  if (listing === null) return lines;
+  const present = new Set(listing.split(/\r?\n/).map((s) => s.trim()).filter(Boolean));
+  for (const m of members) {
+    const rel = wsFiles.DIR + '/' + wsFiles.TASKS_DIR + '/' + wsFiles.shardFileName(m);
+    if (!present.has(rel)) {
+      lines.push(escapeLib.escapeMemberId(m) + ': no state branch on the remote — not enabled yet');
+      continue;
+    }
+    // Present. Whose commit put it there?
+    const last = repoLib.lastCommitEmail(root, rel, { rev: refs[0].ref, timeout: 5000 });
+    if (!last || !last.ok) continue;                      // unreadable: claim nothing
+    const committer = String(last.committer || '').toLowerCase();
+    if (committer !== stateBranch.TOOL_IDENTITY.email.toLowerCase()) {
+      lines.push(escapeLib.escapeMemberId(m) + ': state branch presence unproven — the shard on `' +
+        stateBranch.STATE_BRANCH + '` was not committed by this tool');
+    }
+  }
+  return lines;
+}
+
+// Everything `status` and `branches` print about the state branch, computed
+// from what this side already holds. NO network, and no `gh` process: a cached
+// affirmative older than the 600 s TTL is a stale affirmative and not an
+// affirmative (SECURITY.md 6), which is exactly what `cachedVerdict` returns.
+function stateBranchFacts(ctx) {
+  const optIn = stateBranch.readOptIn(ctx.state);
+  const beat = stateLib.readStateBeat(ctx.state);
+  const report = stateBranch.report(ctx.state);
+  const cache = knowledgeCache(ctx.state);
+
+  // ALWAYS POPULATED, in every state of the world (section 4.4 rule 1). Before
+  // the opt-in the value is the tenth Stage 1 word, which names the state and
+  // carries the verb that changes it - see NOT_ENABLED_LINE above.
+  let push;
+  if (!optIn.enabled) {
+    push = stateBranch.PUSH_STATES.not_enabled;
+  } else if (beat.push) {
+    push = beat.push;                       // what the last batch actually concluded
+  } else {
+    // Opted in and no batch has run yet: derive the arm rather than promise
+    // `pushing` for a path that would refuse on its first beat.
+    const arm = stateBranch.visibilityArm(repoLib.cachedVerdict(ctx.state), optIn, null);
+    push = arm.allowed ? stateBranch.PUSH_STATES.pushing : arm.push;
+  }
+
+  // A REFUSAL THE CLOSED VOCABULARY HAS NO WORD FOR STILL HAS TO REACH THE
+  // HUMAN. Two Stage 1 refusals carry no `push:` word: the shard is past the
+  // 256 KB cap every peer reads through, and git is not on PATH. Neither drains
+  // by waiting and neither is any of the ten, so `push:` above falls back to
+  // the derived arm - which would say `pushing` while every beat refuses. The
+  // detail is therefore printed on its OWN line, with the cause and the next
+  // move (section 4.4 rule 2), and the ASK on the record is an eleventh word
+  // for it, which needs a ruling rather than a commit.
+  const refused = beat.outcome === 'refused' && !beat.push && beat.reason !== 'revoked'
+    ? { reason: beat.reason || null, detail: beat.detail || null }
+    : null;
+
+  return {
+    refused,
+    enabled: optIn.enabled,
+    visibility: optIn.visibility,
+    at: optIn.at,
+    push,
+    outcome: beat.outcome,
+    detail: beat.detail,
+    last_batch_at: beat.at,
+    late_flush: beat.late_flush,
+    deferred: report.deferred.count,
+    deferred_reason: report.deferred.reason,
+    recorded_head: report.recorded_head,
+    last_push_at: report.last_push_at,
+    fetch_ms: cache ? cache.fetch_ms : null,
+    fetch_reason: cache ? cache.fetch_reason : null,
+    scan_truncated: Boolean(cache && cache.scan_truncated),
+    scan_source: cache ? cache.source : null,
+    // How many shards the first-prompt block carries that the fetched ref does
+    // NOT have - peers who have not opted in, whose records ride a human commit
+    // (section 4.1's no-remote arm). The ref scan is a UNION with the working
+    // tree, never a replacement, and this is the number that says so.
+    worktree_only: cache && Number.isFinite(cache.worktree_only) ? cache.worktree_only : 0,
+    // And the other half of that union: records the working tree contributed
+    // for a peer the ref DOES carry, because that peer's branch copy is behind
+    // their committed one (their last flush deferred, their human committed
+    // after it). Without this number the recovery is silent, which is the one
+    // thing section 4.4 rule 1 does not allow.
+    worktree_extra_records: cache && Number.isFinite(cache.worktree_extra_records)
+      ? cache.worktree_extra_records : 0,
+  };
+}
+
+function knowledgeCache(state) {
+  try { return require('../lib/shard-scan').readCache(state.dir); } catch (_) { return null; }
+}
+
+// The verdict word the opt-in recorded, printed so `unprovable` and
+// `public, overridden` are never the same word (section 4.2 item 2).
+function recordedVisibility(v) {
+  if (!v || !v.verdict) return 'not recorded';
+  if (v.verdict === 'unprovable') return 'unprovable (a non-github.com remote; you confirmed it yourself)';
+  if (v.override === true) return 'PUBLIC, overridden by a typed confirmation';
+  return v.verdict + (v.reason ? ' (' + v.reason + ')' : '');
+}
+
+// The lines both `status` and `branches` print, in one place so the two cannot
+// drift into two different vocabularies for one field.
+//
+// The `push:` line is printed ALWAYS - one field, one place, always filled in,
+// and always one of Stage 1's closed ten (section 4.4 rule 1). Before the
+// opt-in the value is the not-enabled word and the caller's own header carries
+// rule 3's sentence beside it; the COUNTERS below stay behind the capability,
+// because a deferred count for a path that has never run is decoration.
+function stateBranchStatusLines(ctx, facts, opts) {
+  const o = opts || {};
+  const lines = [];
+  lines.push('  push: ' + facts.push);
+  if (facts.enabled) {
+    lines.push('  deferred: ' + facts.deferred +
+      (facts.deferred && facts.deferred_reason ? ' (' + facts.deferred_reason + ')' : ''));
+    // The refusal the vocabulary has no word for - see `stateBranchFacts`.
+    if (facts.refused) {
+      lines.push('  refused: ' + (facts.refused.detail || facts.refused.reason) +
+        (facts.refused.reason === 'shard_too_large'
+          ? ' - trim or rotate that shard and the next beat goes out'
+          : facts.refused.reason === 'git_missing'
+            ? ' - install git, or put it on PATH, and the next beat goes out'
+            : ''));
+    }
+  }
+  if (facts.fetch_ms !== null && facts.fetch_ms !== undefined) {
+    lines.push('  last SessionStart fetch: ' + facts.fetch_ms + ' ms' +
+      (facts.fetch_reason ? ' (' + facts.fetch_reason + ')' : '') +
+      ' · shard scan: ' + (facts.scan_truncated ? 'TRUNCATED - it reported less than it holds' : 'complete'));
+  } else {
+    lines.push('  last SessionStart fetch: not fetched this session' +
+      (facts.fetch_reason ? ' (' + facts.fetch_reason + ')' : '') +
+      ' · shard scan: ' + (facts.scan_truncated ? 'TRUNCATED - it reported less than it holds' : 'complete'));
+  }
+  if (facts.late_flush) {
+    lines.push('  committed a batch left over from your last session - late instead of lost');
+  }
+  // The union, said out loud when it did something: N peers whose records are
+  // in the block because they are on this disk and NOT on the state branch.
+  if (facts.worktree_only) {
+    lines.push('  shard scan: ' + facts.worktree_only + ' shard(s) came from the working tree, not the state ' +
+      'branch - those peers have not enabled it, and their records are carried either way');
+  }
+  // ...and the per-RECORD half of the same union: a peer IS on the branch, but
+  // their committed shard held records their branch copy did not, so the block
+  // is the union of both copies rather than the branch's alone.
+  if (facts.worktree_extra_records) {
+    lines.push('  shard scan: ' + facts.worktree_extra_records + ' record(s) came from a peer\'s committed shard ' +
+      'that their state-branch copy does not carry yet - their last flush deferred; nothing was dropped');
+  }
+  if (facts.enabled && o.root) {
+    const peer = o.peerLines || stateBranchPeerLines(ctx, o.root, facts, { probe: o.probe !== false });
+    for (const l of peer) lines.push('  ' + l);
+  }
+  if (o.headless) lines.push('  headless: state pushes ride the Stop hook, peer-branch evaluation is off');
+  return lines;
+}
+
+// --------------------------------------------------- handshake branches -----
+
+// READ-ONLY on the REMOTE: this command changes nothing anywhere. Every NUMBER
+// below comes off a ref this clone already has, which is what SessionStart's
+// fetch is for, and a count it cannot compute is printed as unknown and never
+// guessed (section 4.4 rule 3, and section 14 item 6's "the honest line over
+// the fuller number").
+//
+// It does make ONE bounded network call, and section 10.1's Tests are what ask
+// for it: rule 3's peer line is "derived from `ls-remote` and from nothing the
+// peer sent". A local ref answers for the past, and the measured failure was a
+// clone confidently reporting `bob: not enabled yet` about a bob who had opted
+// in and pushed (see `stateBranchPeerLines`). `--no-network` skips the probe
+// and falls back to the local derivation with its own honest unknown arm.
+async function cmdBranches(args) {
+  const found = requireWs(args); if (!found) return;
+  const ctx = openWorkspace(found.ws, args);
+  const detected = repoRoot();
+  const root = detected ? detected.root : null;
+  const facts = stateBranchFacts(ctx);
+  const monitors = sessionLib.monitorAlive(path.join(ctx.state.dir, 'monitor.alive'));
+
+  const refs = root ? stateRefsHere(root) : [];
+  let commits = null;
+  let bytes = null;
+  if (refs.length) {
+    const c = stateGit(root, ['rev-list', '--count', refs[0].ref]);
+    if (c !== null && /^\d+$/.test(c.trim())) commits = Number(c.trim());
+    // `rev-list --disk-usage` is git 2.31+; a clone older than that gets the
+    // tip tree's own byte total instead of nothing.
+    const du = stateGit(root, ['rev-list', '--disk-usage', '--objects', refs[0].ref]);
+    if (du !== null && /^\d+$/.test(du.trim())) bytes = Number(du.trim());
+    else {
+      const ls = stateGit(root, ['ls-tree', '-r', '-l', refs[0].ref]);
+      if (ls !== null) {
+        bytes = ls.split(/\r?\n/).reduce((sum, line) => {
+          const m = /^\d{6}\s+blob\s+[0-9a-f]+\s+(\d+)\s/.exec(line);
+          return m ? sum + Number(m[1]) : sum;
+        }, 0);
+      }
+    }
+  }
+
+  // Derived ONCE, so the printed lines and the `--json` array are the same
+  // answer and the bounded `ls-remote` behind them is one call and not two.
+  const peerLines = facts.enabled && root
+    ? stateBranchPeerLines(ctx, root, facts, { probe: args.flags['no-network'] !== true })
+    : [];
+
+  const report = {
+    state_branch: {
+      branch: stateBranch.STATE_BRANCH,
+      enabled: facts.enabled,
+      visibility: facts.visibility,
+      push: facts.push,
+      refused: facts.refused,
+      deferred: facts.deferred,
+      present_here: refs.length > 0,
+      ref: refs.length ? refs[0].ref : null,
+      head: refs.length ? refs[0].sha : null,
+      commits, bytes,
+      recorded_head: facts.recorded_head,
+      last_batch_at: facts.last_batch_at,
+      fetch_ms: facts.fetch_ms,
+      scan_truncated: facts.scan_truncated,
+    },
+    delete: {
+      remote: 'git push origin --delete ' + stateBranch.STATE_BRANCH,
+      local: 'git branch -D ' + stateBranch.STATE_BRANCH,
+    },
+    asymmetry: peerLines,
+    monitors: monitors ? 'running' : 'unavailable',
+  };
+  if (args.flags.json) { json(report); return; }
+
+  out('branches: ' + stateBranch.STATE_BRANCH + '  [coordination state; it never merges into anything you work on]');
+  // Rule 3's line, in the same words `status` uses, and printed BEFORE the rest
+  // so the reader learns the branch is switched off before reading numbers
+  // about it.
+  if (!facts.enabled) {
+    out('  ' + NOT_ENABLED_LINE);
+    out('  nothing is created, committed to or pushed until you type it.');
+  }
+  for (const line of stateBranchStatusLines(ctx, facts, { root, headless: !monitors, peerLines })) out(line);
+  if (refs.length) {
+    out('  on this clone: ' + (commits === null ? 'commit count unknown' : commits + ' commit(s)') +
+      ', ' + (bytes === null ? 'size unknown' : humanBytes(bytes)) + '  [' + refs[0].ref + ' @ ' + refs[0].sha.slice(0, 8) + ']');
+  } else {
+    out('  on this clone: no ' + stateBranch.STATE_BRANCH + ' ref yet' +
+      (root ? '' : ' (not inside a git working tree)'));
+  }
+  out('');
+  for (const l of STATE_REFS_CLAUSE) out('  ' + l);
+  out('');
+  out('  Deleting it is safe. Both halves, because the tool writes the local copy too:');
+  out('    ' + report.delete.remote);
+  out('    ' + report.delete.local);
+  out('  The tool never deletes a branch itself (V2-PLAN 4.1), so these are yours to run.');
+}
+
+function humanBytes(n) {
+  if (!Number.isFinite(n)) return 'unknown';
+  if (n < 1024) return n + ' B';
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+  return (n / (1024 * 1024)).toFixed(1) + ' MB';
+}
+
+// ------------------------------------- the ONE workflow read in this stage ---
+//
+// THE PLAN CONTRADICTS ITSELF HERE AND THIS COMMENT SAYS SO RATHER THAN
+// PRETENDING OTHERWISE. Section 10.1's Delivers says "no workflow is read, no
+// workflow is edited" and its Tests say "no workflow file is opened by any path
+// in this stage" - while the SAME Delivers demands "the two `[skip ci]`
+// warnings of section 4.2 item 4", and section 14 item 51's
+// `pull_request_target` warning cannot be produced without reading a workflow.
+// One of the two sentences has to give.
+//
+// What this build does, and what the owner is being asked to ratify: the ban
+// holds absolutely on every HOOK, MONITOR and LIB path - nothing under `hooks/`,
+// `monitors/` or `lib/` names `.github` at all, asserted by fixture - and the
+// single reader is this function, called from exactly one place, the typed
+// human verb `cmdPair`. Section 10.1's Delivers and Tests need the ban scoped
+// to those paths, naming `cmdPair` as the one reader, or the
+// `pull_request_target` warning withdrawn.
+//
+// It never blocks. It reads at most MAX files of at most MAX bytes each,
+// swallows every error into `unreadable`, and writes nothing.
+const WF_MAX_FILES = 40;
+const WF_MAX_BYTES = 256 * 1024;
+
+function workflowPullRequestTarget(root) {
+  const out = { found: false, files: [], scanned: 0, unreadable: null };
+  if (!root) return out;
+  const dir = path.join(root, '.github', 'workflows');
+  let names;
+  try {
+    names = fs.readdirSync(dir).filter((n) => /\.ya?ml$/i.test(n)).sort();
+  } catch (_) {
+    return out;                       // no workflows at all: the ordinary case
+  }
+  if (names.length > WF_MAX_FILES) {
+    out.unreadable = names.length + ' workflow files (only the first ' + WF_MAX_FILES + ' were read)';
+    names = names.slice(0, WF_MAX_FILES);
+  }
+  for (const name of names) {
+    const file = path.join(dir, name);
+    let text;
+    try {
+      const st = fs.statSync(file);
+      if (!st.isFile()) continue;
+      if (st.size > WF_MAX_BYTES) { out.unreadable = out.unreadable || name; continue; }
+      text = fs.readFileSync(file, 'utf8');
+    } catch (_) { out.unreadable = out.unreadable || name; continue; }
+    out.scanned++;
+    // Deliberately a substring test and not a YAML parse: zero dependencies is
+    // this repository's own rule, a hand-rolled YAML parser is a bug farm, and
+    // the question is one word. A commented-out mention costs one warning that
+    // does not block, which is the safe direction for a warn-only check.
+    if (/(^|[^A-Za-z0-9_-])pull_request_target([^A-Za-z0-9_-]|$)/m.test(text)) {
+      out.found = true;
+      if (out.files.length < 8) out.files.push(name);
+    }
+  }
+  return out;
+}
+
+// -------------------------------------------------------- handshake pair ----
+
+// The opt-in gate (section 4.2 item 3, section 14 item 5). It is `join`-shaped
+// because this codebase already has a shape for "a thing arrives from outside
+// and a human must sanction it": it prints the whole grant, it refuses a proven
+// child, and - because it is `join`-shaped and not `offer accept`-shaped - it
+// REFUSES `--yes` and requires a typed confirmation
+// [C bin/handshake.js:627] [P section 9.1].
+//
+// What that confirmation is worth is stated in the help text and is not
+// upgraded later: the model drives the terminal, so it is a speed bump and an
+// audit line, not proof of consent [SEC section 1.2].
+const PAIR_USAGE = [
+  'usage: handshake pair --state-branch [--revoke] [--allow-unsigned]',
+  '',
+  '  --state-branch     opt this machine in to the automated coordination-state branch',
+  '  --revoke           (alias --off) remove the opt-in; nothing is committed or pushed after it',
+  '  --allow-unsigned   accept that the tool passes -c commit.gpgsign=false on its own commits',
+  '',
+  '  Human-only: it refuses --yes and refuses from a proven child session. The typed',
+  '  confirmation is a SPEED BUMP and an audit line, not proof of consent - the model',
+  '  drives this terminal too (SECURITY.md 1.2).',
+].join('\n');
+
+async function cmdPair(args) {
+  // section 7.2 rule 1, and the same refusal `join` uses.
+  if (refuseIfChild('pair')) return;
+  // `--state-branch <word>` makes parseArgs swallow the next positional
+  // [C bin/handshake.js:42-56]; the mode is still set, so hand the word back.
+  if (typeof args.flags['state-branch'] === 'string') {
+    args._.unshift(args.flags['state-branch']);
+    args.flags['state-branch'] = true;
+  }
+  if (args.flags['state-branch'] !== true) {
+    err('handshake: `pair` has exactly one mode in this release.');
+    out(PAIR_USAGE);
+    process.exitCode = 2; return;
+  }
+
+  const found = requireWs(args); if (!found) return;
+  const ctx = openWorkspace(found.ws, args);
+
+  // ---- --revoke / --off -----------------------------------------------------
+  if (args.flags.revoke === true || args.flags.off === true) {
+    const had = stateBranch.readOptIn(ctx.state).enabled;
+    stateBranch.clearOptIn(ctx.state);
+    // `push: null` and not a word: the capability is off, and the surfaces read
+    // that off-ness from the opt-in record rather than from a stale beat that
+    // claims a push state the branch no longer has.
+    stateLib.writeStateBeat(ctx.state, {
+      at: null, outcome: 'refused', reason: 'revoked', push: null, where: 'cli',
+    });
+    out(had
+      ? 'state branch: OFF. Nothing is committed or pushed to `' + stateBranch.STATE_BRANCH + '` from this machine any more.'
+      : 'state branch: already off on this machine; nothing changed.');
+    out('  The refs that exist stay where they are - the tool never deletes a branch.');
+    out('  Delete them yourself with:');
+    out('    git push origin --delete ' + stateBranch.STATE_BRANCH);
+    out('    git branch -D ' + stateBranch.STATE_BRANCH);
+    return;
+  }
+
+  const detected = repoRoot();
+  if (!detected) {
+    err('handshake: not inside a git working tree, so there is no branch to write.');
+    err('           Run this from the project you want coordinated.');
+    process.exitCode = 2; return;
+  }
+
+  // ---- ruling D2: the screen prints the visibility verdict, first ------------
+  const verdict = repoLib.guard({ state: ctx.state, cwd: detected.root, repo: detected });
+  out('state branch opt-in — ' + stateBranch.STATE_BRANCH);
+  out('');
+  out('  repository:  ' + (detected.slug || detected.remote || '(no remote)'));
+  out('  visibility:  ' + verdict.verdict + ' - ' + verdict.explanation);
+  out('');
+
+  const existing = stateBranch.readOptIn(ctx.state);
+  const arm = stateBranch.visibilityArm(verdict, { visibility: { override: false, unprovable_confirmed: false } }, detected.remote);
+  let recordVisibility = { verdict: 'private', reason: verdict.reason, checked_at: Date.now(), override: false, unprovable_confirmed: false };
+
+  if (detected.reason === 'no_remote') {
+    err('handshake: this working tree has no git remote, so there is no state branch — no commit');
+    err('           is made and no push is attempted. The shard is written and rides your next');
+    err('           commit, exactly as it does today. Add one with `git remote add origin <url>`.');
+    process.exitCode = 1; return;
+  }
+
+  if (arm.arm === 'gh') {
+    // gh_missing / gh_unauthenticated: installable, and the next step is one
+    // command. No override is offered, because one is not needed.
+    err(arm.message);
+    process.exitCode = 1; return;
+  }
+
+  if (arm.arm === 'unreadable') {
+    err(arm.message);
+    process.exitCode = 1; return;
+  }
+
+  if (arm.arm === 'unprovable') {
+    // The permanent case for every GitLab, Gitea, Bitbucket and self-hosted
+    // pair. NO world-readable sentence is printed here, because it is not true
+    // here, and the confirmation is recorded as `unprovable` and NEVER as an
+    // override of a public verdict: asking a human to certify that their
+    // private repository is public is asking them to certify something false.
+    out('  Visibility cannot be proved for a non-github.com remote. Confirm yourself that');
+    out('    ' + (detected.remote || 'origin'));
+    out('  is private. This is recorded as `unprovable`, not as an override of a public verdict.');
+    out('');
+    if (args.flags.yes) {
+      err('handshake: --yes is not accepted for pair; confirmation must be typed (PROTOCOL 9.1).');
+    }
+    if (!(await confirm('Is that remote private?'))) { out('not enabled'); return; }
+    recordVisibility = {
+      verdict: 'unprovable', reason: verdict.reason, checked_at: Date.now(),
+      override: false, unprovable_confirmed: true,
+    };
+  } else if (arm.arm === 'public') {
+    // affirmative_public, and ONLY here is the world-readable sentence true.
+    out('  This repository is PUBLIC. If you enable this, ' + STATE_BRANCH_PUBLIC_SENTENCE);
+    out('');
+    out('  A public repository is refused by default (ruling D2). Enabling it anyway is a');
+    out('  DISTINCT second confirmation that names the consequence, and it is recorded on');
+    out('  the `status` line as `PUBLIC, overridden`.');
+    out('');
+    if (args.flags.yes) {
+      err('handshake: --yes is not accepted for pair; confirmation must be typed (PROTOCOL 9.1).');
+    }
+    const typed = (await ask('  Type exactly: ' + PUBLIC_OVERRIDE_PHRASE + '\n  > ')).trim();
+    if (typed !== PUBLIC_OVERRIDE_PHRASE) {
+      err('handshake: not enabled — the automated push path stays OFF on a public repository.');
+      err('           Nothing was written. Make the repository private, or re-run and type the');
+      err('           phrase exactly.');
+      process.exitCode = 1; return;
+    }
+    recordVisibility = {
+      verdict: 'public', reason: verdict.reason, checked_at: Date.now(),
+      override: true, unprovable_confirmed: false,
+    };
+  }
+
+  // ---- the THREE preconditions ---------------------------------------------
+  // The visibility precondition has just been adjudicated ABOVE, by the human,
+  // and the record of it is not on disk yet - so `preflight` re-derives it from
+  // an opt-in file that does not carry the confirmation and refuses. Its
+  // verdict is therefore dropped rather than its input doctored: passing a
+  // synthetic `private: true` would make `checks.visibility.arm` read `private`
+  // on a repository the human was just told is public, and a preflight that
+  // misreports which arm it took is worse than one that reports none.
+  const adjudicated = arm.arm === 'unprovable' || arm.arm === 'public';
+  // section 4.2 item 4's first warning. THIS verb - a human-invoked CLI verb,
+  // never a hook path - is the one reader of the repository's workflow files:
+  // read-only, bounded, and only to warn on `pull_request_target`. The read is
+  // done HERE and the answer is handed to `preflight` as a boolean, so
+  // lib/state-branch.js - which every hook path goes through - opens no
+  // workflow file by any route. See `workflowPullRequestTarget` for the plan
+  // sentence this trades against and what still needs amending.
+  const prt = workflowPullRequestTarget(detected.root);
+  const pre = stateBranch.preflight({
+    state: ctx.state, cwd: detected.root, repo: detected, verdict,
+    gpgsignResolved: args.flags['allow-unsigned'] === true,
+    pullRequestTarget: prt.found,
+    remote: 'origin',
+  });
+  const blocking = pre.refusals.filter((r) => !(r.id === 'visibility' && adjudicated));
+  out('  preflight:');
+  out('    visibility:        ' + (adjudicated
+    ? 'ok - ' + recordedVisibility(recordVisibility)
+    : (pre.checks.visibility && pre.checks.visibility.ok ? 'ok (' + pre.checks.visibility.arm + ')' : 'REFUSED')));
+  out('    push --dry-run:    ' + (pre.checks.push_dry_run === null ? 'not run'
+    : pre.checks.push_dry_run.ok ? 'ok' + (pre.checks.push_dry_run.reason ? ' (' + pre.checks.push_dry_run.reason + ')' : '')
+      : 'REFUSED (' + pre.checks.push_dry_run.reason + ')'));
+  out('    commit.gpgsign:    ' + (pre.checks.gpgsign.on ? (pre.checks.gpgsign.resolved ? 'on, resolved with --allow-unsigned' : 'ON and unresolved') : 'off'));
+  out('    git:               ' + (pre.git_version || 'unknown'));
+  out('');
+  for (const w of pre.warnings) {
+    out('  warning: ' + w.message);
+    // The one warning that can name the file it came from does so: rule 2 wants
+    // a next move, and "one of your workflows" is not one.
+    if (w.id === 'pull_request_target' && prt.files.length) {
+      out('           the workflow' + (prt.files.length > 1 ? 's' : '') + ': ' + prt.files.join(', '));
+    }
+    out('');
+  }
+  if (prt.unreadable) {
+    out('  warning: `' + prt.unreadable + '` could not be read, so this check could not see every');
+    out('           workflow. `[skip ci]` still applies to the ones it did read; a');
+    out('           `pull_request_target` workflow it missed would cost a run per tool push.');
+    out('');
+  }
+  if (blocking.length) {
+    for (const r of blocking) err(r.message);
+    err('handshake: not enabled — nothing was written.');
+    process.exitCode = 1; return;
+  }
+
+  // ---- what the gate must SAY about the commits themselves ------------------
+  out('  What you are switching on, in the plainest words available:');
+  out('');
+  for (const line of STATE_BRANCH_GRANT) out('    ' + line);
+  out('');
+  if (args.flags.yes) {
+    err('handshake: --yes is not accepted for pair; confirmation must be typed (PROTOCOL 9.1).');
+  }
+  if (!(await confirm('Enable the coordination state branch on this machine?'))) { out('not enabled'); return; }
+
+  stateBranch.writeOptIn(ctx.state, { enabled: true, at: Date.now(), visibility: recordVisibility });
+  stateLib.writeStateBeat(ctx.state, {
+    at: null, outcome: null, push: stateBranch.PUSH_STATES.pushing, where: 'cli',
+  });
+  out('');
+  out('state branch: ON for this machine  [' + stateBranch.STATE_BRANCH + ']');
+  out('  recorded visibility: ' + recordedVisibility(recordVisibility));
+  out('  The first batch goes out on the next beat - at most one a minute, and the shard');
+  out('  is on your disk either way. `handshake branches` shows the branch and both');
+  out('  delete commands; `handshake pair --state-branch --revoke` switches it back off.');
+  out('  Your peer opting in grants you nothing and yours grants them nothing: the two');
+  out('  sides are independent, by design.');
+}
+
+const PUBLIC_OVERRIDE_PHRASE = 'publish my in-progress work to a public repository';
+
+const STATE_BRANCH_PUBLIC_SENTENCE =
+  'task subjects, file paths, declared symbols, learnings, coordination outcomes and\n' +
+  '  in-progress code would become world-readable.';
+
+// The opt-in text, quoted from V2-PLAN 4.2 item 3 / section 14 item 47. It is
+// repeated verbatim in docs/INSTALL.md and in the README, because the thing a
+// reader fears here is a directory of abandoned refs and hundreds of commits
+// nobody typed, and the answer to both is arithmetic rather than reassurance.
+const STATE_BRANCH_GRANT = [
+  'These commits are AUTHORED AS YOU, about ONE A MINUTE, on a branch that NEVER',
+  'MERGES into anything you work on, and they WILL APPEAR IN YOUR GITHUB ACTIVITY.',
+  '',
+  'Two people means two work branches plus one handshake/state: THREE REFS, FOREVER',
+  '- three on the remote, and on your own machine you also carry the local copies',
+  'the tool writes, handshake/state and handshake/<you>.',
+  '',
+  'The tool\'s commits never run CI; yours do.',
+  '',
+  'What is committed is an explicit allowlist: your own task shard and nothing else.',
+  'Its new records are scanned before every commit by the same outbound secret filter',
+  'that stands in front of every message this tool sends, and a finding REFUSES the',
+  'commit rather than publishing it. That filter is a seatbelt against accidental',
+  'disclosure, not a defence against a motivated reader - which is why this is',
+  'private-repo only.',
+  'Never pull handshake/<you> into a checkout you care about - it is rewritten under',
+  'a lease, and a clone that followed it gets a mess the tool cannot see.',
+];
+
 // ================================================================== main ====
 
 const COMMANDS = {
@@ -2508,6 +3395,7 @@ const COMMANDS = {
   sync: cmdSync, cursor: cmdCursor, status: cmdStatus, tasks: cmdTasks, guard: cmdGuard,
   rotate: cmdRotate, leave: cmdLeave, doctor: cmdDoctor,
   mute: cmdMute, unmute: cmdUnmute, rest: cmdRest,
+  pair: cmdPair, branches: cmdBranches,
   'deploy-relay': cmdDeployRelay, upgrade: cmdUpgrade, scrub: cmdScrub,
 };
 
@@ -2528,7 +3416,7 @@ const USAGE = [
   '  post      <note.*|warn.overlap|task.change> --text "..." [--paths a,b]',
   '  sync      [--limit <n>] [--json] [--inject-digest] [--guard-refresh]',
   '  cursor    [--commit]',
-  '  status    [--json]',
+  '  status    [--json] [--no-network]   --no-network skips the one bounded `ls-remote` behind the peer lines',
   '  tasks     [--json] [--limit <n>]   projection over .handshake/tasks/ (never a master file)',
   '  guard     [--refresh] [--json] [--ack-rotated]   the fail-closed private-repo guard',
   '  rotate    [--grace <seconds>]',
@@ -2538,6 +3426,12 @@ const USAGE = [
   '  rest      [--summary "..."]  stop broadcasting this session; keep listening',
   '  deploy-relay [--name <n>] [--as <member name>] [--work-dir <path>] [--yes] [--print-only]  deploy your own Cloudflare relay (one command)',
   '  upgrade   [--relay <origin>] [--yes]  migrate zero-setup -> team relay (PROTOCOL 9.4)',
+  '  pair      --state-branch [--revoke] [--allow-unsigned]   opt IN to the automated coordination-state',
+  '            branch: commits authored as you, about one a minute, on `handshake/state`, which never',
+  '            merges into anything you work on. Human-only: refuses --yes, refuses a proven child, and',
+  '            the typed confirmation is a speed bump and an audit line, not proof of consent.',
+  '  branches  [--json] [--no-network]   read-only: the state branch, its size, its `push:` state and BOTH',
+  '            delete commands. One bounded `ls-remote` proves the peer lines; --no-network skips it.',
   '  doctor    [--json]',
   '  scrub     [--yes] [--restore [--claude-md]]  detach THIS project from the repo layer (not your membership)',
   '',

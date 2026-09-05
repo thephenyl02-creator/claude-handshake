@@ -473,6 +473,34 @@ test('a PROVEN child never posts: SessionEnd sends no parting note', () => {
   assert.strictEqual(w.state.read().last_leave, undefined, 'no ws.leave was recorded');
   assert.ok(!fs.existsSync(path.join(w.state.dir, 'monitor.alive')),
     'the stale liveness sentinel is cleared so the NEXT session is not misclassified');
+  // V2-PLAN 10.1: SessionEnd also flushes the state-branch batch, and rule 7.2
+  // rule 1 covers that too - a proven child creates nothing, so it leaves no
+  // beat record and no pending marker behind for the parent to trip over.
+  assert.ok(!fs.existsSync(path.join(w.state.dir, 'state.beat')), 'a child records no batch');
+  assert.ok(!fs.existsSync(path.join(w.state.dir, 'state.pending')), 'and marks nothing pending');
+});
+
+const C = require(path.join(HOOKS, 'common.js'));
+
+test('the two state-branch sentinels are named centrally and live in the state dir', () => {
+  // V2-PLAN 10.1's Touches: the batch clock and the late-not-lost marker are
+  // sentinels beside the existing ones and explicitly NOT fields in state.json,
+  // which hooks read-modify-write on hot paths. Four writers share these two
+  // paths - lib/state-branch.js, the monitor, the Stop hook and the CLI - so
+  // there is exactly one spelling of each.
+  const w = mkWorkspace();
+  assert.equal(C.SENTINELS.stateBeat, 'state.beat');
+  assert.equal(C.SENTINELS.statePending, 'state.pending');
+  assert.equal(C.sentinel(w.state, 'stateBeat'), path.join(w.state.dir, 'state.beat'));
+  assert.equal(C.sentinel(w.state, 'statePending'), path.join(w.state.dir, 'state.pending'));
+  // lib/state.js names the same two files, and a second spelling would be a
+  // second clock nobody could find.
+  assert.equal(w.state.files.state_beat, C.sentinel(w.state, 'stateBeat'));
+  assert.equal(w.state.files.state_pending, C.sentinel(w.state, 'statePending'));
+  // And neither is a key in state.json.
+  const cfg = w.state.read();
+  assert.equal(cfg.state_beat, undefined);
+  assert.equal(cfg.state_pending, undefined);
 });
 
 test('a PROVEN child never consumes the parent watermark', () => {

@@ -109,11 +109,25 @@ test('the scan returns typed records keyed to the shard, not to any field in it'
   assert.equal(rec.author_status, 'unknown');
   // The truncation report is always present, even when nothing was truncated:
   // a consumer that has to guess whether a zero means "none" or "not measured"
-  // will guess wrong (PROTOCOL 10.2).
-  assert.deepEqual(res.truncated, { shards: 0, records: 0 });
+  // will guess wrong (PROTOCOL 10.2). `bytes` / `unread` / `too_large` /
+  // `budget` arrive with V2-PLAN 10.1's read half and obey the same rule - the
+  // ref path can come back short in four more ways and each of them is counted,
+  // not implied. `too_large` is its own counter beside `unread` because a shard
+  // past the runner's own output buffer comes back EMPTY, and "the ref could
+  // not hand it back" is a different sentence from "this shard is enormous".
+  assert.deepEqual(res.truncated, { shards: 0, records: 0, bytes: 0, unread: 0, too_large: 0, budget: false });
+  assert.equal(res.source, 'worktree', 'no ref asked for, so the working tree answered');
+  assert.equal(res.ref, null);
+  assert.equal(res.ref_ok, null, 'null, not false: nothing about a ref was attempted');
   assert.deepEqual(res.excluded, { non_member_commit: 0 });
+  // `declared_member` is null on the working-tree path and on any shard whose
+  // header agrees with its filename: it is the header's CLAIM, kept beside the
+  // record only when it disagrees with the name the enumeration derived
+  // (V2-PLAN 10.1's read half - on the shared state branch the header is
+  // peer-authored text about somebody else).
   assert.deepEqual(res.shards, [{
-    member: 'bob', file: '.handshake/tasks/bob.md', status: 'unknown', excluded: false, records: 1, kept: 1,
+    member: 'bob', file: '.handshake/tasks/bob.md', status: 'unknown', excluded: false,
+    declared_member: null, records: 1, kept: 1,
   }]);
 });
 
@@ -452,6 +466,13 @@ test('ORDERING PIN: the knowledge cache is on disk while the sync is still hangi
   // With the scan behind it, knowledge.json would first appear at ~7 s - long
   // after the injector's 500 ms wait had rendered the first prompt of the
   // session (KNOWLEDGE.md 3.2).
+  //
+  // V2-PLAN 10.1's read half puts a 1 500 ms fetch and a 500 ms ref scan on
+  // this same hook, and the ordering claim survives BOTH of them: the
+  // working-tree scan is written first and the ref scan only ever REPLACES it,
+  // so the cache still lands inside the injector's window. That is the second
+  // half of this pin, and the assertions below are what would fail if the read
+  // half were ever re-ordered in front of it.
   const box = hookBox();
   const held = [];
   const server = http.createServer((req, res) => { held.push(res); });
@@ -487,6 +508,17 @@ test('ORDERING PIN: the knowledge cache is on disk while the sync is still hangi
   assert.equal(cache.records[0].fields.text, 'Token refresh is timer-driven, not 401-driven.');
   assert.equal(cache.records[0].author_status, 'unknown');
   assert.ok(!('root' in cache), 'the cache carries records, not paths for a consumer to open');
+
+  // The read half's own fields, on the fallback arm this box exercises (no git
+  // tree, no remote, no state ref): the source is named rather than assumed,
+  // and the reason the ref half had nothing to say is recorded rather than
+  // left for a human to guess (V2-PLAN 4.4 rules 1 and 3).
+  assert.equal(cache.source, 'worktree');
+  assert.equal(cache.scan_truncated, false);
+  assert.ok(cache.ref_reason, 'the ref half says why it did not answer: ' + cache.ref_reason);
+  assert.equal(cache.fetch_reason, 'not_enabled',
+    'and no network call was made: the fetch is behind the same opt-in as the write half');
+  assert.ok(total < 9500, 'the whole hook still fits inside its watchdog: ' + total + ' ms');
 });
 
 test('the scan runs on startup and not on clear, and never for a child', async () => {

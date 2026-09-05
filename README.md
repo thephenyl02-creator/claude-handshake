@@ -233,7 +233,27 @@ carrying your live claims across. Full details and the free-tier limits:
 | `doctor` | Pass/warn/fail health check (Node, workspace, credentials, transport, private-repo guard, git history, more) | no |
 | `deploy-relay` | Deploy your own Cloudflare relay in **one command** (no `wrangler` typing) and print the invite | yes |
 | `upgrade` | Migrate an existing zero-setup workspace → team relay (deploys one for you if you have none) | yes |
+| `pair --state-branch` | Opt **this machine** in to the coordination-state branch: a commit per batch, at most one a minute, on an orphan `handshake/state` that never merges into anything you work on. Private-repo only, `--revoke` switches it off | **yes, always** — it refuses `--yes` and prints exactly what it publishes |
+| `branches` | Read-only: what `handshake/state` holds, how big it is, why the branch is or is not moving, and both delete commands for every handshake ref your clone carries | no |
 | `scrub` | Detach **this project** from the durable layer: delete `.handshake/` and the `CLAUDE.md` block, and stop re-creating them. Membership, credentials and the live layer are untouched. `--restore` rewrites the layer for the same workspace | yes |
+
+### The coordination state branch, in one paragraph
+
+Off until a human types `/handshake pair --state-branch`, and off on your peer's
+machine until they type it too — one side opting in grants the other nothing.
+Switched on, the tool commits your own task shard to an orphan branch called
+`handshake/state` roughly once a minute, **authored as you**, so a peer who has
+been away for a week gets your learnings on their next session start instead of
+nothing. The commits **never merge into anything you work on**, they never move
+your `HEAD` or touch your index (they are built through a temporary index, so
+uncommitted work is safe), and every message carries `[skip ci]` so they start
+no CI runs — but they **will appear in your GitHub activity**. Two people means
+two work branches plus one `handshake/state`: **three refs, forever**, plus the
+local copies the tool writes in your own clone. It is **private-repo only**;
+`/handshake branches` shows what exists and both delete commands for each ref,
+and **deleting them is safe**. Never pull `handshake/<you>` into a checkout you
+care about — it is rewritten under a lease. Full detail:
+[docs/INSTALL.md](docs/INSTALL.md#the-coordination-state-branch-opt-in).
 
 `rotate` is also routed (`/handshake rotate`) but is an offboarding action that
 needs the recovery key — never run it on your own initiative. Full verb

@@ -47,6 +47,26 @@ const SENTINELS = Object.freeze({
   // newest 16 kept. Nothing else reads or writes it, so there is nothing to
   // fight over.
   knowledgeInjected: 'knowledge.injected.json',
+  // V2-PLAN 10.1 (Stage 1), and both live HERE rather than in state.json for
+  // the reason that section's Touches gives: hooks read-modify-write that file
+  // on hot paths, and a batch clock that fights the claim writer for one JSON
+  // document is a lost claim.
+  //
+  // `state.beat` is the batch clock AND the outcome record. mtime is the last
+  // state-branch batch attempt - which is what makes "two batches inside one
+  // minute produce one commit" true across the monitor and the Stop hook, two
+  // different processes with no shared memory, exactly as `stop.beat` does it
+  // for the heartbeat. The body is a JSON record carrying the outcome word, so
+  // `handshake status` can print section 4.4 rule 1's `push:` line without
+  // spawning anything.
+  stateBeat: 'state.beat',
+  // `state.pending` is the late-not-lost marker: a shard was written and its
+  // batch has not reached the remote. Written by the CLI's shard-write path and
+  // by any beat that ends short of `ok`; removed by the beat that pushes.
+  // SessionEnd is best-effort, 20 of 21 [S4], so the session that loses its
+  // flush leaves this behind and the NEXT session start commits the batch -
+  // late instead of lost.
+  statePending: 'state.pending',
 });
 
 // PostToolUse fires at p50 0.4 s / p90 3.1 s in agent workloads [S7] and 218

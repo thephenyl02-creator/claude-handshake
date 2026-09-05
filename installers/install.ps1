@@ -406,6 +406,13 @@ if ($HandshakeExtraArgs.Count -gt 0) {
             Write-Warn2 'The plugin is installed but not reporting as enabled in ''claude plugin list''.'
             Write-Warn2 'Inside a Claude Code session, run:  /reload-plugins'
             Write-Warn2 'Then start a NEW session (or /reload-plugins again) before re-checking.'
+            # The same sentence the other arm has carried since v0.1.0, and it
+            # belongs in BOTH: installed-but-not-active with exit code 1 is the
+            # documented, EXPECTED result of a fresh install, and an arm that
+            # omits the sentence reads as a failed one.
+            Write-Warn2 'This is expected immediately after install: handshake''s hooks are'
+            Write-Warn2 'no-ops until you are inside a workspace, and exit code 1 here is the'
+            Write-Warn2 'documented outcome of a fresh install, not a failure.'
         } else {
             # Reached for a failed-to-load entry only when a fallback copy is
             # also present (the load-failure return above already handled the

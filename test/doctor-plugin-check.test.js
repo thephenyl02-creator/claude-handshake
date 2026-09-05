@@ -153,3 +153,89 @@ test('a failed-to-load listing reaches the report as fail, cause and all', (t) =
   assert.match(check.detail, /FAILED TO LOAD - no hook fires/);
   assert.match(check.detail, /duplicate hooks key in plugin\.json/);
 });
+
+// ============= V2-PLAN section 14 item 49: registered hooks vs installed =====
+//
+// The WSL and fallback routes hand-merge `hooks.json` into
+// `~/.claude/settings.json`, and that merge has to be redone on every upgrade
+// whose hook set changed [C docs/INSTALL.md]. A merge from an older release
+// silently drops a hook, and a dropped hook fails SOFT - nothing anywhere says
+// the capability is gone. Stage 1 makes it bite harder rather than softer: a
+// session whose SessionEnd hook is missing never flushes its last state batch.
+//
+// Cheap by construction - two readFileSyncs and no subprocess of its own - so
+// it is checked here, on the real `doctor --json`, with a fake config dir.
+
+const MANIFEST = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'hooks', 'hooks.json'), 'utf8'));
+
+// The hand-merged shape: the same commands, with the plugin-root placeholder
+// already rewritten to an absolute path, which is exactly what the installers'
+// fallback route writes.
+function settingsFor(events) {
+  const hooks = {};
+  for (const [event, groups] of Object.entries(MANIFEST.hooks)) {
+    if (!events.includes(event)) continue;
+    hooks[event] = groups.map((g) => Object.assign({}, g, {
+      hooks: g.hooks.map((h) => Object.assign({}, h, {
+        command: h.command.split('${CLAUDE_PLUGIN_ROOT}').join('/home/me/.claude/handshake-plugin/0.1.5'),
+      })),
+    }));
+  }
+  return { hooks };
+}
+
+function runDoctorWithConfig(configDir) {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'hs-doctor-cfg-'));
+  temps.push(cwd);
+  const env = Object.assign({}, process.env, {
+    HANDSHAKE_STATE_DIR: path.join(cwd, 'data'),
+    HANDSHAKE_SKIP_HOST_CHECKS: '1',
+  });
+  if (configDir === null) delete env.CLAUDE_CONFIG_DIR; else env.CLAUDE_CONFIG_DIR = configDir;
+  const r = spawnSync(process.execPath, [CLI, 'doctor', '--json'], {
+    cwd, input: '', encoding: 'utf8', timeout: 120000, env,
+  });
+  assert.equal(r.signal, null, 'doctor was killed, stderr: ' + (r.stderr || ''));
+  let report;
+  try { report = JSON.parse(r.stdout); } catch (e) {
+    assert.fail('doctor --json did not print JSON: ' + (r.stdout || '') + (r.stderr || ''));
+  }
+  const check = report.checks.find((c) => c.check === 'hooks registered vs installed');
+  assert.ok(check, 'doctor must carry the check; got ' + report.checks.map((c) => c.check).join(', '));
+  return check;
+}
+
+function configDirWith(settings) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hs-cfg-'));
+  temps.push(dir);
+  if (settings) fs.writeFileSync(path.join(dir, 'settings.json'), JSON.stringify(settings, null, 2));
+  return dir;
+}
+
+test('no hand-merged hook set is nothing to compare, and doctor says exactly that', () => {
+  // The plugin route: the host registers the hooks and settings.json carries
+  // none of ours. A check that shouted here would shout at almost everyone.
+  const check = runDoctorWithConfig(configDirWith(null));
+  assert.equal(check.verdict, 'pass');
+  assert.match(check.detail, /nothing to compare/);
+});
+
+test('a complete hand-merged hook set passes, and names how many it checked', () => {
+  const check = runDoctorWithConfig(configDirWith(settingsFor(Object.keys(MANIFEST.hooks))));
+  assert.equal(check.verdict, 'pass', check.detail);
+  assert.match(check.detail, new RegExp('all ' + Object.keys(MANIFEST.hooks).length + ' registered hooks'));
+});
+
+test('a hand-merge from an older release FAILS and names the missing hook', () => {
+  // The real WSL case: the merge predates the release that added SessionEnd,
+  // so the last state batch of every session is never flushed and nothing
+  // else in the product would ever say so.
+  const kept = Object.keys(MANIFEST.hooks).filter((e) => e !== 'SessionEnd');
+  const check = runDoctorWithConfig(configDirWith(settingsFor(kept)));
+  assert.equal(check.verdict, 'fail', check.detail);
+  assert.match(check.detail, /MISSING/);
+  assert.match(check.detail, /SessionEnd \(session-end\.js\)/);
+  // section 4.4 rule 2: a next move, not a bare verdict.
+  assert.match(check.detail, /Re-run the installer/);
+  assert.match(check.detail, /fails SOFT/);
+});

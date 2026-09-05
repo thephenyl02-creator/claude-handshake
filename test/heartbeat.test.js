@@ -628,3 +628,112 @@ test('spawned as a script the monitor still beats, and still disarms', async () 
     try { child.kill(); } catch (_) { /* already gone */ }
   }
 });
+
+// ============================= V2-PLAN 10.1: the state-branch batch clock ====
+//
+// The write layer's own suites prove what a beat DOES; these prove the four
+// things that are true of the monitor rather than of the beat - the gates it
+// refuses at, the clock it shares with a process that has no memory, its place
+// in the beat's order, and that it can never take the heartbeat down with it.
+
+const sb = require('../lib/state-branch');
+
+// This process runs INSIDE a Claude Code session, which exports
+// CLAUDE_CODE_CHILD_SESSION=1 - so every call below would take PROTOCOL 7.2
+// rule 1's refusal and pass for the wrong reason. Cleared per test and put
+// back, rather than deleted at load, because the spawn tests above build their
+// child environments from this one.
+async function asParent(fn) {
+  const saved = {};
+  for (const k of ['CLAUDE_CODE_CHILD_SESSION', 'CLAUDE_CODE_SESSION_ID', 'CLAUDE_SESSION_ID',
+    'HANDSHAKE_SESSION_ID', 'CLAUDE_PROJECT_DIR']) {
+    saved[k] = process.env[k];
+    delete process.env[k];
+  }
+  try { return await fn(); } finally {
+    for (const [k, v] of Object.entries(saved)) if (v !== undefined) process.env[k] = v;
+  }
+}
+
+test('the batch clock is a minute, and the beat ceiling fits the Stop hook window', () => {
+  // section 4.1: "batched <= 1/min". A number in a comment is not a contract.
+  assert.equal(H.STATE_BATCH_MS, 60000);
+  // section 2.5: fetch 1,500 + scan 1,500 + commit 500 + push (ceiling 5,000).
+  assert.equal(H.STATE_BEAT_MS, 1500 + 1500 + 500 + sb.PUSH_CEILING_MS);
+  // hooks/stop.js runs it inside a 9,500 ms watchdog minus a 500 ms margin, so
+  // the ceiling must not exceed what that path can actually pay for.
+  assert.ok(H.STATE_BEAT_MS <= 9500 - 500, 'the ceiling must fit the no-monitor fallback');
+});
+
+test('with no opt-in the batch refuses before it spends anything', async () => {
+  const state = tmpState();
+  const r = await H.stateBatch(state, { root: state.dir }, {});
+  assert.equal(r.ran, false);
+  assert.equal(r.reason, 'not_enabled');
+  // Section 4.4 rule 1's field is populated in every state of the world, this
+  // one included: the caller can name the state without re-deriving it.
+  assert.equal(r.push, sb.PUSH_STATES.not_enabled);
+  // Nothing was written: no clock, no outcome, no pending marker. A workspace
+  // that never opted in pays NOTHING (section 10.1's "no commit before opt-in").
+  assert.equal(fs.existsSync(state.files.state_beat), false);
+  assert.equal(fs.existsSync(state.files.state_pending), false);
+});
+
+test('the clock is on DISK, so a hook with no memory shares it with the monitor', () => asParent(async () => {
+  // The monitor holds `lastBeat` in a variable; hooks/stop.js is a fresh
+  // process every turn. "Two batches inside one minute produce one commit" is
+  // only true if both read the same file.
+  const state = tmpState();
+  sb.writeOptIn(state, { enabled: true, visibility: { verdict: 'private', reason: 'affirmative_private' } });
+  St.writeStateBeat(state, { at: Date.now(), outcome: 'ok', push: sb.PUSH_STATES.pushing, where: 'monitor' });
+
+  const r = await H.stateBatch(state, { root: state.dir }, {});
+  assert.equal(r.ran, false);
+  assert.equal(r.reason, 'not_due', 'a second batch inside the minute does not run');
+
+  // A minute later it is due again - and here it reaches the repo gate rather
+  // than the clock, which is the proof the clock stopped being the reason.
+  St.writeStateBeat(state, { at: Date.now() - H.STATE_BATCH_MS - 1, outcome: 'ok', where: 'monitor' });
+  const due = await H.stateBatch(state, { root: state.dir }, {});
+  assert.notEqual(due.reason, 'not_due');
+}));
+
+test('`force` is what SessionEnd uses: it ignores the clock and nothing else', () => asParent(async () => {
+  const state = tmpState();
+  sb.writeOptIn(state, { enabled: true, visibility: { verdict: 'private', reason: 'affirmative_private' } });
+  St.writeStateBeat(state, { at: Date.now(), outcome: 'ok', where: 'monitor' });
+  const r = await H.stateBatch(state, { root: state.dir }, { force: true, where: 'session_end' });
+  assert.notEqual(r.reason, 'not_due', 'the last batch of a session has no next beat to wait for');
+  // ...but it does not ignore the child rule, which is above the clock.
+  const child = await H.stateBatch(state, { root: state.dir }, { force: true, child: { child: true } });
+  assert.equal(child.ran, false);
+  assert.equal(child.reason, 'child');
+}));
+
+test('the state batch is taken LAST, and it can never take the heartbeat down', () => asParent(async () => {
+  // section 2.5's ordering rule: "the presence post is taken first and the git
+  // work second, so on a slow transport the thing that gets truncated is the
+  // push" - which the deferred arm handles honestly - "and never the
+  // heartbeat, which nothing refills".
+  const state = tmpState();
+  claim(state, ['a.ts']);
+  sb.writeOptIn(state, { enabled: true, visibility: { verdict: 'private', reason: 'affirmative_private' } });
+
+  const order = [];
+  const realCli = C.runCli;
+  const realRead = St.readStateBeat;
+  C.runCli = async (args) => { order.push(args[0]); return { ok: true }; };
+  // The clock read is the first thing the batch does past its own gates, so
+  // it marks where in the beat the state work happened - and throwing from it
+  // is the harshest failure that step can have.
+  St.readStateBeat = () => { order.push('state-batch'); throw new Error('boom'); };
+  let ok;
+  try {
+    ok = await H.beat(state, { root: state.dir }, 'working');
+  } finally {
+    C.runCli = realCli;
+    St.readStateBeat = realRead;
+  }
+  assert.deepEqual(order, ['presence', 'change', 'state-batch'], 'presence first, git work last');
+  assert.equal(ok, true, 'the heartbeat still went out, and the beat still reports it did');
+}));
